@@ -1,0 +1,2 @@
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+pub const DEFAULT_MAX_TURNS: u32 = 12;

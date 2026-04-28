@@ -1,0 +1,21 @@
+[package]
+name = "relay-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+claudius = { version = "0.25", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+anyhow = "1"
+config = { version = "0.15", default-features = false }
+dotenvy = "0.15"
+
+[profile.release]
+panic = "abort"
