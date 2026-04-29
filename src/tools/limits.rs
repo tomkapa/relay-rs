@@ -29,3 +29,7 @@ pub const SEARCH_MAX_COUNT: u8 = 10;
 /// Hard ceiling on bytes a tool may return as a single result. Stops a future poorly
 /// behaved tool from filling the model context with megabytes.
 pub const TOOL_RESULT_MAX_BYTES: usize = 256 * 1024;
+
+// §5: per-tool body caps must always fit within the global tool-result cap so the agent
+// boundary doesn't have to truncate something we already truncated upstream.
+const _: () = assert!(FETCH_MAX_BODY_BYTES <= TOOL_RESULT_MAX_BYTES);

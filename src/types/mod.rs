@@ -12,7 +12,7 @@ mod secret;
 mod tool_name;
 
 pub use error::ParseError;
-pub use limits::{MAX_OUTPUT_TOKENS_CAP, MAX_TURNS_CAP, MaxOutputTokens, MaxTurns};
+pub use limits::{MAX_OUTPUT_TOKENS_CAP, MAX_TURNS_CAP, MaxOutputTokens, MaxTurns, TurnIndex};
 pub use model_id::ModelId;
 pub use prompt::{PROMPT_MAX_BYTES, Prompt};
 pub use secret::SecretString;

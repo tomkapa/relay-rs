@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use crate::types::{MAX_OUTPUT_TOKENS_CAP, MAX_TURNS_CAP};
+
 /// Default model output budget per turn. Comfortably under typical model caps; bumped
 /// per-Agent via the builder when a tool-heavy task warrants it.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -21,3 +23,10 @@ pub const PROVIDER_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Per-call timeout for any `Tool::execute`. The tool may have its own narrower timeout
 /// (e.g. fetch is 20 s); this is the outer fence.
 pub const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+// §5: defaults must always parse cleanly through their newtype constructors. Pinned at
+// compile time so a future bump cannot silently invert the relationship.
+const _: () = assert!(DEFAULT_MAX_OUTPUT_TOKENS > 0);
+const _: () = assert!(DEFAULT_MAX_OUTPUT_TOKENS <= MAX_OUTPUT_TOKENS_CAP);
+const _: () = assert!(DEFAULT_MAX_TURNS > 0);
+const _: () = assert!(DEFAULT_MAX_TURNS <= MAX_TURNS_CAP);

@@ -9,23 +9,55 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::types::{MaxOutputTokens, ModelId, ToolName};
+use crate::types::{MaxOutputTokens, ModelId, ParseError, ToolName};
+
+/// Maximum bytes accepted in a `ToolCallId`.
+///
+/// Anthropic ids are short opaque strings (~30 chars). 256 bytes leaves headroom for any
+/// provider while bounding the size of an attribute that ends up on every span and every
+/// error.
+pub const TOOL_CALL_ID_MAX_BYTES: usize = 256;
 
 /// Identifier connecting an assistant `ToolCall` to its corresponding user `ToolResult`.
 ///
 /// Providers generate these and we round-trip them verbatim — never invent or rewrite.
+/// Construction is fallible: an empty or oversize id desyncs the call/result pairing,
+/// which is silent corruption, so we reject it at the boundary instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ToolCallId(pub Arc<str>);
+pub struct ToolCallId(Arc<str>);
 
 impl ToolCallId {
     #[must_use]
-    pub fn new(id: impl Into<Arc<str>>) -> Self {
-        Self(id.into())
-    }
-
-    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<&str> for ToolCallId {
+    type Error = ParseError;
+
+    fn try_from(raw: &str) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(ParseError::Empty {
+                field: "tool_call_id",
+            });
+        }
+        if raw.len() > TOOL_CALL_ID_MAX_BYTES {
+            return Err(ParseError::TooLong {
+                field: "tool_call_id",
+                max: TOOL_CALL_ID_MAX_BYTES,
+                got: raw.len(),
+            });
+        }
+        Ok(Self(Arc::from(raw)))
+    }
+}
+
+impl TryFrom<String> for ToolCallId {
+    type Error = ParseError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_from(raw.as_str())
     }
 }
 
@@ -136,5 +168,27 @@ impl ChatResponse {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_id_rejects_empty() {
+        assert!(ToolCallId::try_from("").is_err());
+    }
+
+    #[test]
+    fn tool_call_id_rejects_oversize() {
+        let big = "a".repeat(TOOL_CALL_ID_MAX_BYTES + 1);
+        assert!(ToolCallId::try_from(big.as_str()).is_err());
+    }
+
+    #[test]
+    fn tool_call_id_round_trips_verbatim() {
+        let id = ToolCallId::try_from("toolu_01abc").expect("valid");
+        assert_eq!(id.as_str(), "toolu_01abc");
     }
 }

@@ -3,8 +3,6 @@
 //! Kept in its own module so each direction sits in one place and the cognitive load of
 //! adding a new content variant is bounded.
 
-use std::sync::Arc;
-
 use claudius::{
     ContentBlock, MessageParam, MessageRole, Model, StopReason as ClaudiusStop, TextBlock,
     ToolParam, ToolResultBlock, ToolUnionParam, ToolUseBlock,
@@ -87,12 +85,13 @@ pub(super) fn block_to_assistant(block: ContentBlock) -> Option<AssistantContent
         ContentBlock::Text(t) => Some(AssistantContent::Text(t.text)),
         ContentBlock::Thinking(t) => Some(AssistantContent::Reasoning(t.thinking)),
         ContentBlock::ToolUse(t) => {
-            // A name we cannot parse means the upstream sent something we wouldn't have
-            // registered — drop it so the agent loop terminates cleanly rather than
+            // A name or id we cannot parse means the upstream sent something we wouldn't
+            // have registered — drop it so the agent loop terminates cleanly rather than
             // looping on an unknown tool.
             let name = ToolName::try_from(t.name.as_str()).ok()?;
+            let id = ToolCallId::try_from(t.id.as_str()).ok()?;
             Some(AssistantContent::ToolCall(ToolCall {
-                id: ToolCallId(Arc::from(t.id)),
+                id,
                 name,
                 input: t.input,
             }))

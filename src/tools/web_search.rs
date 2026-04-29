@@ -7,13 +7,115 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::instrument;
 
-use crate::types::{SecretString, ToolName};
+use crate::types::{ParseError, SecretString, ToolName};
 
 use super::limits::{SEARCH_DEFAULT_COUNT, SEARCH_MAX_COUNT, SEARCH_TIMEOUT};
 use super::traits::{Tool, ToolError};
 
 const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
 const SEARCH_QUERY_MAX_BYTES: usize = 400;
+/// Hard cap on the upstream error body included in a `ToolError::Upstream`.
+///
+/// Brave error responses are short JSON payloads; capping at 4 KB stops a runaway
+/// upstream from filling tracing fields and tool-result context.
+const UPSTREAM_BODY_MAX_BYTES: usize = 4 * 1024;
+
+// §5: the default count must always be a legal `SearchCount`. Pinned at compile time so
+// a future bump cannot silently invert the relationship.
+const _: () = assert!(SEARCH_DEFAULT_COUNT >= 1);
+const _: () = assert!(SEARCH_DEFAULT_COUNT <= SEARCH_MAX_COUNT);
+
+/// Validated search query.
+///
+/// Trimmed of leading/trailing whitespace and capped at [`SEARCH_QUERY_MAX_BYTES`]. The
+/// trim happens at parse time so the rest of the tool sees a single canonical form.
+#[derive(Debug, Clone)]
+struct SearchQuery(String);
+
+impl SearchQuery {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SearchQuery {
+    type Error = ParseError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ParseError::Empty {
+                field: "search_query",
+            });
+        }
+        if trimmed.len() > SEARCH_QUERY_MAX_BYTES {
+            return Err(ParseError::TooLong {
+                field: "search_query",
+                max: SEARCH_QUERY_MAX_BYTES,
+                got: trimmed.len(),
+            });
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchQuery {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(d)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validated result count: `1..=SEARCH_MAX_COUNT`. Default is [`SEARCH_DEFAULT_COUNT`].
+#[derive(Debug, Clone, Copy)]
+struct SearchCount(u8);
+
+impl SearchCount {
+    const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for SearchCount {
+    fn default() -> Self {
+        // §6: the relationship `SEARCH_DEFAULT_COUNT in 1..=SEARCH_MAX_COUNT` is pinned at
+        // compile time below, so this conversion cannot fail.
+        Self(SEARCH_DEFAULT_COUNT)
+    }
+}
+
+impl TryFrom<u8> for SearchCount {
+    type Error = ParseError;
+
+    fn try_from(n: u8) -> Result<Self, Self::Error> {
+        if n == 0 {
+            return Err(ParseError::OutOfRange {
+                field: "search_count",
+                detail: "must be >= 1",
+            });
+        }
+        if n > SEARCH_MAX_COUNT {
+            return Err(ParseError::OutOfRange {
+                field: "search_count",
+                detail: "exceeds ceiling",
+            });
+        }
+        Ok(Self(n))
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchCount {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = u8::deserialize(d)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Brave Search front-end. Behind the trait so the agent never knows which search
 /// vendor is in use; swapping vendors is one new file plus one composition-root edit.
@@ -55,9 +157,9 @@ impl WebSearchTool {
 
 #[derive(Debug, Deserialize)]
 struct Input {
-    query: String,
+    query: SearchQuery,
     #[serde(default)]
-    count: Option<u8>,
+    count: SearchCount,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,36 +205,25 @@ impl Tool for WebSearchTool {
         let Input { query, count } = serde_json::from_value(input)
             .map_err(|e| ToolError::InvalidInput(format!("web_search: {e}")))?;
 
-        let trimmed = query.trim();
-        if trimmed.is_empty() {
-            return Err(ToolError::InvalidInput("query must not be empty".into()));
-        }
-        if trimmed.len() > SEARCH_QUERY_MAX_BYTES {
-            return Err(ToolError::InvalidInput(format!(
-                "query exceeds {SEARCH_QUERY_MAX_BYTES} bytes"
-            )));
-        }
-
-        let count = count
-            .unwrap_or(SEARCH_DEFAULT_COUNT)
-            .clamp(1, SEARCH_MAX_COUNT);
-
+        let count_str = count.get().to_string();
         let response = self
             .client
             .get(BRAVE_ENDPOINT)
             .timeout(SEARCH_TIMEOUT)
             .header("Accept", "application/json")
             .header("X-Subscription-Token", self.api_key.expose())
-            .query(&[("q", trimmed), ("count", count.to_string().as_str())])
+            .query(&[("q", query.as_str()), ("count", count_str.as_str())])
             .send()
             .await?;
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            // §5: cap the upstream body before surfacing it; a runaway 50 MB error page
+            // must not end up on a span attribute or in a tool result.
+            let body = response.text().await?;
             return Err(ToolError::Upstream {
                 status: status.as_u16(),
-                body,
+                body: truncate_to_chars(body, UPSTREAM_BODY_MAX_BYTES),
             });
         }
 
@@ -140,7 +231,7 @@ impl Tool for WebSearchTool {
         let results = parsed.web.map(|w| w.results).unwrap_or_default();
 
         if results.is_empty() {
-            return Ok(format!("No results for query: {trimmed}"));
+            return Ok(format!("No results for query: {}", query.as_str()));
         }
 
         let mut out = String::with_capacity(results.len() * 256);
@@ -158,5 +249,69 @@ impl Tool for WebSearchTool {
             assert!(res.is_ok(), "writing to String never errors");
         }
         Ok(out)
+    }
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint.
+fn truncate_to_chars(mut s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_query_rejects_empty_and_whitespace() {
+        assert!(serde_json::from_value::<SearchQuery>(json!("")).is_err());
+        assert!(serde_json::from_value::<SearchQuery>(json!("   \n")).is_err());
+    }
+
+    #[test]
+    fn search_query_rejects_oversize() {
+        let big = "a".repeat(SEARCH_QUERY_MAX_BYTES + 1);
+        assert!(serde_json::from_value::<SearchQuery>(json!(big)).is_err());
+    }
+
+    #[test]
+    fn search_query_trims_at_boundary() {
+        let q: SearchQuery = serde_json::from_value(json!("  hello world  ")).expect("valid");
+        assert_eq!(q.as_str(), "hello world");
+    }
+
+    #[test]
+    fn search_count_rejects_zero_and_overflow() {
+        assert!(serde_json::from_value::<SearchCount>(json!(0)).is_err());
+        let too_big = u64::from(SEARCH_MAX_COUNT) + 1;
+        assert!(serde_json::from_value::<SearchCount>(json!(too_big)).is_err());
+    }
+
+    #[test]
+    fn search_count_default_matches_constant() {
+        assert_eq!(SearchCount::default().get(), SEARCH_DEFAULT_COUNT);
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        // Multi-byte char straddling the cap must not panic and must not be split.
+        let s = "aaa🦀bbb".to_string();
+        // the crab emoji is at byte offset 3 (4 bytes long)
+        let out = truncate_to_chars(s, 5);
+        assert!(out.is_char_boundary(out.len()));
+        assert_eq!(out, "aaa");
+    }
+
+    #[test]
+    fn truncate_noop_when_under_cap() {
+        let out = truncate_to_chars("short".to_string(), 100);
+        assert_eq!(out, "short");
     }
 }

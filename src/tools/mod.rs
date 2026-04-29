@@ -14,6 +14,7 @@ mod url;
 mod web_fetch;
 mod web_search;
 
+pub use limits::TOOL_RESULT_MAX_BYTES;
 pub use registry::{ToolRegistry, ToolRegistryBuilder};
 pub use traits::{SharedTool, Tool, ToolError};
 pub use url::{FetchUrl, UrlError};

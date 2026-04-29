@@ -120,7 +120,7 @@ fn text_response(s: &str, stop: StopReason) -> ChatResponse {
 fn tool_call_response(name: &str, id: &str) -> ChatResponse {
     ChatResponse {
         content: vec![AssistantContent::ToolCall(ToolCall {
-            id: ToolCallId(Arc::from(id)),
+            id: ToolCallId::try_from(id).expect("valid"),
             name: ToolName::try_from(name).expect("valid"),
             input: json!({}),
         })],

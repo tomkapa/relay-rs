@@ -5,6 +5,7 @@ use async_trait::async_trait;
 
 use crate::provider::{ChatResponse, ToolCall, ToolResult};
 use crate::session::SessionId;
+use crate::types::TurnIndex;
 
 use super::error::HookError;
 
@@ -28,14 +29,14 @@ impl HookDecision {
 #[derive(Debug, Clone, Copy)]
 pub struct TurnContext {
     pub session_id: SessionId,
-    pub turn_index: u32,
+    pub turn_index: TurnIndex,
 }
 
 /// Read-only snapshot of agent state at a tool boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolContext<'a> {
     pub session_id: SessionId,
-    pub turn_index: u32,
+    pub turn_index: TurnIndex,
     pub call: &'a ToolCall,
 }
 

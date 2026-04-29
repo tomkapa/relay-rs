@@ -12,8 +12,8 @@ use crate::provider::{
     ToolResult, UserContent,
 };
 use crate::session::{SessionId, SharedSessionStore};
-use crate::tools::ToolRegistry;
-use crate::types::{MaxOutputTokens, MaxTurns, ModelId, Prompt};
+use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolRegistry};
+use crate::types::{MaxOutputTokens, MaxTurns, ModelId, Prompt, TurnIndex};
 
 use super::error::AgentError;
 use super::limits::MAX_TOOL_CALLS_PER_TURN;
@@ -104,9 +104,14 @@ impl Agent {
                 return Err(AgentError::Cancelled);
             }
 
+            // §6: `MaxTurns::try_from` rejects anything > `MAX_TURNS_CAP`, and `turn` is
+            // strictly less than `max_turns.get()`. The conversion is therefore an
+            // assertion of an invariant established at agent construction.
+            let turn_index = TurnIndex::try_from(turn)
+                .expect("invariant: max_turns is bounded so loop index is a valid TurnIndex");
             let ctx = TurnContext {
                 session_id: session,
-                turn_index: turn,
+                turn_index,
             };
             self.guard(self.hooks.before_turn(ctx).await?)?;
 
@@ -227,6 +232,23 @@ impl Agent {
 
         match outcome {
             Ok(Ok(output)) => {
+                if output.len() > TOOL_RESULT_MAX_BYTES {
+                    warn!(
+                        relay.tool = %call.name,
+                        bytes = output.len(),
+                        cap = TOOL_RESULT_MAX_BYTES,
+                        "tool.result.too_large",
+                    );
+                    return error_result(
+                        id,
+                        format!(
+                            "tool `{}` returned {} bytes; cap is {} bytes",
+                            call.name,
+                            output.len(),
+                            TOOL_RESULT_MAX_BYTES,
+                        ),
+                    );
+                }
                 debug!(relay.tool = %call.name, bytes = output.len(), "tool.result.ok");
                 ToolResult {
                     call_id: id,
@@ -254,9 +276,20 @@ impl Agent {
 }
 
 fn error_result(call_id: ToolCallId, message: String) -> ToolResult {
+    // Defence in depth: the cap on tool output applies just as much to error messages.
+    // Tool authors who embed an upstream body in their error must respect this; we cap
+    // here as a final boundary so a bad implementation cannot blow the budget.
+    let mut output = message;
+    if output.len() > TOOL_RESULT_MAX_BYTES {
+        let mut cut = TOOL_RESULT_MAX_BYTES;
+        while cut > 0 && !output.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        output.truncate(cut);
+    }
     ToolResult {
         call_id,
-        output: message,
+        output,
         is_error: true,
     }
 }
