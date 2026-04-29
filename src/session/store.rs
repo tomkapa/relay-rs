@@ -25,6 +25,14 @@ impl SessionId {
     pub fn as_uuid(self) -> Uuid {
         self.0
     }
+
+    /// Reconstruct an id from its wire representation. The UUID itself carries no
+    /// domain invariant — whether the session exists is a separate, storage-side
+    /// check that returns [`SessionError::NotFound`].
+    #[must_use]
+    pub const fn from_uuid(raw: Uuid) -> Self {
+        Self(raw)
+    }
 }
 
 impl Default for SessionId {
@@ -51,7 +59,7 @@ impl fmt::Display for SessionId {
 /// borrow — every concrete backend (Postgres, Redis, S3) needs to allocate anyway, and
 /// the caller (the agent) consumes the snapshot when building the next request.
 #[async_trait]
-pub trait SessionStore: Send + Sync {
+pub trait SessionStore: fmt::Debug + Send + Sync {
     async fn create(&self) -> Result<SessionId, SessionError>;
     async fn append(&self, id: SessionId, message: ChatMessage) -> Result<(), SessionError>;
     async fn snapshot(&self, id: SessionId) -> Result<Vec<ChatMessage>, SessionError>;
@@ -59,37 +67,7 @@ pub trait SessionStore: Send + Sync {
 }
 
 /// Cheap-clone handle so `Agent` can hold the store without a generic parameter.
-#[derive(Clone)]
-pub struct SharedSessionStore(Arc<dyn SessionStore>);
-
-impl SharedSessionStore {
-    #[must_use]
-    pub fn new(store: Arc<dyn SessionStore>) -> Self {
-        Self(store)
-    }
-
-    pub async fn create(&self) -> Result<SessionId, SessionError> {
-        self.0.create().await
-    }
-
-    pub async fn append(&self, id: SessionId, message: ChatMessage) -> Result<(), SessionError> {
-        self.0.append(id, message).await
-    }
-
-    pub async fn snapshot(&self, id: SessionId) -> Result<Vec<ChatMessage>, SessionError> {
-        self.0.snapshot(id).await
-    }
-
-    pub async fn delete(&self, id: SessionId) -> Result<(), SessionError> {
-        self.0.delete(id).await
-    }
-}
-
-impl fmt::Debug for SharedSessionStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("SharedSessionStore").finish()
-    }
-}
+pub type SharedSessionStore = Arc<dyn SessionStore>;
 
 /// Process-local session storage. Suitable for the REPL and for tests; replace with a
 /// durable backend when persistence matters.

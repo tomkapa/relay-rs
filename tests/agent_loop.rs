@@ -129,8 +129,8 @@ fn tool_call_response(name: &str, id: &str) -> ChatResponse {
 }
 
 fn build(provider: Arc<ScriptedProvider>, tools: Vec<SharedTool>) -> relay_rs::Agent {
-    let provider = SharedProvider::new(provider);
-    let sessions = SharedSessionStore::new(Arc::new(InMemorySessionStore::new()));
+    let provider: SharedProvider = provider;
+    let sessions: SharedSessionStore = Arc::new(InMemorySessionStore::new());
     let memory: SharedMemory = Arc::new(StaticMemory::new("test prompt"));
     let model = ModelId::try_from("test-model").expect("valid");
     let mut builder = ToolRegistry::builder();
@@ -155,7 +155,7 @@ async fn returns_text_when_no_tool_call() {
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("hello").expect("prompt");
     let reply = agent
-        .reply(session, prompt, CancellationToken::new())
+        .reply(session, vec![prompt], CancellationToken::new(), None)
         .await
         .expect("reply");
 
@@ -175,7 +175,7 @@ async fn runs_tool_then_returns_text() {
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("use the tool").expect("prompt");
     let reply = agent
-        .reply(session, prompt, CancellationToken::new())
+        .reply(session, vec![prompt], CancellationToken::new(), None)
         .await
         .expect("reply");
 
@@ -196,7 +196,7 @@ async fn unknown_tool_does_not_loop_forever() {
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("try the missing tool").expect("prompt");
     let reply = agent
-        .reply(session, prompt, CancellationToken::new())
+        .reply(session, vec![prompt], CancellationToken::new(), None)
         .await
         .expect("reply");
 
@@ -217,7 +217,7 @@ async fn cancellation_short_circuits() {
     cancel.cancel();
 
     let err = agent
-        .reply(session, prompt, cancel)
+        .reply(session, vec![prompt], cancel, None)
         .await
         .expect_err("cancelled");
     matches!(err, relay_rs::AgentError::Cancelled);
@@ -236,7 +236,7 @@ async fn provider_specs_match_registered_tools() {
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("hi").expect("prompt");
     let _ = agent
-        .reply(session, prompt, CancellationToken::new())
+        .reply(session, vec![prompt], CancellationToken::new(), None)
         .await
         .expect("reply");
 

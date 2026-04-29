@@ -14,7 +14,7 @@ use super::error::ProviderError;
 /// * SHOULD respect cancellation by returning promptly when the future is dropped (the
 ///   agent layer wraps every call in `tokio::time::timeout`).
 #[async_trait]
-pub trait LlmProvider: Send + Sync {
+pub trait LlmProvider: fmt::Debug + Send + Sync {
     /// Identifier used in tracing fields (`relay.provider`). Low-cardinality, stable.
     fn name(&self) -> &'static str;
 
@@ -22,29 +22,4 @@ pub trait LlmProvider: Send + Sync {
 }
 
 /// Reference-counted handle so the agent can clone cheaply without taking a generic.
-#[derive(Clone)]
-pub struct SharedProvider(Arc<dyn LlmProvider>);
-
-impl SharedProvider {
-    #[must_use]
-    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
-        Self(provider)
-    }
-
-    #[must_use]
-    pub fn name(&self) -> &'static str {
-        self.0.name()
-    }
-
-    pub async fn send(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-        self.0.send(request).await
-    }
-}
-
-impl fmt::Debug for SharedProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedProvider")
-            .field("name", &self.0.name())
-            .finish()
-    }
-}
+pub type SharedProvider = Arc<dyn LlmProvider>;

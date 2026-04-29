@@ -1,0 +1,194 @@
+{
+  "info": {
+    "name": "relay-rs",
+    "_postman_id": "f7a1d3c0-0001-4a01-9a01-relay-rs-collection",
+    "description": "HTTP surface for relay-rs (see doc/task1.md). Run requests in order; the test scripts capture `session_id` and `request_id` into collection variables so dependent requests work without manual copy-paste.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8080",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "request_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "idempotency_key",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "last_event_id",
+      "value": "",
+      "type": "string",
+      "description": "Set this to resume an SSE stream after a disconnect; leave empty for a fresh subscription."
+    }
+  ],
+  "item": [
+    {
+      "name": "POST /sessions — create a session",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Accept", "value": "application/json" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/sessions",
+          "host": ["{{base_url}}"],
+          "path": ["sessions"]
+        },
+        "description": "Allocates a fresh session id. Returns `{ session_id }`."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const json = pm.response.json();",
+              "pm.expect(json.session_id, 'session_id present').to.be.a('string');",
+              "pm.collectionVariables.set('session_id', json.session_id);",
+              "console.log('session_id =', json.session_id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /prompts — submit a prompt",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/prompts",
+          "host": ["{{base_url}}"],
+          "path": ["prompts"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"content\": \"Hello, who are you?\",\n  \"idempotency_key\": \"{{idempotency_key}}\"\n}"
+        },
+        "description": "Enqueues a prompt for the given session. Replays of the same idempotency_key return the original request_id (with status 200 instead of 202). The pre-request script auto-generates a fresh idempotency_key per send so repeated clicks are not deduped."
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Generate a fresh idempotency key on every send so a repeated click",
+              "// is treated as a new request. Override the variable manually if you",
+              "// want to test the dedup path.",
+              "const key = 'pm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);",
+              "pm.collectionVariables.set('idempotency_key', key);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 or 202', () => pm.expect(pm.response.code).to.be.oneOf([200, 202]));",
+              "const json = pm.response.json();",
+              "pm.expect(json.request_id, 'request_id present').to.be.a('string');",
+              "pm.collectionVariables.set('request_id', json.request_id);",
+              "console.log('request_id =', json.request_id, 'status =', json.status);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /prompts — idempotent retry (same key)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/prompts",
+          "host": ["{{base_url}}"],
+          "path": ["prompts"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"content\": \"Hello, who are you?\",\n  \"idempotency_key\": \"{{idempotency_key}}\"\n}"
+        },
+        "description": "Reuses the idempotency_key set by the previous request. Server should return the same request_id with status 200 (the row already existed)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 (existing)', () => pm.response.to.have.status(200));",
+              "const json = pm.response.json();",
+              "pm.expect(json.request_id).to.eql(pm.collectionVariables.get('request_id'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "GET /requests/{id}/stream — subscribe to SSE",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Accept", "value": "text/event-stream" },
+          {
+            "key": "Last-Event-ID",
+            "value": "{{last_event_id}}",
+            "description": "Optional — resume after a disconnect. Leave the collection variable empty for a fresh subscription.",
+            "disabled": false
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/requests/{{request_id}}/stream",
+          "host": ["{{base_url}}"],
+          "path": ["requests", "{{request_id}}", "stream"]
+        },
+        "description": "Server-Sent Events stream of response chunks. Postman renders the response progressively; events have type `text` | `tool_call` | `tool_result` | `done` | `error` | `stalled`. Each event's `id:` is a monotonic chunk seq — pass it back as `Last-Event-ID` to resume."
+      }
+    },
+    {
+      "name": "POST /requests/{id}/cancel — request cancellation",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/requests/{{request_id}}/cancel",
+          "host": ["{{base_url}}"],
+          "path": ["requests", "{{request_id}}", "cancel"]
+        },
+        "description": "Marks `cancellation_requested = true` on the request. The worker honours it at the next turn boundary (per task1.md §Worker loop)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('204 No Content', () => pm.response.to.have.status(204));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use config::{Config, ConfigError, Environment};
 use serde::Deserialize;
 use thiserror::Error;
@@ -20,10 +22,16 @@ pub struct Settings {
     pub brave_search_api_key: SecretString,
     #[serde(default = "default_model")]
     pub model: ModelId,
+    #[serde(default = "default_http_addr")]
+    pub http_addr: SocketAddr,
 }
 
 fn default_model() -> ModelId {
     ModelId::try_from("claude-sonnet-4-5").expect("static default model id is valid")
+}
+
+fn default_http_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8080))
 }
 
 impl Settings {

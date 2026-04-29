@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::clock::SharedClock;
+use crate::clock::{SharedClock, SystemClock};
 use crate::hook::HookChain;
 use crate::memory::SharedMemory;
 use crate::provider::SharedProvider;
@@ -45,7 +45,7 @@ impl AgentBuilder {
             provider,
             sessions,
             memory,
-            clock: SharedClock::system(),
+            clock: SystemClock::shared(),
             tools: ToolRegistry::empty(),
             hooks: HookChain::new(),
             model,

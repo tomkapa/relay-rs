@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::types::{MaxOutputTokens, ModelId, ParseError, ToolName};
@@ -61,6 +62,25 @@ impl TryFrom<String> for ToolCallId {
     }
 }
 
+impl Serialize for ToolCallId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCallId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A single message in the conversation, distinguished by speaker. Each role permits a
 /// different set of content blocks — the enum encodes that asymmetry.
 #[derive(Debug, Clone)]
@@ -87,7 +107,7 @@ pub enum AssistantContent {
 }
 
 /// A model-issued request to invoke a tool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: ToolName,
@@ -95,7 +115,7 @@ pub struct ToolCall {
 }
 
 /// The result of running a tool, threaded back to the model in the next turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolResult {
     pub call_id: ToolCallId,
     pub output: String,

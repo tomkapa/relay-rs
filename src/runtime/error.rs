@@ -1,0 +1,68 @@
+use std::time::Duration;
+
+use thiserror::Error;
+
+use crate::session::{SessionError, SessionId};
+use crate::types::ParseError;
+
+use super::types::{PromptRequestId, SeqOverflow};
+
+/// Construction-time error for [`crate::runtime::queue::LeaseTiming`]. Surfaces
+/// at startup so a misconfigured deployment fails before serving traffic.
+#[derive(Debug, Error)]
+pub enum LeaseTimingError {
+    #[error("heartbeat interval must be > 0")]
+    IntervalZero,
+    #[error(
+        "heartbeat interval ({heartbeat_interval:?}) must be strictly less than \
+         lease ttl ({ttl:?}); otherwise the lease silently expires between beats"
+    )]
+    IntervalNotUnderTtl {
+        ttl: Duration,
+        heartbeat_interval: Duration,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum PromptError {
+    #[error("session: {0}")]
+    Session(#[from] SessionError),
+
+    #[error("parse: {0}")]
+    Parse(#[from] ParseError),
+
+    #[error("session {session:?} has reached its pending cap of {max}")]
+    PendingCapExceeded { session: SessionId, max: usize },
+
+    #[error("request {0:?} not found")]
+    RequestNotFound(PromptRequestId),
+
+    #[error("session {0:?} not found")]
+    SessionNotFound(SessionId),
+
+    #[error("lease for session {session:?} expired or superseded")]
+    LeaseStale { session: SessionId },
+
+    #[error("sequence: {0}")]
+    Sequence(#[from] SeqOverflow),
+
+    #[error("queue backend error: {0}")]
+    Backend(String),
+}
+
+/// Failure modes for response delivery — distinct from queue errors so HTTP can map
+/// each cleanly to a status code.
+#[derive(Debug, Error)]
+pub enum ResponseError {
+    #[error("request {0:?} has no active or persisted stream")]
+    NotFound(PromptRequestId),
+
+    #[error("subscriber lagged past the chunk buffer; reconnect with Last-Event-ID")]
+    Lagged,
+
+    #[error("sequence: {0}")]
+    Sequence(#[from] SeqOverflow),
+
+    #[error("response sink backend error: {0}")]
+    Backend(String),
+}

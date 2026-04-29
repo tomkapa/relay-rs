@@ -8,8 +8,8 @@ use crate::clock::SharedClock;
 use crate::hook::{HookChain, HookDecision, ToolContext, TurnContext};
 use crate::memory::SharedMemory;
 use crate::provider::{
-    AssistantContent, ChatMessage, ChatRequest, ChatResponse, SharedProvider, ToolCall, ToolCallId,
-    ToolResult, UserContent,
+    ChatMessage, ChatRequest, ChatResponse, SharedProvider, ToolCall, ToolCallId, ToolResult,
+    UserContent,
 };
 use crate::session::{SessionId, SharedSessionStore};
 use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolRegistry};
@@ -17,6 +17,7 @@ use crate::types::{MaxOutputTokens, MaxTurns, ModelId, Prompt, TurnIndex};
 
 use super::error::AgentError;
 use super::limits::MAX_TOOL_CALLS_PER_TURN;
+use super::observer::SharedTurnObserver;
 
 /// The agent runtime. All collaborators live behind shared trait handles so the agent
 /// is end-to-end testable with no network and so any one of them can be swapped without
@@ -73,9 +74,13 @@ impl Agent {
         Ok(self.sessions.create().await?)
     }
 
-    /// Drive one user prompt to a final assistant text answer, running tool calls in
-    /// between turns. Honours `cancel`: if the token fires, returns
-    /// [`AgentError::Cancelled`] at the next checkpoint.
+    /// Drive a batch of user prompts (a single user message with one text block per
+    /// prompt) to a final assistant text answer, running tool calls in between turns.
+    /// Honours `cancel`: returns [`AgentError::Cancelled`] at the next checkpoint.
+    ///
+    /// `observer` (if `Some`) is notified at every assistant content block and every
+    /// tool result so the SSE pipeline can stream chunks as the loop progresses
+    /// rather than at the very end.
     #[instrument(
         name = "agent.reply",
         skip_all,
@@ -83,71 +88,95 @@ impl Agent {
             relay.session.id = %session,
             relay.provider = self.provider.name(),
             relay.model = %self.model,
+            relay.batch_size = prompts.len(),
             relay.max_turns = self.max_turns.get(),
         ),
     )]
     pub async fn reply(
         &self,
         session: SessionId,
-        prompt: Prompt,
+        prompts: Vec<Prompt>,
         cancel: CancellationToken,
+        observer: Option<SharedTurnObserver>,
     ) -> Result<String, AgentError> {
+        // §6: a worker only calls this after draining at least one prompt.
+        assert!(!prompts.is_empty(), "reply requires at least one prompt");
+        let user_blocks: Vec<UserContent> = prompts
+            .into_iter()
+            .map(|p| UserContent::Text(p.into_string()))
+            .collect();
         self.sessions
-            .append(
-                session,
-                ChatMessage::User(vec![UserContent::Text(prompt.into_string())]),
-            )
+            .append(session, ChatMessage::User(user_blocks))
             .await?;
 
+        let observer = observer.as_ref();
         for turn in 0..self.max_turns.get() {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-
-            // §6: `MaxTurns::try_from` rejects anything > `MAX_TURNS_CAP`, and `turn` is
-            // strictly less than `max_turns.get()`. The conversion is therefore an
-            // assertion of an invariant established at agent construction.
             let turn_index = TurnIndex::try_from(turn)
                 .expect("invariant: max_turns is bounded so loop index is a valid TurnIndex");
             let ctx = TurnContext {
                 session_id: session,
                 turn_index,
             };
-            self.guard(self.hooks.before_turn(ctx).await?)?;
-
-            let response = self.send_one_turn(session, &cancel).await?;
-
-            self.guard(self.hooks.after_turn(ctx, &response).await?)?;
-
-            self.sessions
-                .append(session, ChatMessage::Assistant(response.content.clone()))
-                .await?;
-
-            let tool_calls = response.tool_calls();
-            if tool_calls.is_empty() {
-                let text = response.text();
-                if text.is_empty() {
-                    return Err(AgentError::EmptyReply);
-                }
+            if let Some(text) = self.run_turn(ctx, &cancel, observer).await? {
                 info!(turn, "agent.turn.final");
                 return Ok(text);
             }
-            if tool_calls.len() > MAX_TOOL_CALLS_PER_TURN {
-                return Err(AgentError::TooManyToolCalls {
-                    max: MAX_TOOL_CALLS_PER_TURN,
-                });
-            }
+        }
+        Err(AgentError::MaxTurnsExceeded(self.max_turns.get()))
+    }
 
-            let results = self.run_tools(ctx, &tool_calls, &cancel).await?;
-            self.sessions
-                .append(
-                    session,
-                    ChatMessage::User(results.into_iter().map(UserContent::ToolResult).collect()),
-                )
-                .await?;
+    /// Run one provider call + its tool-call follow-up. Returns `Some(text)` when the
+    /// turn ends with a final answer; `None` to continue the loop.
+    async fn run_turn(
+        &self,
+        ctx: TurnContext,
+        cancel: &CancellationToken,
+        observer: Option<&SharedTurnObserver>,
+    ) -> Result<Option<String>, AgentError> {
+        self.guard(self.hooks.before_turn(ctx).await?)?;
+        let response = self.send_one_turn(ctx.session_id, cancel).await?;
+        self.guard(self.hooks.after_turn(ctx, &response).await?)?;
+
+        // Stream every assistant content block (text, reasoning, tool call) before
+        // the tools run, so a UI sees the model's thinking and intent immediately.
+        if let Some(obs) = observer {
+            for block in &response.content {
+                obs.on_assistant(block).await;
+            }
         }
 
-        Err(AgentError::MaxTurnsExceeded(self.max_turns.get()))
+        self.sessions
+            .append(
+                ctx.session_id,
+                ChatMessage::Assistant(response.content.clone()),
+            )
+            .await?;
+
+        let tool_calls = response.tool_calls();
+        if tool_calls.is_empty() {
+            let text = response.text();
+            if text.is_empty() {
+                return Err(AgentError::EmptyReply);
+            }
+            return Ok(Some(text));
+        }
+        if tool_calls.len() > MAX_TOOL_CALLS_PER_TURN {
+            return Err(AgentError::TooManyToolCalls {
+                max: MAX_TOOL_CALLS_PER_TURN,
+            });
+        }
+
+        let results = self.run_tools(ctx, &tool_calls, cancel, observer).await?;
+        self.sessions
+            .append(
+                ctx.session_id,
+                ChatMessage::User(results.into_iter().map(UserContent::ToolResult).collect()),
+            )
+            .await?;
+        Ok(None)
     }
 
     /// Construct one provider request from current session state and run it under the
@@ -188,12 +217,14 @@ impl Agent {
 
     /// Execute every tool call from the assistant turn, returning a `ToolResult` for
     /// each — never short-circuits on the first error so the model receives a complete
-    /// picture of what happened.
+    /// picture of what happened. Each result is streamed through `observer` (if set)
+    /// the instant it lands, ahead of the next provider call.
     async fn run_tools(
         &self,
         ctx: TurnContext,
         calls: &[&ToolCall],
         cancel: &CancellationToken,
+        observer: Option<&SharedTurnObserver>,
     ) -> Result<Vec<ToolResult>, AgentError> {
         let mut out = Vec::with_capacity(calls.len());
         for call in calls {
@@ -208,6 +239,9 @@ impl Agent {
             self.guard(self.hooks.before_tool(tool_ctx).await?)?;
             let result = self.run_one_tool(call, cancel).await;
             self.guard(self.hooks.after_tool(tool_ctx, &result).await?)?;
+            if let Some(obs) = observer {
+                obs.on_tool_result(&result).await;
+            }
             out.push(result);
         }
         Ok(out)
@@ -292,10 +326,4 @@ fn error_result(call_id: ToolCallId, message: String) -> ToolResult {
         output,
         is_error: true,
     }
-}
-
-// Pull AssistantContent into scope so doc-cross-refs in this module's tests resolve.
-#[allow(dead_code)]
-fn _doc_link() -> Option<AssistantContent> {
-    None
 }

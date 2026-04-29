@@ -9,6 +9,7 @@ mod builder;
 mod core;
 mod error;
 mod limits;
+mod observer;
 
 pub use builder::AgentBuilder;
 pub use core::Agent;
@@ -17,3 +18,4 @@ pub use limits::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TURNS, MAX_TOOL_CALLS_PER_TURN, PROVIDER_CALL_TIMEOUT,
     TOOL_CALL_TIMEOUT,
 };
+pub use observer::{NoopObserver, SharedTurnObserver, TurnObserver};

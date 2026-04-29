@@ -1,3 +1,6 @@
+use std::io;
+use std::net::SocketAddr;
+
 use thiserror::Error;
 
 use crate::config::SettingsError;
@@ -20,4 +23,11 @@ pub enum AppError {
 
     #[error("http client init: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("http bind {http_addr}: {source}")]
+    Bind {
+        http_addr: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
 }
