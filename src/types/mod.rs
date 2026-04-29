@@ -1,0 +1,19 @@
+//! Domain primitives — the only types that cross module boundaries.
+//!
+//! Per CLAUDE.md §1: every value carrying an invariant (logical or business) is a newtype
+//! with a `TryFrom` smart constructor. Bare `String` / `u32` / `Uuid` are reserved for values
+//! that genuinely have none.
+
+mod error;
+mod limits;
+mod model_id;
+mod prompt;
+mod secret;
+mod tool_name;
+
+pub use error::ParseError;
+pub use limits::{MAX_OUTPUT_TOKENS_CAP, MAX_TURNS_CAP, MaxOutputTokens, MaxTurns};
+pub use model_id::ModelId;
+pub use prompt::{PROMPT_MAX_BYTES, Prompt};
+pub use secret::SecretString;
+pub use tool_name::{TOOL_NAME_MAX_LEN, ToolName};

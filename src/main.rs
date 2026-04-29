@@ -2,8 +2,7 @@ mod cli;
 
 use anyhow::{Context, Result};
 
-use relay_rs::tools::default_registry;
-use relay_rs::{Agent, AppState, MemoryManager, Settings, observability};
+use relay_rs::{Settings, app, observability};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -11,10 +10,7 @@ async fn main() -> Result<()> {
     observability::init();
 
     let settings = Settings::load().context("load settings")?;
-    let state = AppState::from_settings(settings).context("init app state")?;
+    let agent = app::build_agent(settings).context("compose agent")?;
 
-    let memory = MemoryManager::with_tools(default_registry(&state));
-    let agent = Agent::new(state, memory);
-
-    cli::run(&agent).await
+    cli::run(agent).await
 }

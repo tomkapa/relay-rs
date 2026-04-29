@@ -2,20 +2,93 @@
 name = "relay-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Provider-agnostic, hookable agent runtime in Rust."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tomtran/relay-rs"
+readme = "CLAUDE.md"
+keywords = ["agent", "llm", "ai", "anthropic"]
+categories = ["asynchronous"]
+publish = false
 
 [dependencies]
+async-trait = "0.1"
 claudius = { version = "0.25", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+config = { version = "0.15", default-features = false }
+dotenvy = "0.15"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "io-std",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-thiserror = "2"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Binary entry only (CLAUDE.md §12 — `anyhow` may not appear in library signatures).
 anyhow = "1"
-config = { version = "0.15", default-features = false }
-dotenvy = "0.15"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 
 [profile.release]
 panic = "abort"
+codegen-units = 1
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+nonstandard_style = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Hard bans we always enforce.
+unwrap_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+as_conversions = "deny"
+mem_forget = "deny"
+float_cmp = "deny"
+
+# `expect()` is permitted with a justification message; we lint the message in code review,
+# not via clippy, so the lint is downgraded from `warn` to `allow`. See CLAUDE.md §6.
+expect_used = "allow"
+panic = "allow"
+
+# Stylistic/nursery lints that conflict with how this crate is structured.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+multiple_crate_versions = "allow"
+unnecessary_literal_bound = "allow"   # trait sig dictates `&str`; the lint forces `&'static str`.
+needless_pass_by_value = "allow"      # collides with our owned-by-default API style.
+significant_drop_in_scrutinee = "allow"
+significant_drop_tightening = "allow"
+doc_markdown = "allow"
+missing_const_for_fn = "allow"        # noisy; reach for it deliberately, not as a default.
+unused_self = "allow"
+redundant_clone = "allow"
+manual_let_else = "allow"
+case_sensitive_file_extension_comparisons = "allow"

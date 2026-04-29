@@ -1,13 +1,45 @@
 use thiserror::Error;
 
+use crate::hook::HookError;
+use crate::memory::MemoryError;
+use crate::provider::ProviderError;
+use crate::session::SessionError;
+
 #[derive(Debug, Error)]
 pub enum AgentError {
-    #[error("anthropic api error: {0}")]
-    Api(#[from] claudius::Error),
+    #[error("provider: {0}")]
+    Provider(#[from] ProviderError),
+
+    #[error("session: {0}")]
+    Session(#[from] SessionError),
+
+    #[error("memory: {0}")]
+    Memory(#[from] MemoryError),
+
+    #[error("hook: {0}")]
+    Hook(#[from] HookError),
+
+    #[error("hook denied: {0}")]
+    HookDenied(String),
+
+    #[error("provider call timed out")]
+    ProviderTimeout,
+
+    #[error("tool `{name}` timed out")]
+    ToolTimeout { name: String },
+
+    #[error("model issued an unknown tool: {0}")]
+    UnknownTool(String),
+
+    #[error("model issued more than {max} tool calls in a single turn")]
+    TooManyToolCalls { max: usize },
 
     #[error("max turns ({0}) exceeded without final reply")]
     MaxTurnsExceeded(u32),
 
-    #[error("model returned empty reply")]
+    #[error("provider returned no usable content")]
     EmptyReply,
+
+    #[error("agent cancelled")]
+    Cancelled,
 }
