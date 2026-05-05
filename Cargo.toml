@@ -18,6 +18,12 @@ claudius = { version = "0.25", default-features = false, features = ["rustls-tls
 config = { version = "0.15", default-features = false }
 dotenvy = "0.15"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# §8 (zero-dep bias): a turndown.js-style HTML→Markdown converter on top of html5ever.
+# A faithful in-tree implementation (entities, nested lists, tables, code blocks, malformed
+# markup) is well over 200 LOC and a known footgun. `htmd` rides on `html5ever`, so we get
+# spec-compliant parsing for free. Markdown halves typical page sizes for the model and
+# strips data-* / class noise that bloats LLM context. Owner: tools/.
+htmd = { version = "0.5", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
