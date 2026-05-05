@@ -20,5 +20,5 @@ pub mod tools;
 pub mod types;
 
 pub use agent::{Agent, AgentBuilder, AgentError};
-pub use config::{Settings, SettingsError};
+pub use config::{ProviderSettings, Settings, SettingsError};
 pub use error::AppError;

@@ -15,13 +15,14 @@ use tracing::{info, warn};
 
 use crate::agent::{Agent, AgentBuilder};
 use crate::clock::{SharedClock, SystemClock};
-use crate::config::Settings;
+use crate::config::{ProviderSettings, Settings};
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
 use crate::memory::{SharedMemory, StaticMemory};
 use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
+use crate::provider::openai::OpenAiProvider;
 use crate::runtime::{
     InMemoryPromptQueue, InMemoryResponseHub, SharedLeaseManager, SharedPromptQueue,
     SharedResponseSink, SharedResponseSource, WorkerConfig, WorkerPool, WorkerPoolHandle,
@@ -159,11 +160,15 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
 }
 
 fn build_provider(settings: &Settings) -> Result<SharedProvider, AppError> {
-    let provider = AnthropicProvider::new(
-        &settings.anthropic_api_key,
-        settings.anthropic_base_url.clone(),
-    )?;
-    Ok(Arc::new(provider))
+    let provider: SharedProvider = match &settings.provider {
+        ProviderSettings::Openai { api_key, base_url } => {
+            Arc::new(OpenAiProvider::new(api_key, base_url.clone()))
+        }
+        ProviderSettings::Anthropic { api_key, base_url } => {
+            Arc::new(AnthropicProvider::new(api_key, base_url.clone())?)
+        }
+    };
+    Ok(provider)
 }
 
 fn build_tools(settings: &Settings, http: Client) -> Result<ToolRegistry, AppError> {

@@ -7,6 +7,7 @@
 pub mod anthropic;
 mod chat;
 mod error;
+pub mod openai;
 mod traits;
 
 pub use chat::{
