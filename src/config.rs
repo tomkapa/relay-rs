@@ -30,6 +30,9 @@ pub struct Settings {
     pub brave_search_api_key: SecretString,
     pub model: ModelId,
     pub http_addr: SocketAddr,
+    /// Postgres connection string. Required at startup — there is no in-memory
+    /// fallback. Wrapped in [`SecretString`] because the URL embeds a password.
+    pub database_url: SecretString,
 }
 
 /// Provider selection + the credentials that go with it. Exhaustive — adding a backend
@@ -78,6 +81,7 @@ struct RawSettings {
     model: ModelId,
     #[serde(default = "default_http_addr")]
     http_addr: SocketAddr,
+    database_url: SecretString,
 }
 
 fn default_model() -> ModelId {
@@ -116,6 +120,7 @@ impl TryFrom<RawSettings> for Settings {
             brave_search_api_key: raw.brave_search_api_key,
             model: raw.model,
             http_addr: raw.http_addr,
+            database_url: raw.database_url,
         })
     }
 }
@@ -149,6 +154,7 @@ mod tests {
             brave_search_api_key: secret("brave"),
             model: default_model(),
             http_addr: default_http_addr(),
+            database_url: secret("postgres://relay:relay@localhost:5432/relay"),
         }
     }
 

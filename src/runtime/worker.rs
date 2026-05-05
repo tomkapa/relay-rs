@@ -34,12 +34,12 @@ use super::queue::{
     ClaimReceipt, ClaimedSession, LeaseTiming, SharedLeaseManager, SharedPromptQueue,
 };
 use super::response::{ResponseChunk, SharedResponseSink};
-use super::types::{FailureReason, PromptRequestId, RequestStatus, WorkerId};
+use super::types::{FailureReason, PromptRequestId, WorkerId};
 
 /// Construction-time configuration for the pool.
 ///
 /// `lease_timing` is shared with the queue: construct a single [`LeaseTiming`] and
-/// pass it to both [`InMemoryPromptQueue::with_caps`](super::queue::InMemoryPromptQueue::with_caps)
+/// pass it to both [`PgPromptQueue::with_caps`](super::pg_queue::PgPromptQueue::with_caps)
 /// and this struct so the worker's heartbeat cadence is co-validated with the queue's TTL.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -244,9 +244,7 @@ impl Worker {
         for id in ids {
             match self.queue.status(*id).await {
                 Ok(view) => {
-                    if view.cancellation_requested
-                        || matches!(view.status, RequestStatus::Failed | RequestStatus::Done)
-                    {
+                    if view.cancellation_requested || view.status.is_terminal() {
                         return true;
                     }
                 }
@@ -286,11 +284,22 @@ impl Worker {
     }
 
     async fn handle_agent_error(&self, receipt: &ClaimReceipt, err: AgentError) {
+        // Exhaustive on purpose: a new `AgentError` variant must light up here so
+        // the operator decides which `FailureReason` the worker should park it as,
+        // rather than silently falling through to `Provider`.
         let reason = match err {
             AgentError::Cancelled => FailureReason::Cancelled,
             AgentError::ProviderTimeout => FailureReason::Timeout,
             AgentError::HookDenied(s) => FailureReason::Hook(s),
-            other => FailureReason::Provider(other.to_string()),
+            e @ (AgentError::Provider(_)
+            | AgentError::Session(_)
+            | AgentError::Memory(_)
+            | AgentError::Hook(_)
+            | AgentError::ToolTimeout { .. }
+            | AgentError::UnknownTool(_)
+            | AgentError::TooManyToolCalls { .. }
+            | AgentError::MaxTurnsExceeded(_)
+            | AgentError::EmptyReply) => FailureReason::Provider(e.to_string()),
         };
         warn!(reason = reason.label(), "worker.turn.error");
         self.publish_failure(receipt.ids(), &reason).await;
@@ -362,12 +371,7 @@ impl Worker {
                 for id in receipt.ids() {
                     match queue.status(*id).await {
                         Ok(view) => {
-                            if view.cancellation_requested
-                                || matches!(
-                                    view.status,
-                                    RequestStatus::Done | RequestStatus::Failed
-                                )
-                            {
+                            if view.cancellation_requested || view.status.is_terminal() {
                                 debug!(relay.request.id = %id, "worker.cancel_watcher.fire");
                                 cancel.cancel();
                                 return;
@@ -423,188 +427,5 @@ impl TurnObserver for FanOutObserver {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-    use futures::StreamExt as _;
-
-    use super::*;
-    use crate::agent::AgentBuilder;
-    use crate::clock::{SharedClock, TestClock};
-    use crate::hook::HookChain;
-    use crate::memory::{SharedMemory, StaticMemory};
-    use crate::provider::{
-        AssistantContent, ChatRequest, ChatResponse, LlmProvider, ProviderError, SharedProvider,
-        StopReason,
-    };
-    use crate::runtime::queue::{InMemoryPromptQueue, NewPromptRequest, PromptQueue as _};
-    use crate::runtime::response::{InMemoryResponseHub, ResponseSource as _};
-    use crate::runtime::types::IdempotencyKey;
-    use crate::session::{InMemorySessionStore, SharedSessionStore};
-    use crate::tools::ToolRegistry;
-    use crate::types::ModelId;
-
-    #[derive(Debug)]
-    struct ScriptedProvider {
-        responses: Vec<ChatResponse>,
-        cursor: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl LlmProvider for ScriptedProvider {
-        fn name(&self) -> &'static str {
-            "scripted-test"
-        }
-
-        async fn send(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
-            let i = self.cursor.fetch_add(1, Ordering::SeqCst);
-            self.responses
-                .get(i)
-                .cloned()
-                .ok_or_else(|| ProviderError::Transport("script exhausted".into()))
-        }
-    }
-
-    fn build_pool(
-        provider: Arc<ScriptedProvider>,
-    ) -> (
-        WorkerPoolHandle,
-        Arc<InMemoryPromptQueue>,
-        Arc<InMemoryResponseHub>,
-        SharedSessionStore,
-        Arc<TestClock>,
-    ) {
-        let test_clock = Arc::new(TestClock::new());
-        let clock: SharedClock = test_clock.clone();
-        let queue = Arc::new(InMemoryPromptQueue::new(clock.clone()));
-        let hub = Arc::new(InMemoryResponseHub::new());
-
-        let provider: SharedProvider = provider;
-        let sessions: SharedSessionStore = Arc::new(InMemorySessionStore::new());
-        let memory: SharedMemory = Arc::new(StaticMemory::new("test"));
-        let model = ModelId::try_from("test-model").expect("model");
-        let agent = AgentBuilder::new(provider, sessions.clone(), memory, model)
-            .expect("builder")
-            .with_clock(clock)
-            .with_tools(ToolRegistry::empty())
-            .with_hooks(HookChain::new())
-            .build();
-
-        let cfg = WorkerConfig {
-            workers: 1,
-            lease_timing: LeaseTiming::try_new(
-                Duration::from_millis(200),
-                Duration::from_millis(50),
-            )
-            .expect("valid timing"),
-            max_turn_duration: Duration::from_secs(5),
-            idle_poll: Duration::from_millis(20),
-            cancel_poll: Duration::from_millis(20),
-        };
-        let pool = WorkerPool::new(queue.clone(), queue.clone(), hub.clone(), agent, cfg);
-        let handle = pool.spawn();
-        (handle, queue, hub, sessions, test_clock)
-    }
-
-    fn req(session: crate::session::SessionId, content: &str, key: &str) -> NewPromptRequest {
-        NewPromptRequest {
-            session,
-            content: crate::types::Prompt::try_from(content).expect("p"),
-            idempotency_key: IdempotencyKey::try_from(key).expect("k"),
-        }
-    }
-
-    fn text_resp(s: &str) -> ChatResponse {
-        ChatResponse {
-            content: vec![AssistantContent::Text(s.into())],
-            stop_reason: StopReason::EndTurn,
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn worker_processes_a_pending_prompt_and_publishes_done() {
-        let provider = Arc::new(ScriptedProvider {
-            responses: vec![text_resp("hello back")],
-            cursor: AtomicUsize::new(0),
-        });
-        let (handle, queue, hub, sessions, _clock) = build_pool(provider);
-
-        let s = sessions.create().await.expect("session");
-        let id = queue
-            .enqueue(req(s, "hi", "k1"))
-            .await
-            .expect("enqueue")
-            .request_id();
-
-        let mut stream = hub.subscribe(id, None).await.expect("subscribe");
-        let mut got_done = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            let next = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
-            let Ok(Some(item)) = next else { continue };
-            let ev = item.expect("ok");
-            if let crate::runtime::response::StreamEvent::Chunk(env) = ev
-                && matches!(env.chunk, ResponseChunk::Done { .. })
-            {
-                got_done = true;
-                break;
-            }
-        }
-        assert!(got_done, "should have observed Done chunk");
-        // Done is published before `mark_done` runs; poll briefly so the test isn't
-        // racy with respect to that ordering.
-        let mut final_status = None;
-        for _ in 0..20 {
-            let view = queue.status(id).await.expect("status");
-            if matches!(view.status, RequestStatus::Done) {
-                final_status = Some(view.status);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(matches!(final_status, Some(RequestStatus::Done)));
-
-        handle.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn cancellation_before_turn_marks_request_failed() {
-        let provider = Arc::new(ScriptedProvider {
-            responses: vec![text_resp("never used")],
-            cursor: AtomicUsize::new(0),
-        });
-        let (handle, queue, _hub, sessions, _clock) = build_pool(provider);
-
-        let s = sessions.create().await.expect("session");
-        let id = queue
-            .enqueue(req(s, "hi", "k1"))
-            .await
-            .expect("enqueue")
-            .request_id();
-        // Cancel before the worker can pick it up. There's a tiny race here — we can't
-        // *guarantee* the worker hasn't claimed yet — but the assertion only requires
-        // that the request finishes in either Done or Failed state.
-        queue.request_cancellation(id).await.expect("cancel");
-
-        // Wait for terminal state.
-        let mut terminal = None;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let view = queue.status(id).await.expect("status");
-            if matches!(view.status, RequestStatus::Done | RequestStatus::Failed) {
-                terminal = Some(view.status);
-                break;
-            }
-        }
-        assert!(
-            terminal.is_some(),
-            "worker should have reached terminal state"
-        );
-
-        handle.shutdown().await;
-    }
-}
+// Worker-pool tests live in `tests/runtime_pipeline.rs`, against the real Pg
+// backends — see CLAUDE.md §3 (real Postgres for integration tests).

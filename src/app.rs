@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -24,15 +26,21 @@ use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::runtime::{
-    InMemoryPromptQueue, InMemoryResponseHub, SharedLeaseManager, SharedPromptQueue,
-    SharedResponseSink, SharedResponseSource, WorkerConfig, WorkerPool, WorkerPoolHandle,
+    PgPromptQueue, PgResponseHub, SharedLeaseManager, SharedPromptQueue, SharedResponseSink,
+    SharedResponseSource, WorkerConfig, WorkerPool, WorkerPoolHandle,
 };
-use crate::session::{InMemorySessionStore, SharedSessionStore};
+use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::{ToolRegistry, WebFetchTool, WebSearchTool};
 
 const HTTP_USER_AGENT: &str = concat!("relay-rs/", env!("CARGO_PKG_VERSION"));
 const HTTP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Pool sizing — each `relay-rs` process holds a single Postgres pool shared across
+/// the worker pool, the session store, and the response hub. CLAUDE.md §9: sized at
+/// startup; never grown on demand from a hot path.
+const PG_MAX_CONNECTIONS: u32 = 32;
+const PG_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are Relay, a helpful AI agent. \
     You are concise, accurate, and prefer to verify facts using your tools \
@@ -53,6 +61,7 @@ pub struct Server {
 #[derive(Debug)]
 struct Collaborators {
     provider: SharedProvider,
+    pool: PgPool,
     sessions: SharedSessionStore,
     memory: SharedMemory,
     clock: SharedClock,
@@ -60,13 +69,23 @@ struct Collaborators {
 }
 
 impl Collaborators {
-    fn new(settings: &Settings) -> Result<Self, AppError> {
+    async fn new(settings: &Settings) -> Result<Self, AppError> {
         let http = build_http_client()?;
+        let clock = SystemClock::shared();
+        let pool = connect_pool(settings).await?;
+        // Run migrations on startup so a fresh deploy picks up the schema without an
+        // operator step. CLAUDE.md §14: every change ships with a forward migration;
+        // this loop applies them in order.
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(|source| AppError::Migrate { source })?;
         Ok(Self {
             provider: build_provider(settings)?,
-            sessions: Arc::new(InMemorySessionStore::new()),
+            pool: pool.clone(),
+            sessions: Arc::new(PgSessionStore::new(pool, clock.clone())),
             memory: Arc::new(StaticMemory::new(DEFAULT_SYSTEM_PROMPT)),
-            clock: SystemClock::shared(),
+            clock,
             tools: build_tools(settings, http)?,
         })
     }
@@ -74,8 +93,8 @@ impl Collaborators {
 
 /// Build a fully-wired [`Agent`] from configuration. Kept for tests and any consumer
 /// that wants the agent without the HTTP/worker stack.
-pub fn build_agent(settings: Settings) -> Result<Agent, AppError> {
-    let pieces = Collaborators::new(&settings)?;
+pub async fn build_agent(settings: Settings) -> Result<Agent, AppError> {
+    let pieces = Collaborators::new(&settings).await?;
     Ok(build_agent_from(&pieces, &settings))
 }
 
@@ -95,15 +114,21 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
 
 /// Build the full HTTP + worker pool composition. The returned [`Server`] is ready to
 /// hand to `axum::serve` and a graceful-shutdown loop.
-pub fn build_server(settings: Settings) -> Result<Server, AppError> {
-    let pieces = Collaborators::new(&settings)?;
+pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
+    let pieces = Collaborators::new(&settings).await?;
     let agent = build_agent_from(&pieces, &settings);
 
-    let queue_impl = Arc::new(InMemoryPromptQueue::new(pieces.clock.clone()));
+    let queue_impl = Arc::new(PgPromptQueue::new(
+        pieces.pool.clone(),
+        pieces.clock.clone(),
+    ));
     let queue: SharedPromptQueue = queue_impl.clone();
     let leases: SharedLeaseManager = queue_impl;
 
-    let hub = Arc::new(InMemoryResponseHub::new());
+    let hub = Arc::new(PgResponseHub::new(
+        pieces.pool.clone(),
+        pieces.clock.clone(),
+    ));
     let sink: SharedResponseSink = hub.clone();
     let responses: SharedResponseSource = hub;
 
@@ -187,4 +212,13 @@ fn build_http_client() -> Result<Client, reqwest::Error> {
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .user_agent(HTTP_USER_AGENT)
         .build()
+}
+
+async fn connect_pool(settings: &Settings) -> Result<PgPool, AppError> {
+    PgPoolOptions::new()
+        .max_connections(PG_MAX_CONNECTIONS)
+        .acquire_timeout(PG_ACQUIRE_TIMEOUT)
+        .connect(settings.database_url.expose())
+        .await
+        .map_err(|source| AppError::DbConnect { source })
 }

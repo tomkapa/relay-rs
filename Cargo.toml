@@ -14,6 +14,11 @@ publish = false
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion", "byot"] }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log", "tracing", "macros"] }
+# §8 (zero-dep bias): wall-clock TIMESTAMPTZ bridge for storage code. The Clock trait
+# returns SystemTime, but sqlx maps Postgres TIMESTAMPTZ to chrono::DateTime<Utc> (or
+# time::OffsetDateTime). We prefer chrono because the CLAUDE.md §11 sample names it
+# directly; rolling our own date crate is firmly over the 200-LOC bar. Owner: storage/.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 claudius = { version = "0.25", default-features = false, features = ["rustls-tls"] }
 config = { version = "0.15", default-features = false }
 dotenvy = "0.15"
@@ -27,6 +32,20 @@ htmd = { version = "0.5", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# §8 (zero-dep bias): de-facto compile-time-checked Postgres driver for tokio. A
+# hand-rolled pool + protocol implementation is many thousands of LOC and a known
+# footgun; sqlx is actively maintained and lets us use `query!` / `query_as!` so SQL
+# drift from the schema fails the build (CLAUDE.md §10). Owner: runtime/, session/.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "macros",
+    "migrate",
+] }
 thiserror = "2"
 tokio = { version = "1", features = [
     "macros",

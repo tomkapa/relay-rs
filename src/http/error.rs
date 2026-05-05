@@ -51,7 +51,7 @@ impl IntoResponse for HttpError {
             Self::Session(SessionError::NotFound(_)) => {
                 (StatusCode::NOT_FOUND, "session not found".into())
             }
-            Self::Session(SessionError::SessionCapExceeded { .. })
+            Self::Session(SessionError::MessageCapExceeded { .. })
             | Self::Prompt(PromptError::PendingCapExceeded { .. }) => {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
             }

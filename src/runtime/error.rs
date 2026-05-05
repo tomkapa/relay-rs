@@ -32,7 +32,7 @@ pub enum PromptError {
     Parse(#[from] ParseError),
 
     #[error("session {session:?} has reached its pending cap of {max}")]
-    PendingCapExceeded { session: SessionId, max: usize },
+    PendingCapExceeded { session: SessionId, max: u32 },
 
     #[error("request {0:?} not found")]
     RequestNotFound(PromptRequestId),
@@ -48,6 +48,9 @@ pub enum PromptError {
 
     #[error("queue backend error: {0}")]
     Backend(String),
+
+    #[error("queue db error: {0}")]
+    Db(#[from] sqlx::Error),
 }
 
 /// Failure modes for response delivery — distinct from queue errors so HTTP can map
@@ -65,4 +68,7 @@ pub enum ResponseError {
 
     #[error("response sink backend error: {0}")]
     Backend(String),
+
+    #[error("response sink db error: {0}")]
+    Db(#[from] sqlx::Error),
 }

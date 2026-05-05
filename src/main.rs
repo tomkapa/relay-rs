@@ -9,7 +9,9 @@ async fn main() -> Result<()> {
     observability::init();
 
     let settings = Settings::load().context("load settings")?;
-    let server = app::build_server(settings).context("compose server")?;
+    let server = app::build_server(settings)
+        .await
+        .context("compose server")?;
 
     let cancel = CancellationToken::new();
     let watch = cancel.clone();

@@ -43,28 +43,26 @@ pub fn router(state: AppState) -> Router {
 
 #[derive(Debug, Serialize)]
 struct CreateSessionResponse {
-    session_id: Uuid,
+    session_id: SessionId,
 }
 
 async fn create_session(
     State(state): State<AppState>,
 ) -> Result<Json<CreateSessionResponse>, HttpError> {
-    let id = state.sessions.create().await?;
-    Ok(Json(CreateSessionResponse {
-        session_id: id.as_uuid(),
-    }))
+    let session_id = state.sessions.create().await?;
+    Ok(Json(CreateSessionResponse { session_id }))
 }
 
 #[derive(Debug, Deserialize)]
 struct SubmitPromptRequest {
-    session_id: Uuid,
+    session_id: SessionId,
     content: String,
     idempotency_key: String,
 }
 
 #[derive(Debug, Serialize)]
 struct SubmitPromptResponse {
-    request_id: Uuid,
+    request_id: PromptRequestId,
     status: RequestStatus,
 }
 
@@ -72,7 +70,6 @@ async fn submit_prompt(
     State(state): State<AppState>,
     Json(payload): Json<SubmitPromptRequest>,
 ) -> Result<(StatusCode, Json<SubmitPromptResponse>), HttpError> {
-    let session = SessionId::from_uuid(payload.session_id);
     let content =
         Prompt::try_from(payload.content).map_err(|e| HttpError::BadRequest(e.to_string()))?;
     let idempotency_key = IdempotencyKey::try_from(payload.idempotency_key)
@@ -81,20 +78,20 @@ async fn submit_prompt(
     let outcome = state
         .queue
         .enqueue(NewPromptRequest {
-            session,
+            session: payload.session_id,
             content,
             idempotency_key,
         })
         .await?;
 
-    let status = match outcome {
+    let status_code = match outcome {
         EnqueueOutcome::Inserted { .. } => StatusCode::ACCEPTED,
         EnqueueOutcome::Existing { .. } => StatusCode::OK,
     };
     Ok((
-        status,
+        status_code,
         Json(SubmitPromptResponse {
-            request_id: outcome.request_id().as_uuid(),
+            request_id: outcome.request_id(),
             status: outcome.status(),
         }),
     ))
@@ -104,7 +101,7 @@ async fn cancel_request(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, HttpError> {
-    let request_id = PromptRequestId::from_uuid(id);
+    let request_id = PromptRequestId::from(id);
     state.queue.request_cancellation(request_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -114,7 +111,7 @@ async fn stream_request(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, HttpError> {
-    let request_id = PromptRequestId::from_uuid(id);
+    let request_id = PromptRequestId::from(id);
     let since = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())

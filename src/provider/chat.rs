@@ -83,21 +83,58 @@ impl<'de> Deserialize<'de> for ToolCallId {
 
 /// A single message in the conversation, distinguished by speaker. Each role permits a
 /// different set of content blocks — the enum encodes that asymmetry.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` are derived so storage backends (the Postgres
+/// `session_messages.body` JSONB column today, future Redis/S3 tomorrow) can round-
+/// trip the envelope without an intermediate DTO. `#[serde(tag = "role", rename_all
+/// = "snake_case")]` produces `{"role":"user","contents":[...]}` etc., matching the
+/// `role` discriminator column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "role", content = "contents", rename_all = "snake_case")]
 pub enum ChatMessage {
     User(Vec<UserContent>),
     Assistant(Vec<AssistantContent>),
 }
 
+impl ChatMessage {
+    /// Speaker of this message. Matches the serde tag `rename_all = "snake_case"`
+    /// produces on `ChatMessage` and the `session_messages.role` `CHECK` constraint
+    /// — driven from [`Role::as_str`] so the three sites cannot drift.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        match self {
+            Self::User(_) => Role::User,
+            Self::Assistant(_) => Role::Assistant,
+        }
+    }
+}
+
+crate::str_enum! {
+    /// Discriminator on [`ChatMessage`]. Single source of truth for the
+    /// `session_messages.role` column, the JSON serde tag, and any future
+    /// role-keyed lookup. The label list below mirrors `ChatMessage`'s
+    /// `rename_all = "snake_case"` serde tag and the column's `CHECK`.
+    pub enum Role {
+        User      => "user",
+        Assistant => "assistant",
+    }
+}
+
 /// Content allowed in a user-role message.
-#[derive(Debug, Clone)]
+///
+/// Adjacently tagged (`{"kind":"...","value":...}`) so tuple variants over a
+/// non-struct inner (`Text(String)`) survive serde round-trip — required for the
+/// JSONB envelope written by `PgSessionStore`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum UserContent {
     Text(String),
     ToolResult(ToolResult),
 }
 
 /// Content allowed in an assistant-role message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum AssistantContent {
     Text(String),
     /// Reasoning / thinking blocks — opaque to us, round-tripped to providers that
@@ -107,7 +144,7 @@ pub enum AssistantContent {
 }
 
 /// A model-issued request to invoke a tool.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: ToolCallId,
     pub name: ToolName,
@@ -115,7 +152,7 @@ pub struct ToolCall {
 }
 
 /// The result of running a tool, threaded back to the model in the next turn.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call_id: ToolCallId,
     pub output: String,

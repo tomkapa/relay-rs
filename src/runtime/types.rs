@@ -1,15 +1,49 @@
 //! Domain primitives for the prompt pipeline. CLAUDE.md §1 — every value carrying an
 //! invariant is wrapped in a newtype with a `TryFrom` smart constructor.
+//!
+//! `sqlx::Type` / `Encode` / `Decode` impls let storage code bind these values
+//! directly (`.bind(RequestStatus::Pending)`, `fetch_one::<(_, TurnSeq, _)>()`),
+//! removing every hand-rolled string match against the `prompt_requests.status`
+//! check constraint. Live next to the type so a new variant cannot drift past
+//! the wire mapping.
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sqlx::Postgres;
+use sqlx::encode::IsNull;
+use sqlx::error::BoxDynError;
+use sqlx::postgres::{PgArgumentBuffer, PgTypeInfo, PgValueRef};
+use sqlx::{Decode, Encode, Type};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::types::ParseError;
 
 use super::limits::{MAX_ATTEMPTS, MAX_IDEMPOTENCY_KEY_BYTES};
+
+/// Decode a Postgres `BIGINT` into a `u64`, asserting non-negativity. The
+/// sequence columns are `BIGINT` only because Postgres has no unsigned 64-bit
+/// type; their values are always non-negative by construction (counters only
+/// grow). A negative value means schema corruption per CLAUDE.md §6.
+fn decode_u64(value: PgValueRef<'_>, name: &'static str) -> Result<u64, BoxDynError> {
+    let raw = <i64 as Decode<Postgres>>::decode(value)?;
+    u64::try_from(raw)
+        .map_err(|_| format!("invariant: {name} must be non-negative, got {raw}").into())
+}
+
+/// Encode a `u64` as a Postgres `BIGINT`, panicking if the value crosses
+/// `i64::MAX`. Sequence values reach that bound only after ~9.2×10¹⁸
+/// increments — astronomical for any realistic workload — so observing it is a
+/// program error, not a recoverable failure (CLAUDE.md §6).
+fn encode_u64(
+    n: u64,
+    buf: &mut PgArgumentBuffer,
+    name: &'static str,
+) -> Result<IsNull, BoxDynError> {
+    let raw = i64::try_from(n).unwrap_or_else(|_| panic!("invariant: {name} fits in i64"));
+    <i64 as Encode<Postgres>>::encode_by_ref(&raw, buf)
+}
 
 /// Sequence number stepped past `u64::MAX`. Astronomical, but typed so callers know
 /// what failed without parsing a string.
@@ -20,52 +54,16 @@ pub struct SeqOverflow {
     pub seq: &'static str,
 }
 
-/// Opaque request id — minted by the queue when a prompt is enqueued.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PromptRequestId(Uuid);
-
-impl PromptRequestId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    #[must_use]
-    pub fn as_uuid(self) -> Uuid {
-        self.0
-    }
-
-    /// Reconstruct an id from its wire form. As with `SessionId`, the UUID itself
-    /// carries no domain invariant — existence is checked by the queue.
-    #[must_use]
-    pub const fn from_uuid(raw: Uuid) -> Self {
-        Self(raw)
-    }
-}
-
-impl Default for PromptRequestId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Debug for PromptRequestId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("PromptRequestId").field(&self.0).finish()
-    }
-}
-
-impl fmt::Display for PromptRequestId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
+crate::uuid_newtype! {
+    /// Opaque request id — minted by the queue when a prompt is enqueued.
+    pub PromptRequestId
 }
 
 impl TryFrom<&str> for PromptRequestId {
     type Error = ParseError;
     fn try_from(raw: &str) -> Result<Self, Self::Error> {
         Uuid::parse_str(raw)
-            .map(Self)
+            .map(Self::from)
             .map_err(|_| ParseError::Malformed {
                 field: "request_id",
                 detail: "not a UUID",
@@ -73,39 +71,10 @@ impl TryFrom<&str> for PromptRequestId {
     }
 }
 
-/// Identifier for an individual worker in the pool. Carried on lease tokens so we can
-/// trace which worker held a session.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WorkerId(Uuid);
-
-impl WorkerId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    #[must_use]
-    pub fn as_uuid(self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for WorkerId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Debug for WorkerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("WorkerId").field(&self.0).finish()
-    }
-}
-
-impl fmt::Display for WorkerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
+crate::uuid_newtype! {
+    /// Identifier for an individual worker in the pool. Carried on lease tokens so we can
+    /// trace which worker held a session.
+    pub WorkerId
 }
 
 /// Monotonically-increasing sequence number bumped on every claim. Stale writes from
@@ -134,6 +103,27 @@ impl TurnSeq {
 impl fmt::Display for TurnSeq {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl Type<Postgres> for TurnSeq {
+    fn type_info() -> PgTypeInfo {
+        <i64 as Type<Postgres>>::type_info()
+    }
+    fn compatible(ty: &PgTypeInfo) -> bool {
+        <i64 as Type<Postgres>>::compatible(ty)
+    }
+}
+
+impl<'r> Decode<'r, Postgres> for TurnSeq {
+    fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
+        decode_u64(value, "turn_seq").map(Self)
+    }
+}
+
+impl Encode<'_, Postgres> for TurnSeq {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        encode_u64(self.0, buf, "turn_seq")
     }
 }
 
@@ -206,20 +196,43 @@ impl TryFrom<&str> for IdempotencyKey {
     }
 }
 
-/// Lifecycle state of a prompt request row. The pipeline is forward-only:
-/// `Pending -> Processing -> Done | Failed`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestStatus {
-    Pending,
-    Processing,
-    Done,
-    Failed,
+crate::str_enum! {
+    /// Lifecycle state of a prompt request row. The pipeline is forward-only:
+    /// `Pending -> Processing -> Done | Failed`.
+    ///
+    /// The label list below is the single source of truth — the
+    /// `prompt_requests.status` `CHECK` constraint and the JSON wire format
+    /// are keyed off these strings exactly. Adding a variant means one edit
+    /// here and one matching migration; `as_str`, `parse`, and the
+    /// sqlx/serde glue follow automatically.
+    pub enum RequestStatus {
+        Pending    => "pending",
+        Processing => "processing",
+        Done       => "done",
+        Failed     => "failed",
+    }
+}
+
+impl RequestStatus {
+    /// Terminal states — no further transitions possible. Used by the pre-turn
+    /// check and the cancel watcher; expressed once here so a new terminal variant
+    /// cannot be missed at one of those call sites.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed)
+    }
 }
 
 /// Why a request was marked failed. Closed enum so every caller of `mark_failed` is
 /// exhaustive at compile time.
-#[derive(Debug, Clone)]
+///
+/// Persisted to `prompt_requests.failure_reason TEXT` as adjacently-tagged JSON
+/// (`{"type":"provider","detail":"..."}`) via [`Encode`]/[`Decode`]. The same
+/// serde representation is the wire format for any future API consumer; the
+/// human-friendly [`fmt::Display`] is for logs/SSE chunks only and is **not**
+/// the storage format — so changing `Display` cannot silently corrupt rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "detail", rename_all = "snake_case")]
 pub enum FailureReason {
     Cancelled,
     Timeout,
@@ -259,6 +272,35 @@ impl fmt::Display for FailureReason {
     }
 }
 
+impl Type<Postgres> for FailureReason {
+    fn type_info() -> PgTypeInfo {
+        <&str as Type<Postgres>>::type_info()
+    }
+    fn compatible(ty: &PgTypeInfo) -> bool {
+        <&str as Type<Postgres>>::compatible(ty)
+    }
+}
+
+impl<'r> Decode<'r, Postgres> for FailureReason {
+    fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
+        let raw = <&str as Decode<'r, Postgres>>::decode(value)?;
+        // §6: rows only land here via the `Encode` impl below, so a parse failure
+        // means the schema has been hand-edited or a previous deploy used a stale
+        // serializer. Surface it as a backend error rather than coercing.
+        serde_json::from_str(raw).map_err(|e| {
+            format!("invariant: failure_reason JSON decode failed for {raw:?}: {e}").into()
+        })
+    }
+}
+
+impl<'q> Encode<'q, Postgres> for FailureReason {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        let json = serde_json::to_string(self)
+            .expect("invariant: FailureReason serialises infallibly via serde_json");
+        <String as Encode<'q, Postgres>>::encode(json, buf)
+    }
+}
+
 /// Sequence number for an individual chunk on a request stream. Strictly monotonic
 /// per request so an SSE client reconnecting can pass `Last-Event-ID` to skip already-
 /// observed chunks.
@@ -294,6 +336,27 @@ impl fmt::Display for ChunkSeq {
     }
 }
 
+impl Type<Postgres> for ChunkSeq {
+    fn type_info() -> PgTypeInfo {
+        <i64 as Type<Postgres>>::type_info()
+    }
+    fn compatible(ty: &PgTypeInfo) -> bool {
+        <i64 as Type<Postgres>>::compatible(ty)
+    }
+}
+
+impl<'r> Decode<'r, Postgres> for ChunkSeq {
+    fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
+        decode_u64(value, "chunk_seq").map(Self)
+    }
+}
+
+impl Encode<'_, Postgres> for ChunkSeq {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        encode_u64(self.0, buf, "chunk_seq")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +383,25 @@ mod tests {
             assert_eq!(a.increment(), AttemptOutcome::Live);
         }
         assert_eq!(a.increment(), AttemptOutcome::Poisoned);
+    }
+
+    #[test]
+    fn request_status_string_round_trips() {
+        // `as_str`/`parse` together are the single source of truth shared with the
+        // CHECK constraint on `prompt_requests.status` and exercised by `Decode` at
+        // the Pg seam. Iterating `ALL` guarantees a new variant is round-tripped
+        // here without an extra test edit.
+        for s in RequestStatus::ALL.iter().copied() {
+            assert_eq!(RequestStatus::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(RequestStatus::parse("nope"), None);
+    }
+
+    #[test]
+    fn request_status_terminal_only_for_done_and_failed() {
+        assert!(RequestStatus::Done.is_terminal());
+        assert!(RequestStatus::Failed.is_terminal());
+        assert!(!RequestStatus::Pending.is_terminal());
+        assert!(!RequestStatus::Processing.is_terminal());
     }
 }

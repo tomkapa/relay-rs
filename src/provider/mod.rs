@@ -11,8 +11,8 @@ pub mod openai;
 mod traits;
 
 pub use chat::{
-    AssistantContent, ChatMessage, ChatRequest, ChatResponse, StopReason, TOOL_CALL_ID_MAX_BYTES,
-    ToolCall, ToolCallId, ToolResult, ToolSpec, UserContent,
+    AssistantContent, ChatMessage, ChatRequest, ChatResponse, Role, StopReason,
+    TOOL_CALL_ID_MAX_BYTES, ToolCall, ToolCallId, ToolResult, ToolSpec, UserContent,
 };
 pub use error::ProviderError;
 pub use traits::{LlmProvider, SharedProvider};

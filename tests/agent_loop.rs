@@ -13,15 +13,19 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use relay_rs::agent::AgentBuilder;
+use relay_rs::clock::SystemClock;
 use relay_rs::hook::HookChain;
 use relay_rs::memory::{SharedMemory, StaticMemory};
 use relay_rs::provider::{
     AssistantContent, ChatRequest, ChatResponse, LlmProvider, ProviderError, SharedProvider,
     StopReason, ToolCall, ToolCallId,
 };
-use relay_rs::session::{InMemorySessionStore, SharedSessionStore};
+use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::tools::{SharedTool, Tool, ToolError, ToolRegistry};
 use relay_rs::types::{ModelId, Prompt, ToolName};
+
+mod common;
+use common::pg::TestDb;
 
 /// Provider that returns a pre-scripted sequence of responses, one per turn. Records the
 /// requests it sees so tests can assert on them.
@@ -128,9 +132,10 @@ fn tool_call_response(name: &str, id: &str) -> ChatResponse {
     }
 }
 
-fn build(provider: Arc<ScriptedProvider>, tools: Vec<SharedTool>) -> relay_rs::Agent {
+fn build(db: &TestDb, provider: Arc<ScriptedProvider>, tools: Vec<SharedTool>) -> relay_rs::Agent {
     let provider: SharedProvider = provider;
-    let sessions: SharedSessionStore = Arc::new(InMemorySessionStore::new());
+    let clock = SystemClock::shared();
+    let sessions: SharedSessionStore = Arc::new(PgSessionStore::new(db.pool.clone(), clock));
     let memory: SharedMemory = Arc::new(StaticMemory::new("test prompt"));
     let model = ModelId::try_from("test-model").expect("valid");
     let mut builder = ToolRegistry::builder();
@@ -144,13 +149,14 @@ fn build(provider: Arc<ScriptedProvider>, tools: Vec<SharedTool>) -> relay_rs::A
         .build()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn returns_text_when_no_tool_call() {
+    let db = TestDb::fresh().await;
     let provider = Arc::new(ScriptedProvider::new(vec![text_response(
         "hi back",
         StopReason::EndTurn,
     )]));
-    let agent = build(provider.clone(), vec![]);
+    let agent = build(&db, provider.clone(), vec![]);
 
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("hello").expect("prompt");
@@ -163,14 +169,15 @@ async fn returns_text_when_no_tool_call() {
     assert_eq!(provider.calls(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn runs_tool_then_returns_text() {
+    let db = TestDb::fresh().await;
     let provider = Arc::new(ScriptedProvider::new(vec![
         tool_call_response("counter", "call-1"),
         text_response("done", StopReason::EndTurn),
     ]));
     let counter = Arc::new(CountingTool::new("counter"));
-    let agent = build(provider.clone(), vec![counter.clone()]);
+    let agent = build(&db, provider.clone(), vec![counter.clone()]);
 
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("use the tool").expect("prompt");
@@ -184,14 +191,14 @@ async fn runs_tool_then_returns_text() {
     assert_eq!(provider.calls(), 2, "two turns: tool call, then final");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn unknown_tool_does_not_loop_forever() {
-    // Provider asks for a tool that isn't registered, then provides a final answer.
+    let db = TestDb::fresh().await;
     let provider = Arc::new(ScriptedProvider::new(vec![
         tool_call_response("missing-tool", "call-x"),
         text_response("recovered", StopReason::EndTurn),
     ]));
-    let agent = build(provider.clone(), vec![]);
+    let agent = build(&db, provider.clone(), vec![]);
 
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("try the missing tool").expect("prompt");
@@ -203,13 +210,14 @@ async fn unknown_tool_does_not_loop_forever() {
     assert_eq!(reply, "recovered");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cancellation_short_circuits() {
+    let db = TestDb::fresh().await;
     let provider = Arc::new(ScriptedProvider::new(vec![text_response(
         "never used",
         StopReason::EndTurn,
     )]));
-    let agent = build(provider, vec![]);
+    let agent = build(&db, provider, vec![]);
 
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("cancel me").expect("prompt");
@@ -223,15 +231,15 @@ async fn cancellation_short_circuits() {
     matches!(err, relay_rs::AgentError::Cancelled);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn provider_specs_match_registered_tools() {
-    // Sanity that the agent forwards the registry's specs to the provider unchanged.
+    let db = TestDb::fresh().await;
     let provider = Arc::new(ScriptedProvider::new(vec![text_response(
         "ok",
         StopReason::EndTurn,
     )]));
     let counter = Arc::new(CountingTool::new("counter"));
-    let agent = build(provider.clone(), vec![counter]);
+    let agent = build(&db, provider.clone(), vec![counter]);
 
     let session = agent.start_session().await.expect("session");
     let prompt = Prompt::try_from("hi").expect("prompt");

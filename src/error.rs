@@ -30,4 +30,16 @@ pub enum AppError {
         #[source]
         source: io::Error,
     },
+
+    #[error("postgres connect: {source}")]
+    DbConnect {
+        #[source]
+        source: sqlx::Error,
+    },
+
+    #[error("postgres migrate: {source}")]
+    Migrate {
+        #[source]
+        source: sqlx::migrate::MigrateError,
+    },
 }

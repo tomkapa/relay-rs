@@ -1,9 +1,10 @@
-//! End-to-end tests for the prompt pipeline:
+//! End-to-end tests for the prompt pipeline against the Postgres-backed runtime:
 //! * worker round-trip (enqueue → claim → run → publish → mark_done)
 //! * cancellation ends the in-flight turn before its second prompt is processed
+//! * streaming guarantees (text before done, exactly-once Text)
+//! * idempotent enqueue
 //!
-//! These tests use a scripted provider so no network is involved. They follow the
-//! same pattern as `tests/agent_loop.rs`.
+//! Each test owns its own schema via [`TestDb::fresh`] so they can run in parallel.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -24,19 +25,20 @@ use relay_rs::provider::{
 };
 use relay_rs::runtime::queue::PromptQueue as _;
 use relay_rs::runtime::{
-    IdempotencyKey, InMemoryPromptQueue, InMemoryResponseHub, LeaseTiming, NewPromptRequest,
-    RequestStatus, ResponseChunk, SharedResponseSource, StreamEvent, WorkerConfig, WorkerPool,
+    IdempotencyKey, LeaseTiming, NewPromptRequest, PgPromptQueue, PgResponseHub, RequestStatus,
+    ResponseChunk, SharedResponseSource, StreamEvent, WorkerConfig, WorkerPool,
 };
-use relay_rs::session::{InMemorySessionStore, SharedSessionStore};
+use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::tools::ToolRegistry;
 use relay_rs::types::{ModelId, Prompt};
+
+mod common;
+use common::pg::TestDb;
 
 #[derive(Debug)]
 struct ScriptedProvider {
     responses: Vec<ChatResponse>,
     cursor: AtomicUsize,
-    /// Optional delay applied to each call so a test can race cancellation with the
-    /// in-flight turn.
     delay: Duration,
 }
 
@@ -66,17 +68,22 @@ fn text_response(s: &str) -> ChatResponse {
 }
 
 struct Harness {
-    queue: Arc<InMemoryPromptQueue>,
-    hub: Arc<InMemoryResponseHub>,
+    /// Held only so its `Drop` reaps the schema at end-of-scope.
+    #[allow(dead_code)]
+    db: TestDb,
+    queue: Arc<PgPromptQueue>,
+    hub: Arc<PgResponseHub>,
     sessions: SharedSessionStore,
     pool: relay_rs::runtime::WorkerPoolHandle,
 }
 
-fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
+async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
+    let db = TestDb::fresh().await;
     let clock = SystemClock::shared();
-    let queue_impl = Arc::new(InMemoryPromptQueue::new(clock.clone()));
-    let hub = Arc::new(InMemoryResponseHub::new());
-    let sessions: SharedSessionStore = Arc::new(InMemorySessionStore::new());
+    let queue_impl = Arc::new(PgPromptQueue::new(db.pool.clone(), clock.clone()));
+    let hub = Arc::new(PgResponseHub::new(db.pool.clone(), clock.clone()));
+    let sessions: SharedSessionStore =
+        Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
 
     let provider: SharedProvider = provider;
     let memory: SharedMemory = Arc::new(StaticMemory::new("test"));
@@ -106,6 +113,7 @@ fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
     .spawn();
 
     Harness {
+        db,
         queue: queue_impl,
         hub,
         sessions,
@@ -122,7 +130,7 @@ fn req(session: relay_rs::session::SessionId, content: &str, key: &str) -> NewPr
 }
 
 async fn drain_until_terminal(
-    hub: Arc<InMemoryResponseHub>,
+    hub: Arc<PgResponseHub>,
     id: relay_rs::runtime::PromptRequestId,
     deadline: Duration,
 ) -> Vec<ResponseChunk> {
@@ -145,6 +153,26 @@ async fn drain_until_terminal(
     got
 }
 
+/// Wait for `id` to reach a terminal status. The worker publishes the terminal
+/// chunk *before* committing `mark_done` / `mark_failed`, so the SSE stream can
+/// see Done before the DB row flips. Pg adds a commit RTT to that gap; tests poll
+/// briefly to avoid races.
+async fn await_terminal_status(
+    queue: &Arc<PgPromptQueue>,
+    id: relay_rs::runtime::PromptRequestId,
+    deadline: Duration,
+) -> RequestStatus {
+    let until = std::time::Instant::now() + deadline;
+    while std::time::Instant::now() < until {
+        let view = queue.status(id).await.expect("status");
+        if matches!(view.status, RequestStatus::Done | RequestStatus::Failed) {
+            return view.status;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    queue.status(id).await.expect("status").status
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn round_trip_publishes_done_chunk() {
     let provider = Arc::new(ScriptedProvider {
@@ -152,7 +180,7 @@ async fn round_trip_publishes_done_chunk() {
         cursor: AtomicUsize::new(0),
         delay: Duration::ZERO,
     });
-    let h = build_harness(provider);
+    let h = build_harness(provider).await;
     let s = h.sessions.create().await.expect("session");
     let id = h
         .queue
@@ -168,28 +196,20 @@ async fn round_trip_publishes_done_chunk() {
             .any(|c| matches!(c, ResponseChunk::Done { .. })),
         "expected a Done chunk, got {chunks:?}"
     );
-    let view = h.queue.status(id).await.expect("status");
-    assert!(matches!(view.status, RequestStatus::Done));
+    let status = await_terminal_status(&h.queue, id, Duration::from_secs(2)).await;
+    assert!(matches!(status, RequestStatus::Done), "got {status:?}");
 
     h.pool.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancellation_finishes_inflight_and_skips_next_turn() {
-    // task1.md §Worker loop / Cancellation: the in-flight turn finishes, the next is
-    // skipped at the boundary. We stage two prompts on the same session (so a single
-    // claim drains both into one turn) and verify the request reaches a terminal
-    // state (Done after the first turn — cancellation is a no-op once it's drained).
-    //
-    // The more interesting case — two *separate* claims — relies on the worker
-    // re-claiming the same session after the first finishes. We post the second
-    // prompt as a fresh request, cancel it, and verify it never produces a Done.
     let provider = Arc::new(ScriptedProvider {
         responses: vec![text_response("first reply"), text_response("second reply")],
         cursor: AtomicUsize::new(0),
         delay: Duration::from_millis(150),
     });
-    let h = build_harness(provider);
+    let h = build_harness(provider).await;
     let s = h.sessions.create().await.expect("session");
     let first = h
         .queue
@@ -201,7 +221,6 @@ async fn cancellation_finishes_inflight_and_skips_next_turn() {
     // Wait for the first turn to start.
     let _ = drain_until_terminal(h.hub.clone(), first, Duration::from_secs(3)).await;
 
-    // Stage a second prompt and cancel it before any worker can claim it.
     let second = h
         .queue
         .enqueue(req(s, "second", "k-second"))
@@ -210,32 +229,28 @@ async fn cancellation_finishes_inflight_and_skips_next_turn() {
         .request_id();
     h.queue.request_cancellation(second).await.expect("cancel");
 
-    // The second request should reach a terminal state — Done if it slipped through
-    // the race, Failed (cancelled) if the worker honored the flag at the boundary.
     let chunks = drain_until_terminal(h.hub.clone(), second, Duration::from_secs(3)).await;
-    let view = h.queue.status(second).await.expect("status");
+    let status = await_terminal_status(&h.queue, second, Duration::from_secs(2)).await;
     assert!(
-        matches!(view.status, RequestStatus::Done | RequestStatus::Failed),
-        "second request must reach a terminal state; got {:?}",
-        view.status
+        matches!(status, RequestStatus::Done | RequestStatus::Failed),
+        "second request must reach a terminal state; got {status:?}",
     );
     assert!(
         chunks.iter().any(ResponseChunk::is_terminal),
         "must have observed a terminal chunk on the SSE stream"
     );
+
     h.pool.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn streaming_emits_text_before_done() {
-    // Asserts the SSE-streaming guarantee: text/reasoning/tool chunks arrive *during*
-    // the agent loop via the FanOutObserver, not piggybacking on the final Done.
     let provider = Arc::new(ScriptedProvider {
         responses: vec![text_response("incremental answer")],
         cursor: AtomicUsize::new(0),
         delay: Duration::ZERO,
     });
-    let h = build_harness(provider);
+    let h = build_harness(provider).await;
     let s = h.sessions.create().await.expect("session");
     let id = h
         .queue
@@ -258,8 +273,6 @@ async fn streaming_emits_text_before_done() {
     let t = text_idx.expect("expected at least one Text chunk");
     let d = done_idx.expect("expected a terminal Done chunk");
     assert!(t < d, "Text chunk must precede Done; got chunks {chunks:?}");
-    // No duplicate-final-text contract: Text chunks carry the streamed content,
-    // Done carries the assembled final answer. They are not the same event repeated.
     let text_count = chunks
         .iter()
         .filter(|c| matches!(c, ResponseChunk::Text { value: _ }))
@@ -274,17 +287,12 @@ async fn streaming_emits_text_before_done() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mid_turn_cancellation_aborts_in_flight_turn() {
-    // Reproduces the mid-turn cancel path: a request is enqueued, the worker starts
-    // the agent loop with a slow provider, then `POST /requests/:id/cancel` flips
-    // `cancellation_requested` mid-turn. The cancel watcher inside `handle_claim`
-    // observes that within `cfg.cancel_poll` and fires the agent's CancellationToken,
-    // routing the request to terminal-Failed (Cancelled) instead of Done.
     let provider = Arc::new(ScriptedProvider {
         responses: vec![text_response("never delivered")],
         cursor: AtomicUsize::new(0),
-        delay: Duration::from_secs(2), // long enough to lose the race
+        delay: Duration::from_secs(2),
     });
-    let h = build_harness(provider);
+    let h = build_harness(provider).await;
     let s = h.sessions.create().await.expect("session");
     let id = h
         .queue
@@ -293,7 +301,6 @@ async fn mid_turn_cancellation_aborts_in_flight_turn() {
         .expect("enqueue")
         .request_id();
 
-    // Give the worker a moment to claim the request before we cancel.
     tokio::time::sleep(Duration::from_millis(150)).await;
     h.queue
         .request_cancellation(id)
@@ -326,7 +333,7 @@ async fn idempotent_repeat_returns_same_request_id() {
         cursor: AtomicUsize::new(0),
         delay: Duration::ZERO,
     });
-    let h = build_harness(provider);
+    let h = build_harness(provider).await;
     let s = h.sessions.create().await.expect("session");
     let a = h
         .queue

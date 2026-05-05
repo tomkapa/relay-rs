@@ -6,6 +6,7 @@
 
 mod error;
 mod limits;
+mod macros;
 mod model_id;
 mod prompt;
 mod secret;

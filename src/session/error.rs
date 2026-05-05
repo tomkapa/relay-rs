@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use super::store::SessionId;
+use super::traits::SessionId;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -8,11 +8,11 @@ pub enum SessionError {
     NotFound(SessionId),
 
     #[error("session {id:?} would exceed message cap ({max})")]
-    MessageCapExceeded { id: SessionId, max: usize },
-
-    #[error("session store reached its session cap ({max})")]
-    SessionCapExceeded { max: usize },
+    MessageCapExceeded { id: SessionId, max: u32 },
 
     #[error("session store backend error: {0}")]
     Backend(String),
+
+    #[error("session store db error: {0}")]
+    Db(#[from] sqlx::Error),
 }
