@@ -1,0 +1,48 @@
+meta {
+  name: POST /prompts — submit a prompt
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/prompts
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "session_id": "{{session_id}}",
+    "content": "Hello, who are you?",
+    "idempotency_key": "{{idempotency_key}}"
+  }
+}
+
+script:pre-request {
+  // Generate a fresh idempotency key on every send so a repeated click
+  // is treated as a new request. Override the variable manually to test
+  // the dedup path.
+  const key = "bru-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+  bru.setVar("idempotency_key", key);
+}
+
+script:post-response {
+  const json = res.getBody();
+  bru.setVar("request_id", json.request_id);
+}
+
+tests {
+  test("200 or 202", function() {
+    expect([200, 202]).to.include(res.status);
+  });
+
+  test("request_id present", function() {
+    const json = res.getBody();
+    expect(json.request_id).to.be.a("string");
+  });
+}

@@ -1,0 +1,16 @@
+meta {
+  name: GET /requests/{id}/stream — subscribe to SSE
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/requests/{{request_id}}/stream
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: text/event-stream
+  Last-Event-ID: {{last_event_id}}
+}

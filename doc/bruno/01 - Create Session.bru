@@ -1,0 +1,31 @@
+meta {
+  name: POST /sessions — create a session
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/sessions
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+script:post-response {
+  const json = res.getBody();
+  bru.setVar("session_id", json.session_id);
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("session_id present", function() {
+    const json = res.getBody();
+    expect(json.session_id).to.be.a("string");
+  });
+}
