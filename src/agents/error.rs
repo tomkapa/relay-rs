@@ -17,6 +17,18 @@ pub enum AgentStoreError {
     #[error("no default agent has been seeded")]
     NoDefault,
 
+    /// Caller tried to delete the row currently flagged `is_default = TRUE`. The
+    /// HTTP layer and the worker both assume `default_id()` always resolves, so
+    /// removing the default is unsafe — promote another row first.
+    #[error("cannot delete the default agent")]
+    DefaultDeletionForbidden,
+
+    /// Caller tried to delete a row referenced by at least one session. The FK
+    /// `sessions.agent_id REFERENCES agents(id)` is `ON DELETE RESTRICT` so the
+    /// session history of agents that ever existed is preserved.
+    #[error("agent {0:?} is referenced by one or more sessions")]
+    InUse(AgentId),
+
     #[error("agent record decode: {0}")]
     Parse(#[from] ParseError),
 

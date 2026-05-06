@@ -1,8 +1,7 @@
-//! Axum routes:
-//! * `POST /sessions` → `{ session_id }`
-//! * `POST /prompts` `{ session_id, content, idempotency_key }` → `{ request_id, status }`
-//! * `GET /requests/:id/stream` → SSE
-//! * `POST /requests/:id/cancel` → 204
+//! Prompt and request endpoints:
+//! * `POST /prompts` — enqueue a prompt for a session
+//! * `POST /requests/{id}/cancel` — request cancellation
+//! * `GET  /requests/{id}/stream` — SSE stream of response chunks
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -12,14 +11,12 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post};
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tower_http::trace::TraceLayer;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::agents::AgentId;
 use crate::runtime::{
     ChunkSeq, EnqueueOutcome, IdempotencyKey, NewPromptRequest, PromptRequestId, RequestStatus,
     ResponseChunk, StreamEvent,
@@ -27,66 +24,16 @@ use crate::runtime::{
 use crate::session::SessionId;
 use crate::types::Prompt;
 
-use super::error::HttpError;
-use super::mcp_routes::{
-    create_mcp_server, delete_mcp_server, list_mcp_servers, read_mcp_server, update_mcp_server,
-};
-use super::state::AppState;
+use super::super::error::HttpError;
+use super::super::state::AppState;
 
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-pub fn router(state: AppState) -> Router {
+pub(super) fn router() -> Router<AppState> {
     Router::new()
-        .route("/sessions", post(create_session))
         .route("/prompts", post(submit_prompt))
         .route("/requests/{id}/stream", get(stream_request))
         .route("/requests/{id}/cancel", post(cancel_request))
-        .route(
-            "/mcp-servers",
-            post(create_mcp_server).get(list_mcp_servers),
-        )
-        .route(
-            "/mcp-servers/{id}",
-            get(read_mcp_server)
-                .merge(put(update_mcp_server))
-                .merge(delete(delete_mcp_server)),
-        )
-        .with_state(state)
-        .layer(TraceLayer::new_for_http())
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct CreateSessionRequest {
-    /// Optional. When omitted, the server binds the new session to the default
-    /// agent (the row seeded with `is_default = TRUE`).
-    #[serde(default)]
-    agent_id: Option<AgentId>,
-}
-
-#[derive(Debug, Serialize)]
-struct CreateSessionResponse {
-    session_id: SessionId,
-    /// Always populated, even when the client omitted the field — so the
-    /// caller knows which agent ended up bound to the session.
-    agent_id: AgentId,
-}
-
-async fn create_session(
-    State(state): State<AppState>,
-    Json(body): Json<CreateSessionRequest>,
-) -> Result<Json<CreateSessionResponse>, HttpError> {
-    let agent_id = match body.agent_id {
-        Some(id) => id,
-        None => state.agents.default_id().await?,
-    };
-    // FK on `sessions.agent_id` rejects unknown ids; `PgSessionStore::create`
-    // maps that to `SessionError::AgentNotFound`, which `HttpError` already
-    // turns into a 400.
-    let session_id = state.sessions.create(agent_id).await?;
-    Ok(Json(CreateSessionResponse {
-        session_id,
-        agent_id,
-    }))
 }
 
 #[derive(Debug, Deserialize)]

@@ -14,9 +14,11 @@ pub const AGENT_NAME_MAX_LEN: usize = 64;
 /// comfortably within typical model context windows.
 pub const AGENT_SYSTEM_PROMPT_MAX_LEN: usize = 64 * 1024;
 
-/// Capacity of the per-worker [`crate::agents::AgentPromptCache`]. Sized so that
-/// a deployment with hundreds of agents still fits without eviction churn while
-/// staying small enough to bound memory.
+/// Capacity of the per-worker [`crate::agents::AgentPromptCache`].
+///
+/// Bounds the live working set in worker memory; the `agents` table itself is
+/// unbounded (SaaS), and rare tenants whose agent isn't cached pay one DB read
+/// per turn.
 pub const AGENT_PROMPT_CACHE_CAP: usize = 256;
 
 /// TTL for cached agent prompts. Edits to an agent's `system_prompt` row become

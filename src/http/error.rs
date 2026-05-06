@@ -69,6 +69,10 @@ impl IntoResponse for HttpError {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
             }
             Self::Session(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            Self::Agent(AgentStoreError::DefaultDeletionForbidden | AgentStoreError::InUse(_)) => {
+                (StatusCode::CONFLICT, self.to_string())
+            }
+            Self::Agent(AgentStoreError::Parse(_)) => (StatusCode::BAD_REQUEST, self.to_string()),
             Self::Agent(AgentStoreError::NoDefault) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "default agent not seeded".into(),

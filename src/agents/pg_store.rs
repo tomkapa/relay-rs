@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use crate::clock::SharedClock;
 
 use super::error::AgentStoreError;
-use super::store::AgentStore;
+use super::store::{AgentStore, AgentUpdate, NewAgent};
 use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, DefaultAgentSeed};
 
 /// Transaction-scoped advisory-lock key used by [`PgAgentStore::seed_default`] to
@@ -92,6 +92,58 @@ impl fmt::Debug for PgAgentStore {
 
 #[async_trait]
 impl AgentStore for PgAgentStore {
+    async fn create(&self, payload: NewAgent) -> Result<AgentRecord, AgentStoreError> {
+        let now = self.now();
+        let mut tx = self.pool.begin().await?;
+
+        // Promoting a new row to default first demotes the existing default so
+        // the partial unique index `agents_default_unique` stays satisfied.
+        if payload.is_default {
+            sqlx::query(
+                "UPDATE agents SET is_default = FALSE, updated_at = $1 \
+                 WHERE is_default = TRUE",
+            )
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let id = AgentId::new();
+        sqlx::query(
+            "INSERT INTO agents \
+                 (id, name, system_prompt, is_default, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $5)",
+        )
+        .bind(id)
+        .bind(payload.name.as_str())
+        .bind(payload.system_prompt.as_str())
+        .bind(payload.is_default)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(AgentRecord {
+            id,
+            name: payload.name,
+            system_prompt: payload.system_prompt,
+            is_default: payload.is_default,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    async fn list(&self) -> Result<Vec<AgentRecord>, AgentStoreError> {
+        let rows = sqlx::query_as::<_, AgentRow>(
+            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
+             FROM agents ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(AgentRecord::try_from).collect()
+    }
+
     async fn read(&self, id: AgentId) -> Result<AgentRecord, AgentStoreError> {
         let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
             "SELECT id, name, system_prompt, is_default, created_at, updated_at \
@@ -102,6 +154,98 @@ impl AgentStore for PgAgentStore {
         .await?;
         let row = row.ok_or(AgentStoreError::NotFound(id))?;
         row.try_into()
+    }
+
+    async fn update(
+        &self,
+        id: AgentId,
+        payload: AgentUpdate,
+    ) -> Result<AgentRecord, AgentStoreError> {
+        let now = self.now();
+        let mut tx = self.pool.begin().await?;
+
+        let existing: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
+            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
+             FROM agents WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let existing = existing.ok_or(AgentStoreError::NotFound(id))?;
+        let mut current = AgentRecord::try_from(existing)?;
+
+        // Demoting the only default would leave the system without one, which
+        // breaks every session-create that omits `agent_id`. Reject it; the
+        // caller must promote another row first (which atomically demotes this
+        // one).
+        if matches!(payload.is_default, Some(false)) && current.is_default {
+            return Err(AgentStoreError::DefaultDeletionForbidden);
+        }
+
+        if let Some(name) = payload.name {
+            current.name = name;
+        }
+        if let Some(system_prompt) = payload.system_prompt {
+            current.system_prompt = system_prompt;
+        }
+
+        // Promote: clear the old default in the same transaction, then set the
+        // flag on this row. No-op if this row is already the default.
+        if matches!(payload.is_default, Some(true)) && !current.is_default {
+            sqlx::query(
+                "UPDATE agents SET is_default = FALSE, updated_at = $1 \
+                 WHERE is_default = TRUE",
+            )
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            current.is_default = true;
+        }
+
+        current.updated_at = now;
+
+        sqlx::query(
+            "UPDATE agents \
+             SET name = $2, system_prompt = $3, is_default = $4, updated_at = $5 \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(current.name.as_str())
+        .bind(current.system_prompt.as_str())
+        .bind(current.is_default)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(current)
+    }
+
+    async fn delete(&self, id: AgentId) -> Result<(), AgentStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(bool,)> =
+            sqlx::query_as("SELECT is_default FROM agents WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let (is_default,) = row.ok_or(AgentStoreError::NotFound(id))?;
+        if is_default {
+            return Err(AgentStoreError::DefaultDeletionForbidden);
+        }
+        let res = sqlx::query("DELETE FROM agents WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+        match res {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23503") => {
+                Err(AgentStoreError::InUse(id))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn default_id(&self) -> Result<AgentId, AgentStoreError> {

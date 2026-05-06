@@ -6,10 +6,11 @@
 use std::sync::Arc;
 
 use relay_rs::agents::{
-    AgentId, AgentName, AgentStore, AgentStoreError, AgentSystemPrompt, DefaultAgentSeed,
-    PgAgentStore,
+    AgentId, AgentName, AgentStore, AgentStoreError, AgentSystemPrompt, AgentUpdate,
+    DefaultAgentSeed, NewAgent, PgAgentStore,
 };
 use relay_rs::clock::SystemClock;
+use relay_rs::session::{PgSessionStore, SessionStore};
 
 mod common;
 use common::pg::TestDb;
@@ -22,6 +23,14 @@ fn seed(name: &str, prompt: &str) -> DefaultAgentSeed {
     DefaultAgentSeed {
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
+    }
+}
+
+fn new_agent(name: &str, prompt: &str, is_default: bool) -> NewAgent {
+    NewAgent {
+        name: AgentName::try_from(name).expect("valid name"),
+        system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
+        is_default,
     }
 }
 
@@ -82,4 +91,166 @@ async fn default_id_returns_seeded_row() {
 
     let id = store.default_id().await.expect("default");
     assert_eq!(id, db.default_agent_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_then_list_round_trip() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let a = store
+        .create(new_agent("alpha", "you are alpha", false))
+        .await
+        .expect("create alpha");
+    let b = store
+        .create(new_agent("beta", "you are beta", false))
+        .await
+        .expect("create beta");
+    assert!(!a.is_default);
+    assert!(!b.is_default);
+
+    let list = store.list().await.expect("list");
+    // 1 seeded default + 2 new = 3 rows.
+    assert_eq!(list.len(), 3);
+    let names: Vec<&str> = list.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"test-default"));
+    assert!(names.contains(&"alpha"));
+    assert!(names.contains(&"beta"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_with_is_default_demotes_previous_default() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let promoted = store
+        .create(new_agent("new-default", "I am the new default", true))
+        .await
+        .expect("create promoted");
+    assert!(promoted.is_default);
+
+    // The previously-seeded default has been demoted in the same transaction.
+    let old = store.read(db.default_agent_id).await.expect("read old");
+    assert!(!old.is_default);
+    // And there is exactly one default now.
+    let now_default = store.default_id().await.expect("default");
+    assert_eq!(now_default, promoted.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_promotes_to_default_atomically() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let other = store
+        .create(new_agent("other", "I am other", false))
+        .await
+        .expect("create other");
+    assert!(!other.is_default);
+
+    let promoted = store
+        .update(
+            other.id,
+            AgentUpdate {
+                name: None,
+                system_prompt: None,
+                is_default: Some(true),
+            },
+        )
+        .await
+        .expect("promote");
+    assert!(promoted.is_default);
+
+    let old = store.read(db.default_agent_id).await.expect("read old");
+    assert!(!old.is_default);
+    let now_default = store.default_id().await.expect("default");
+    assert_eq!(now_default, other.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_cannot_demote_only_default() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let err = store
+        .update(
+            db.default_agent_id,
+            AgentUpdate {
+                name: None,
+                system_prompt: None,
+                is_default: Some(false),
+            },
+        )
+        .await
+        .expect_err("cannot demote");
+    assert!(matches!(err, AgentStoreError::DefaultDeletionForbidden));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_changes_name_and_prompt() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let agent = store
+        .create(new_agent("orig", "orig prompt", false))
+        .await
+        .expect("create");
+    let updated = store
+        .update(
+            agent.id,
+            AgentUpdate {
+                name: Some(AgentName::try_from("renamed").expect("name")),
+                system_prompt: Some(AgentSystemPrompt::try_from("rolled-out v2").expect("prompt")),
+                is_default: None,
+            },
+        )
+        .await
+        .expect("update");
+
+    assert_eq!(updated.name.as_str(), "renamed");
+    assert_eq!(updated.system_prompt.as_str(), "rolled-out v2");
+    assert_eq!(updated.id, agent.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_removes_non_default_row() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let agent = store
+        .create(new_agent("disposable", "throwaway", false))
+        .await
+        .expect("create");
+    store.delete(agent.id).await.expect("delete");
+
+    let err = store.read(agent.id).await.expect_err("gone");
+    assert!(matches!(err, AgentStoreError::NotFound(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_refuses_default() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let err = store
+        .delete(db.default_agent_id)
+        .await
+        .expect_err("forbidden");
+    assert!(matches!(err, AgentStoreError::DefaultDeletionForbidden));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_refuses_when_referenced_by_a_session() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let agent = store
+        .create(new_agent("attached", "in use", false))
+        .await
+        .expect("create");
+    let sessions = PgSessionStore::new(db.pool.clone(), SystemClock::shared());
+    sessions.create(agent.id).await.expect("session");
+
+    let err = store.delete(agent.id).await.expect_err("in use");
+    assert!(matches!(err, AgentStoreError::InUse(_)));
 }

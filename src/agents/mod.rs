@@ -25,5 +25,5 @@ pub use limits::{
     AGENT_NAME_MAX_LEN, AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AGENT_SYSTEM_PROMPT_MAX_LEN,
 };
 pub use pg_store::PgAgentStore;
-pub use store::{AgentStore, SharedAgentStore};
+pub use store::{AgentStore, AgentUpdate, NewAgent, SharedAgentStore};
 pub use types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, DefaultAgentSeed};

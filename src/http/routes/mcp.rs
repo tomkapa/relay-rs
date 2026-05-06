@@ -13,8 +13,10 @@
 //! `discovered_tools` columns surfaced on the next read.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::routing::{delete, get, post, put};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,23 +25,37 @@ use crate::mcp::{
     McpServerUpdate, McpTransport,
 };
 
-use super::error::HttpError;
-use super::state::AppState;
+use super::super::error::HttpError;
+use super::super::state::AppState;
+
+pub(super) fn router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/mcp-servers",
+            post(create_mcp_server).get(list_mcp_servers),
+        )
+        .route(
+            "/mcp-servers/{id}",
+            get(read_mcp_server)
+                .merge(put(update_mcp_server))
+                .merge(delete(delete_mcp_server)),
+        )
+}
 
 /// What we hand back on every CRUD response. Mirrors `mcp_servers` plus a flag
 /// telling the operator whether the row is currently exposed by the live registry.
 #[derive(Debug, Serialize)]
-pub(super) struct McpServerResponse {
-    pub(super) id: McpServerId,
-    pub(super) alias: String,
-    pub(super) enabled: bool,
-    pub(super) config: McpTransport,
-    pub(super) description: Option<String>,
-    pub(super) last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub(super) last_error: Option<String>,
-    pub(super) discovered_tools: Option<Vec<DiscoveredTool>>,
-    pub(super) created_at: chrono::DateTime<chrono::Utc>,
-    pub(super) updated_at: chrono::DateTime<chrono::Utc>,
+struct McpServerResponse {
+    id: McpServerId,
+    alias: String,
+    enabled: bool,
+    config: McpTransport,
+    description: Option<String>,
+    last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_error: Option<String>,
+    discovered_tools: Option<Vec<DiscoveredTool>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<McpServerRecord> for McpServerResponse {
@@ -60,7 +76,7 @@ impl From<McpServerRecord> for McpServerResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct CreateMcpServerRequest {
+struct CreateMcpServerRequest {
     alias: String,
     config: McpTransport,
     #[serde(default)]
@@ -74,7 +90,7 @@ fn default_enabled() -> bool {
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct UpdateMcpServerRequest {
+struct UpdateMcpServerRequest {
     #[serde(default)]
     alias: Option<String>,
     #[serde(default)]
@@ -103,7 +119,7 @@ mod double_option {
     }
 }
 
-pub(super) async fn create_mcp_server(
+async fn create_mcp_server(
     State(state): State<AppState>,
     Json(payload): Json<CreateMcpServerRequest>,
 ) -> Result<(StatusCode, Json<McpServerResponse>), HttpError> {
@@ -126,7 +142,7 @@ pub(super) async fn create_mcp_server(
     Ok((StatusCode::CREATED, Json(record.into())))
 }
 
-pub(super) async fn list_mcp_servers(
+async fn list_mcp_servers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<McpServerResponse>>, HttpError> {
     let rows = state.mcp_store.list().await?;
@@ -135,7 +151,7 @@ pub(super) async fn list_mcp_servers(
     ))
 }
 
-pub(super) async fn read_mcp_server(
+async fn read_mcp_server(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<McpServerResponse>, HttpError> {
@@ -144,7 +160,7 @@ pub(super) async fn read_mcp_server(
     Ok(Json(row.into()))
 }
 
-pub(super) async fn update_mcp_server(
+async fn update_mcp_server(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateMcpServerRequest>,
@@ -179,7 +195,7 @@ pub(super) async fn update_mcp_server(
     Ok(Json(row.into()))
 }
 
-pub(super) async fn delete_mcp_server(
+async fn delete_mcp_server(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, HttpError> {
