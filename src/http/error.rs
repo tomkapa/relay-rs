@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::agents::AgentStoreError;
 use crate::mcp::McpError;
 use crate::runtime::{PromptError, ResponseError};
 use crate::session::SessionError;
@@ -31,6 +32,9 @@ pub enum HttpError {
     #[error("session: {0}")]
     Session(#[from] SessionError),
 
+    #[error("agent: {0}")]
+    Agent(#[from] AgentStoreError),
+
     #[error("prompt pipeline: {0}")]
     Prompt(#[from] PromptError),
 
@@ -55,12 +59,24 @@ impl IntoResponse for HttpError {
             Self::Session(SessionError::NotFound(_)) => {
                 (StatusCode::NOT_FOUND, "session not found".into())
             }
+            Self::Session(SessionError::AgentNotFound(_))
+            | Self::Agent(AgentStoreError::NotFound(_)) => {
+                (StatusCode::BAD_REQUEST, "unknown agent_id".into())
+            }
             Self::Session(SessionError::MessageCapExceeded { .. })
             | Self::Prompt(PromptError::PendingCapExceeded { .. })
             | Self::Mcp(McpError::ServerCapExceeded { .. }) => {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
             }
             Self::Session(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            Self::Agent(AgentStoreError::NoDefault) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "default agent not seeded".into(),
+            ),
+            Self::Agent(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent store error".into(),
+            ),
             Self::Prompt(PromptError::RequestNotFound(_) | PromptError::SessionNotFound(_)) => {
                 (StatusCode::NOT_FOUND, "not found".into())
             }

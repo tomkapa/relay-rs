@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::agents::AgentId;
 use crate::runtime::{
     ChunkSeq, EnqueueOutcome, IdempotencyKey, NewPromptRequest, PromptRequestId, RequestStatus,
     ResponseChunk, StreamEvent,
@@ -54,16 +55,38 @@ pub fn router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct CreateSessionRequest {
+    /// Optional. When omitted, the server binds the new session to the default
+    /// agent (the row seeded with `is_default = TRUE`).
+    #[serde(default)]
+    agent_id: Option<AgentId>,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateSessionResponse {
     session_id: SessionId,
+    /// Always populated, even when the client omitted the field — so the
+    /// caller knows which agent ended up bound to the session.
+    agent_id: AgentId,
 }
 
 async fn create_session(
     State(state): State<AppState>,
+    Json(body): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, HttpError> {
-    let session_id = state.sessions.create().await?;
-    Ok(Json(CreateSessionResponse { session_id }))
+    let agent_id = match body.agent_id {
+        Some(id) => id,
+        None => state.agents.default_id().await?,
+    };
+    // FK on `sessions.agent_id` rejects unknown ids; `PgSessionStore::create`
+    // maps that to `SessionError::AgentNotFound`, which `HttpError` already
+    // turns into a 400.
+    let session_id = state.sessions.create(agent_id).await?;
+    Ok(Json(CreateSessionResponse {
+        session_id,
+        agent_id,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

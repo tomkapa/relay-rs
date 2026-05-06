@@ -10,6 +10,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use sqlx::PgPool;
 
+use relay_rs::agents::AgentId;
 use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::runtime::queue::PromptQueue as _;
 use relay_rs::runtime::{
@@ -24,9 +25,13 @@ use common::pg::TestDb;
 
 /// Stage a prompt request row so the chunks table's FK is satisfied. Returns the
 /// request id we can publish chunks against.
-async fn stage_request(pool: &PgPool, clock: SharedClock) -> (SessionId, PromptRequestId) {
+async fn stage_request(
+    pool: &PgPool,
+    clock: SharedClock,
+    agent_id: AgentId,
+) -> (SessionId, PromptRequestId) {
     let session_store = PgSessionStore::new(pool.clone(), clock.clone());
-    let session = session_store.create().await.expect("session");
+    let session = session_store.create(agent_id).await.expect("session");
 
     let queue = Arc::new(PgPromptQueue::with_caps(
         pool.clone(),
@@ -53,7 +58,7 @@ async fn publish_and_subscribe_live() {
     let db = TestDb::fresh().await;
     let clock = SystemClock::shared();
     let hub = Arc::new(PgResponseHub::new(db.pool.clone(), clock.clone()));
-    let (_session, id) = stage_request(&db.pool, clock).await;
+    let (_session, id) = stage_request(&db.pool, clock, db.default_agent_id).await;
 
     let mut stream = hub.subscribe(id, None).await.expect("subscribe");
 
@@ -96,7 +101,7 @@ async fn replay_serves_late_subscriber() {
     let db = TestDb::fresh().await;
     let clock = SystemClock::shared();
     let hub = Arc::new(PgResponseHub::new(db.pool.clone(), clock.clone()));
-    let (_session, id) = stage_request(&db.pool, clock).await;
+    let (_session, id) = stage_request(&db.pool, clock, db.default_agent_id).await;
 
     hub.publish(id, ResponseChunk::Text { value: "a".into() })
         .await
@@ -135,7 +140,7 @@ async fn replay_respects_since_cutoff() {
     let db = TestDb::fresh().await;
     let clock = SystemClock::shared();
     let hub = Arc::new(PgResponseHub::new(db.pool.clone(), clock.clone()));
-    let (_session, id) = stage_request(&db.pool, clock).await;
+    let (_session, id) = stage_request(&db.pool, clock, db.default_agent_id).await;
 
     let s0 = hub
         .publish(id, ResponseChunk::Text { value: "a".into() })
@@ -176,9 +181,9 @@ async fn slot_cap_evicts_oldest_closed_first() {
     let db = TestDb::fresh().await;
     let clock = SystemClock::shared();
     let hub = Arc::new(PgResponseHub::with_caps(db.pool.clone(), clock.clone(), 2));
-    let (_sa, a) = stage_request(&db.pool, clock.clone()).await;
-    let (_sb, b) = stage_request(&db.pool, clock.clone()).await;
-    let (_sc, c) = stage_request(&db.pool, clock).await;
+    let (_sa, a) = stage_request(&db.pool, clock.clone(), db.default_agent_id).await;
+    let (_sb, b) = stage_request(&db.pool, clock.clone(), db.default_agent_id).await;
+    let (_sc, c) = stage_request(&db.pool, clock, db.default_agent_id).await;
 
     // Close `a` first (terminal chunk → closed).
     hub.publish(

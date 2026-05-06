@@ -16,6 +16,8 @@
 
 use std::time::Duration;
 
+use relay_rs::agents::{AgentId, AgentName, AgentSystemPrompt, DefaultAgentSeed, PgAgentStore};
+use relay_rs::clock::SystemClock;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
@@ -25,10 +27,15 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns a freshly-migrated, schema-isolated Postgres pool. Use `pool` to construct
 /// the unit under test (`PgSessionStore`, `PgPromptQueue`, `PgResponseHub`).
+///
+/// `default_agent_id` is the row seeded by [`TestDb::fresh`] — every fresh db
+/// has exactly one default agent so `sessions.agent_id NOT NULL REFERENCES
+/// agents(id)` can be satisfied by tests without ceremony.
 pub struct TestDb {
     /// Pool whose connections are pinned to this test's schema via
     /// `SET search_path TO "<schema>", public`.
     pub pool: PgPool,
+    pub default_agent_id: AgentId,
     schema: String,
     admin: PgPool,
 }
@@ -76,8 +83,21 @@ impl TestDb {
             .await
             .expect("run migrations");
 
+        // Seed a default agent so `sessions.agent_id` (NOT NULL REFERENCES
+        // agents) can be satisfied by tests calling `sessions.create(id)`.
+        let agents = PgAgentStore::new(pool.clone(), SystemClock::shared());
+        let default_agent_id = agents
+            .seed_default(DefaultAgentSeed {
+                name: AgentName::try_from("test-default").expect("valid name"),
+                system_prompt: AgentSystemPrompt::try_from("test default prompt")
+                    .expect("valid prompt"),
+            })
+            .await
+            .expect("seed default agent");
+
         Self {
             pool,
+            default_agent_id,
             schema,
             admin,
         }

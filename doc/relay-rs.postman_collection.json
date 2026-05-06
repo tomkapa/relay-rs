@@ -17,6 +17,12 @@
       "type": "string"
     },
     {
+      "key": "agent_id",
+      "value": "",
+      "type": "string",
+      "description": "Captured from POST /sessions; reuse to bind another session to the same agent."
+    },
+    {
       "key": "request_id",
       "value": "",
       "type": "string"
@@ -35,7 +41,7 @@
   ],
   "item": [
     {
-      "name": "POST /sessions — create a session",
+      "name": "POST /sessions — create a session (default agent)",
       "request": {
         "method": "POST",
         "header": [
@@ -46,7 +52,7 @@
           "host": ["{{base_url}}"],
           "path": ["sessions"]
         },
-        "description": "Allocates a fresh session id. Returns `{ session_id }`."
+        "description": "Allocates a fresh session bound to the agent flagged `is_default = TRUE` (seeded at startup). Body is optional; supply `{ \"agent_id\": \"<uuid>\" }` to bind to a specific agent. Returns `{ session_id, agent_id }` so the caller knows which persona will drive every turn."
       },
       "event": [
         {
@@ -57,8 +63,44 @@
               "pm.test('200 OK', () => pm.response.to.have.status(200));",
               "const json = pm.response.json();",
               "pm.expect(json.session_id, 'session_id present').to.be.a('string');",
+              "pm.expect(json.agent_id, 'agent_id echoed').to.be.a('string');",
               "pm.collectionVariables.set('session_id', json.session_id);",
-              "console.log('session_id =', json.session_id);"
+              "pm.collectionVariables.set('agent_id', json.agent_id);",
+              "console.log('session_id =', json.session_id, 'agent_id =', json.agent_id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST /sessions — create a session (explicit agent)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/sessions",
+          "host": ["{{base_url}}"],
+          "path": ["sessions"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"agent_id\": \"{{agent_id}}\"\n}"
+        },
+        "description": "Bind the new session to a specific agent. `agent_id` must reference an existing row in the `agents` table; an unknown id returns 400 with `{\"error\":\"unknown agent_id\"}`. Run the default-agent request first so `agent_id` is captured into a collection variable."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const json = pm.response.json();",
+              "pm.expect(json.agent_id, 'agent_id echoed').to.equal(pm.collectionVariables.get('agent_id'));",
+              "pm.collectionVariables.set('session_id', json.session_id);"
             ]
           }
         }

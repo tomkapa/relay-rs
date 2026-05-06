@@ -30,7 +30,10 @@ async fn fresh() -> (TestDb, Arc<PgPromptQueue>, Arc<TestClock>, SessionId) {
     let test_clock = Arc::new(TestClock::new());
     let clock: SharedClock = test_clock.clone();
     let session_store = PgSessionStore::new(db.pool.clone(), clock.clone());
-    let session = session_store.create().await.expect("session");
+    let session = session_store
+        .create(db.default_agent_id)
+        .await
+        .expect("session");
     let timing = LeaseTiming::try_new(LEASE_TTL, HEARTBEAT).expect("valid timing");
     let queue = Arc::new(PgPromptQueue::with_caps(
         db.pool.clone(),
@@ -136,7 +139,10 @@ async fn poisons_after_max_attempts_via_orphan_path() {
     let test_clock = Arc::new(TestClock::new());
     let clock: SharedClock = test_clock.clone();
     let session_store = PgSessionStore::new(db.pool.clone(), clock.clone());
-    let session = session_store.create().await.expect("session");
+    let session = session_store
+        .create(db.default_agent_id)
+        .await
+        .expect("session");
     let timing = LeaseTiming::try_new(LEASE_TTL, HEARTBEAT).expect("timing");
     let q = Arc::new(PgPromptQueue::with_caps(
         db.pool.clone(),
@@ -202,7 +208,7 @@ async fn release_clears_lease_so_others_can_claim() {
 
     let session_store =
         PgSessionStore::new(db.pool.clone(), relay_rs::clock::SystemClock::shared());
-    let s2 = session_store.create().await.expect("s2");
+    let s2 = session_store.create(db.default_agent_id).await.expect("s2");
     let _ = q.enqueue(req(s2, "b", "k2")).await.expect("ok");
     let again = q.claim_next_session(WorkerId::new()).await.expect("c2");
     assert!(again.is_some());
@@ -214,7 +220,10 @@ async fn enqueue_caps_pending_per_session() {
     let test_clock = Arc::new(TestClock::new());
     let clock: SharedClock = test_clock;
     let session_store = PgSessionStore::new(db.pool.clone(), clock.clone());
-    let session = session_store.create().await.expect("session");
+    let session = session_store
+        .create(db.default_agent_id)
+        .await
+        .expect("session");
     let timing = LeaseTiming::try_new(LEASE_TTL, HEARTBEAT).expect("valid timing");
     let q = Arc::new(PgPromptQueue::with_caps(
         db.pool.clone(),

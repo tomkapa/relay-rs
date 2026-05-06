@@ -1,3 +1,4 @@
+use crate::agents::SharedAgentStore;
 use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore};
 use crate::runtime::{SharedLeaseManager, SharedPromptQueue, SharedResponseSource};
 use crate::session::SharedSessionStore;
@@ -11,6 +12,7 @@ pub struct AppState {
     pub leases: SharedLeaseManager,
     pub responses: SharedResponseSource,
     pub sessions: SharedSessionStore,
+    pub agents: SharedAgentStore,
     pub mcp_store: SharedMcpServerStore,
     /// Send-half of the MCP refresh signal. Cheap to clone; CRUD handlers fire it
     /// after every write. The owning coordinator task lives on [`Server`].

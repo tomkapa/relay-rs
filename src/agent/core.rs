@@ -4,6 +4,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
+use crate::agents::AgentId;
 use crate::clock::SharedClock;
 use crate::hook::{HookChain, HookDecision, ToolContext, TurnContext};
 use crate::memory::SharedMemory;
@@ -68,10 +69,10 @@ impl Agent {
         }
     }
 
-    /// Allocate a fresh session via the configured store. Returns the handle the caller
+    /// Allocate a fresh session bound to `agent_id`. Returns the handle the caller
     /// passes to [`reply`](Self::reply) for subsequent turns.
-    pub async fn start_session(&self) -> Result<SessionId, AgentError> {
-        Ok(self.sessions.create().await?)
+    pub async fn start_session(&self, agent_id: AgentId) -> Result<SessionId, AgentError> {
+        Ok(self.sessions.create(agent_id).await?)
     }
 
     /// Drive a batch of user prompts (a single user message with one text block per

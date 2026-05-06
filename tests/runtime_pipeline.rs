@@ -74,6 +74,7 @@ struct Harness {
     queue: Arc<PgPromptQueue>,
     hub: Arc<PgResponseHub>,
     sessions: SharedSessionStore,
+    default_agent_id: relay_rs::agents::AgentId,
     pool: relay_rs::runtime::WorkerPoolHandle,
 }
 
@@ -113,6 +114,7 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
     .spawn();
 
     Harness {
+        default_agent_id: db.default_agent_id,
         db,
         queue: queue_impl,
         hub,
@@ -181,7 +183,11 @@ async fn round_trip_publishes_done_chunk() {
         delay: Duration::ZERO,
     });
     let h = build_harness(provider).await;
-    let s = h.sessions.create().await.expect("session");
+    let s = h
+        .sessions
+        .create(h.default_agent_id)
+        .await
+        .expect("session");
     let id = h
         .queue
         .enqueue(req(s, "hi", "k1"))
@@ -210,7 +216,11 @@ async fn cancellation_finishes_inflight_and_skips_next_turn() {
         delay: Duration::from_millis(150),
     });
     let h = build_harness(provider).await;
-    let s = h.sessions.create().await.expect("session");
+    let s = h
+        .sessions
+        .create(h.default_agent_id)
+        .await
+        .expect("session");
     let first = h
         .queue
         .enqueue(req(s, "first", "k-first"))
@@ -251,7 +261,11 @@ async fn streaming_emits_text_before_done() {
         delay: Duration::ZERO,
     });
     let h = build_harness(provider).await;
-    let s = h.sessions.create().await.expect("session");
+    let s = h
+        .sessions
+        .create(h.default_agent_id)
+        .await
+        .expect("session");
     let id = h
         .queue
         .enqueue(req(s, "hi", "stream-key"))
@@ -293,7 +307,11 @@ async fn mid_turn_cancellation_aborts_in_flight_turn() {
         delay: Duration::from_secs(2),
     });
     let h = build_harness(provider).await;
-    let s = h.sessions.create().await.expect("session");
+    let s = h
+        .sessions
+        .create(h.default_agent_id)
+        .await
+        .expect("session");
     let id = h
         .queue
         .enqueue(req(s, "slow", "k-mid-cancel"))
@@ -334,7 +352,11 @@ async fn idempotent_repeat_returns_same_request_id() {
         delay: Duration::ZERO,
     });
     let h = build_harness(provider).await;
-    let s = h.sessions.create().await.expect("session");
+    let s = h
+        .sessions
+        .create(h.default_agent_id)
+        .await
+        .expect("session");
     let a = h
         .queue
         .enqueue(req(s, "hi", "same-key"))

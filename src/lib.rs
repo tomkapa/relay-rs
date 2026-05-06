@@ -5,6 +5,7 @@
 //! one new module and one composition-root edit in [`app::build_agent`].
 
 pub mod agent;
+pub mod agents;
 pub mod app;
 pub mod clock;
 pub mod config;
@@ -21,5 +22,6 @@ pub mod tools;
 pub mod types;
 
 pub use agent::{Agent, AgentBuilder, AgentError};
+pub use agents::{AgentId, AgentRecord, AgentStore, SharedAgentStore};
 pub use config::{ProviderSettings, Settings, SettingsError};
 pub use error::AppError;

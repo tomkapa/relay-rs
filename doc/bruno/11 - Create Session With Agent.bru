@@ -1,0 +1,50 @@
+meta {
+  name: POST /sessions — create a session (explicit agent)
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{base_url}}/sessions
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "agent_id": "{{agent_id}}"
+  }
+}
+
+docs {
+  Bind the new session to a specific agent. `agent_id` must reference an
+  existing row in the `agents` table; an unknown id returns 400 Bad Request
+  with `{"error":"unknown agent_id"}`.
+
+  The default usage pattern is:
+  1. Run "01 - Create Session" once. Its `post-response` script saves the
+     default agent's id into the `agent_id` env var.
+  2. Run this request — it reuses that `agent_id`, so it bound-checks the
+     happy path. Replace the id in the body to target a different agent.
+}
+
+script:post-response {
+  const json = res.getBody();
+  bru.setVar("session_id", json.session_id);
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("agent_id echoed back", function() {
+    const json = res.getBody();
+    expect(json.agent_id).to.equal(bru.getVar("agent_id"));
+  });
+}

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::agents::AgentId;
 use crate::provider::ChatMessage;
 
 use super::error::SessionError;
@@ -26,9 +27,16 @@ crate::uuid_newtype! {
 /// the caller (the agent) consumes the snapshot when building the next request.
 #[async_trait]
 pub trait SessionStore: fmt::Debug + Send + Sync {
-    async fn create(&self) -> Result<SessionId, SessionError>;
+    /// Mint a new session bound to `agent_id`. The agent is fixed for the
+    /// session's lifetime — every turn loads its system prompt from this id, so
+    /// swapping mid-session would derail the model's behaviour. The HTTP layer
+    /// resolves "no agent_id given" to the default agent before calling.
+    async fn create(&self, agent_id: AgentId) -> Result<SessionId, SessionError>;
     async fn append(&self, id: SessionId, message: ChatMessage) -> Result<(), SessionError>;
     async fn snapshot(&self, id: SessionId) -> Result<Vec<ChatMessage>, SessionError>;
+    /// Resolve the agent bound to `id`. Called by the memory layer at the start
+    /// of every turn; complement to `snapshot`.
+    async fn agent_id(&self, id: SessionId) -> Result<AgentId, SessionError>;
     async fn delete(&self, id: SessionId) -> Result<(), SessionError>;
 }
 

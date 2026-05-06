@@ -158,7 +158,10 @@ async fn returns_text_when_no_tool_call() {
     )]));
     let agent = build(&db, provider.clone(), vec![]);
 
-    let session = agent.start_session().await.expect("session");
+    let session = agent
+        .start_session(db.default_agent_id)
+        .await
+        .expect("session");
     let prompt = Prompt::try_from("hello").expect("prompt");
     let reply = agent
         .reply(session, vec![prompt], CancellationToken::new(), None)
@@ -179,7 +182,10 @@ async fn runs_tool_then_returns_text() {
     let counter = Arc::new(CountingTool::new("counter"));
     let agent = build(&db, provider.clone(), vec![counter.clone()]);
 
-    let session = agent.start_session().await.expect("session");
+    let session = agent
+        .start_session(db.default_agent_id)
+        .await
+        .expect("session");
     let prompt = Prompt::try_from("use the tool").expect("prompt");
     let reply = agent
         .reply(session, vec![prompt], CancellationToken::new(), None)
@@ -200,7 +206,10 @@ async fn unknown_tool_does_not_loop_forever() {
     ]));
     let agent = build(&db, provider.clone(), vec![]);
 
-    let session = agent.start_session().await.expect("session");
+    let session = agent
+        .start_session(db.default_agent_id)
+        .await
+        .expect("session");
     let prompt = Prompt::try_from("try the missing tool").expect("prompt");
     let reply = agent
         .reply(session, vec![prompt], CancellationToken::new(), None)
@@ -219,7 +228,10 @@ async fn cancellation_short_circuits() {
     )]));
     let agent = build(&db, provider, vec![]);
 
-    let session = agent.start_session().await.expect("session");
+    let session = agent
+        .start_session(db.default_agent_id)
+        .await
+        .expect("session");
     let prompt = Prompt::try_from("cancel me").expect("prompt");
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -241,7 +253,10 @@ async fn provider_specs_match_registered_tools() {
     let counter = Arc::new(CountingTool::new("counter"));
     let agent = build(&db, provider.clone(), vec![counter]);
 
-    let session = agent.start_session().await.expect("session");
+    let session = agent
+        .start_session(db.default_agent_id)
+        .await
+        .expect("session");
     let prompt = Prompt::try_from("hi").expect("prompt");
     let _ = agent
         .reply(session, vec![prompt], CancellationToken::new(), None)

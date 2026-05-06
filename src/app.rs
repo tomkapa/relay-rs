@@ -16,13 +16,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::agent::{Agent, AgentBuilder};
+use crate::agents::{
+    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentName, AgentPromptCache, AgentSystemPrompt,
+    DefaultAgentSeed, PgAgentStore, SharedAgentStore,
+};
 use crate::clock::{SharedClock, SystemClock};
 use crate::config::{ProviderSettings, Settings};
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
 use crate::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
-use crate::memory::{SharedMemory, StaticMemory};
+use crate::memory::{AgentMemory, SharedMemory};
 use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::openai::OpenAiProvider;
@@ -43,11 +47,36 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PG_MAX_CONNECTIONS: u32 = 32;
 const PG_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are Relay, a helpful AI agent. \
-    You are concise, accurate, and prefer to verify facts using your tools \
-    before answering when the answer is not obvious. \
-    When you call a tool, briefly state why before the call. \
-    When you have enough information, give the user a clear final answer.";
+/// Universal personality / professional-employee attitude that prefixes every
+/// agent's role-specific prompt. Wrapped in `<core>...</core>` by
+/// [`AgentMemory`] so the model can distinguish it from the role block.
+///
+/// Stored as a constant rather than a config file: this is the company's core
+/// identity and it ships with the binary.
+const CORE_SYSTEM_PROMPT: &str = "You are a thoughtful, professional teammate. \
+    You aim for correctness, clarity, and pragmatism in every response. \
+    You verify facts with tools when the answer is not already obvious, \
+    you state what you intend before calling a tool, and you reason in small \
+    steps before committing to an answer. You take feedback seriously, learn \
+    from corrections, and grow toward senior-level judgement: you escalate \
+    ambiguity, you flag unstated assumptions, and you never silently paper \
+    over an error.";
+
+/// Display name for the auto-seeded default agent. Appears in operator UIs and
+/// logs only — the model never sees it.
+const DEFAULT_AGENT_NAME: &str = "assistant";
+
+/// Role description for the auto-seeded default agent. Plays the part of a
+/// general-purpose secretary: helpful, concise, willing to fall back to tools.
+/// This row is the seed; once inserted it is owned by the database — editing
+/// this constant later does **not** update existing deployments (by design,
+/// per the design conversation).
+const DEFAULT_AGENT_ROLE_PROMPT: &str = "You are the user's general assistant, \
+    acting like a capable executive secretary. Help with whatever the user \
+    asks: drafting, summarising, planning, looking things up, and following \
+    through on multi-step tasks. Prefer concrete next steps over open-ended \
+    musings, and ask one focused clarifying question when the request is \
+    genuinely ambiguous.";
 
 /// All the pieces a deployment needs to serve HTTP + run workers in-process.
 #[derive(Debug)]
@@ -67,6 +96,7 @@ struct Collaborators {
     provider: SharedProvider,
     pool: PgPool,
     sessions: SharedSessionStore,
+    agents: SharedAgentStore,
     memory: SharedMemory,
     clock: SharedClock,
     builtin_tools: ToolRegistry,
@@ -86,14 +116,38 @@ impl Collaborators {
             .run(&pool)
             .await
             .map_err(|source| AppError::Migrate { source })?;
+
+        // Seed the default agent before exposing the store; everything downstream
+        // (HTTP, worker, memory) assumes `agents.default_id()` resolves.
+        let agents_impl = Arc::new(PgAgentStore::new(pool.clone(), clock.clone()));
+        let seed = default_agent_seed()?;
+        agents_impl.seed_default(seed).await?;
+        let agents: SharedAgentStore = agents_impl;
+
+        let sessions: SharedSessionStore =
+            Arc::new(PgSessionStore::new(pool.clone(), clock.clone()));
+
+        let cache = Arc::new(AgentPromptCache::new(
+            AGENT_PROMPT_CACHE_CAP,
+            AGENT_PROMPT_CACHE_TTL,
+            clock.clone(),
+        ));
+        let memory: SharedMemory = Arc::new(AgentMemory::new(
+            sessions.clone(),
+            agents.clone(),
+            cache,
+            CORE_SYSTEM_PROMPT,
+        ));
+
         let mcp_store: SharedMcpServerStore =
             Arc::new(PgMcpServerStore::new(pool.clone(), clock.clone()));
         let mcp_registry = McpRegistry::new(mcp_store.clone(), clock.clone());
         Ok(Self {
             provider: build_provider(settings)?,
-            pool: pool.clone(),
-            sessions: Arc::new(PgSessionStore::new(pool, clock.clone())),
-            memory: Arc::new(StaticMemory::new(DEFAULT_SYSTEM_PROMPT)),
+            pool,
+            sessions,
+            agents,
+            memory,
             clock,
             builtin_tools: build_tools(settings, http)?,
             mcp_store,
@@ -104,6 +158,13 @@ impl Collaborators {
     fn toolbox(&self) -> ToolBox {
         ToolBox::new(self.builtin_tools.clone(), self.mcp_registry.clone())
     }
+}
+
+fn default_agent_seed() -> Result<DefaultAgentSeed, AppError> {
+    Ok(DefaultAgentSeed {
+        name: AgentName::try_from(DEFAULT_AGENT_NAME)?,
+        system_prompt: AgentSystemPrompt::try_from(DEFAULT_AGENT_ROLE_PROMPT)?,
+    })
 }
 
 /// Build a fully-wired [`Agent`] from configuration. Kept for tests and any consumer
@@ -174,6 +235,7 @@ pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
         leases,
         responses,
         sessions: pieces.sessions,
+        agents: pieces.agents,
         mcp_store: pieces.mcp_store,
         mcp_refresh,
     };

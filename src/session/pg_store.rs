@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
+use crate::agents::AgentId;
 use crate::clock::SharedClock;
 use crate::provider::ChatMessage;
 
@@ -61,15 +62,26 @@ impl fmt::Debug for PgSessionStore {
 
 #[async_trait]
 impl SessionStore for PgSessionStore {
-    async fn create(&self) -> Result<SessionId, SessionError> {
+    async fn create(&self, agent_id: AgentId) -> Result<SessionId, SessionError> {
         let id = SessionId::new();
         let now = self.now();
-        sqlx::query("INSERT INTO sessions (id, created_at) VALUES ($1, $2)")
-            .bind(id)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
-        Ok(id)
+        // The FK on `sessions.agent_id` rejects unknown ids with a Postgres
+        // 23503 (foreign_key_violation); map it back to the typed
+        // `AgentNotFound` so handlers can return a 400 instead of a 500.
+        let res =
+            sqlx::query("INSERT INTO sessions (id, created_at, agent_id) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(now)
+                .bind(agent_id)
+                .execute(&self.pool)
+                .await;
+        match res {
+            Ok(_) => Ok(id),
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23503") => {
+                Err(SessionError::AgentNotFound(agent_id))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn append(&self, id: SessionId, message: ChatMessage) -> Result<(), SessionError> {
@@ -152,6 +164,15 @@ impl SessionStore for PgSessionStore {
             out.push(msg);
         }
         Ok(out)
+    }
+
+    async fn agent_id(&self, id: SessionId) -> Result<AgentId, SessionError> {
+        let row: Option<(AgentId,)> = sqlx::query_as("SELECT agent_id FROM sessions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let (agent_id,) = row.ok_or(SessionError::NotFound(id))?;
+        Ok(agent_id)
     }
 
     async fn delete(&self, id: SessionId) -> Result<(), SessionError> {

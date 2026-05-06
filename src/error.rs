@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
+use crate::agents::AgentStoreError;
 use crate::config::SettingsError;
 use crate::provider::ProviderError;
 use crate::types::ParseError;
@@ -42,4 +43,7 @@ pub enum AppError {
         #[source]
         source: sqlx::migrate::MigrateError,
     },
+
+    #[error("agent store: {0}")]
+    AgentStore(#[from] AgentStoreError),
 }
