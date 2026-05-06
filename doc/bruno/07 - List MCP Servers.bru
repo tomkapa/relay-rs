@@ -1,0 +1,25 @@
+meta {
+  name: GET /mcp-servers — list registered MCP servers
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{base_url}}/mcp-servers
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("body is array", function() {
+    expect(res.getBody()).to.be.an("array");
+  });
+}

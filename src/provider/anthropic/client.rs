@@ -58,12 +58,10 @@ impl LlmProvider for AnthropicProvider {
     async fn send(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
         let model = parse_model(request.model.as_str());
 
-        let tools_iter = request.tools.iter().map(tool_spec_to_param);
-        let tools = if request.tools.is_empty() {
-            None
-        } else {
-            Some(tools_iter.collect())
-        };
+        // `.then(|| …)` defers the `.collect()` to the non-empty case so we don't
+        // allocate an empty `Vec` only to throw it away.
+        let tools = (!request.tools.is_empty())
+            .then(|| request.tools.iter().map(tool_spec_to_param).collect());
 
         let messages = request.messages.into_iter().map(message_to_param).collect();
 

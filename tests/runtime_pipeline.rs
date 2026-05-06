@@ -91,7 +91,7 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
     let agent = AgentBuilder::new(provider, sessions.clone(), memory, model)
         .expect("builder")
         .with_clock(clock)
-        .with_tools(ToolRegistry::empty())
+        .with_builtin_tools(ToolRegistry::empty())
         .with_hooks(HookChain::new())
         .build();
 

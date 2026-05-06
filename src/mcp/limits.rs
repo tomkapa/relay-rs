@@ -1,0 +1,51 @@
+//! MCP-subsystem invariants. CLAUDE.md §5: every container, every I/O is bounded.
+
+use std::time::Duration;
+
+/// Cap on how many MCP servers we let an operator register.
+///
+/// Each server holds a long-lived rmcp client + a `tokio` worker task; this is the
+/// budget for that resource. Sized for the foreseeable per-tenant deployment, not a
+/// single user's experimental sandbox.
+pub const MAX_MCP_SERVERS: usize = 32;
+
+/// Cap on tools exposed by a single MCP server. A misbehaving (or compromised) server
+/// could otherwise flood the agent's tool list and balloon every provider request.
+pub const MAX_TOOLS_PER_SERVER: usize = 64;
+
+/// How long the alias may be. Matches the schema CHECK constraint and reserves enough
+/// budget that `mcp_<alias>_<remote>` always fits in the 64-char `ToolName` cap.
+/// `4 + 16 + 1 + 43 = 64`.
+pub const MCP_ALIAS_MAX_LEN: usize = 16;
+
+/// Description (operator-facing notes) cap; matches the schema CHECK.
+pub const MCP_DESCRIPTION_MAX_LEN: usize = 512;
+
+/// URL length cap on the `http` transport.
+pub const MCP_URL_MAX_LEN: usize = 2048;
+
+/// Maximum number of custom headers the operator may set on a server.
+pub const MCP_MAX_HEADERS: usize = 16;
+
+/// Maximum length of a single header name.
+pub const MCP_HEADER_NAME_MAX_LEN: usize = 64;
+
+/// Maximum length of a single header value. Bearer tokens fit comfortably; opaque blobs
+/// past this size are a sign of misuse, not a real header.
+pub const MCP_HEADER_VALUE_MAX_LEN: usize = 4096;
+
+/// How long we'll wait while connecting + initializing one MCP server during refresh.
+/// Tighter than the per-call timeout so a dead server can't stall the refresh task.
+pub const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long we'll wait for a single `tools/list` round-trip during refresh.
+pub const MCP_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-call timeout for `tools/call`. Honoured inside `McpTool::execute` in addition to
+/// the agent's outer `tool_timeout`.
+pub const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many bytes of an MCP tool's stringified result we'll keep before truncating.
+/// Independent of (and always less than or equal to) `tools::TOOL_RESULT_MAX_BYTES`,
+/// which is the agent-side cap.
+pub const MCP_RESULT_RENDER_CAP: usize = 128 * 1024;

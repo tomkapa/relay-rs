@@ -68,11 +68,10 @@ impl LlmProvider for OpenAiProvider {
             messages.extend(message_to_wire(msg));
         }
 
-        let tools = if request.tools.is_empty() {
-            None
-        } else {
-            Some(request.tools.iter().map(tool_spec_to_wire).collect())
-        };
+        // `.then(|| …)` defers the `.collect()` to the non-empty case so we don't
+        // allocate an empty `Vec` only to throw it away.
+        let tools = (!request.tools.is_empty())
+            .then(|| request.tools.iter().map(tool_spec_to_wire).collect());
 
         let body = ChatRequestBody {
             model: request.model.as_str().to_string(),

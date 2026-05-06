@@ -349,14 +349,10 @@ impl ResponseSource for PgResponseHub {
             },
         );
 
-        // Filter out the dedupe-`None`s.
-        let live_filtered = live_mapped.filter_map(|r| async move {
-            match r {
-                Ok(Some(ev)) => Some(Ok(ev)),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            }
-        });
+        // Filter out the dedupe-`None`s. `Result<Option<T>, E>::transpose` →
+        // `Option<Result<T, E>>` does this in one call: `Ok(None)` becomes the
+        // filter-out None, and the other two arms keep their shape.
+        let live_filtered = live_mapped.filter_map(|r| async move { r.transpose() });
 
         Ok(Box::pin(backlog_stream.chain(live_filtered)))
     }

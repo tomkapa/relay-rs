@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod hook;
 pub mod http;
+pub mod mcp;
 pub mod memory;
 pub mod observability;
 pub mod provider;

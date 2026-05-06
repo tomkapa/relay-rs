@@ -2,6 +2,7 @@
 //! CLAUDE.md §2; handlers stay thin and call into `prompt::*` traits.
 
 mod error;
+mod mcp_routes;
 mod routes;
 mod state;
 

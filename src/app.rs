@@ -21,6 +21,7 @@ use crate::config::{ProviderSettings, Settings};
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
+use crate::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
 use crate::memory::{SharedMemory, StaticMemory};
 use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
@@ -30,7 +31,7 @@ use crate::runtime::{
     SharedResponseSource, WorkerConfig, WorkerPool, WorkerPoolHandle,
 };
 use crate::session::{PgSessionStore, SharedSessionStore};
-use crate::tools::{ToolRegistry, WebFetchTool, WebSearchTool};
+use crate::tools::{ToolBox, ToolRegistry, WebFetchTool, WebSearchTool};
 
 const HTTP_USER_AGENT: &str = concat!("relay-rs/", env!("CARGO_PKG_VERSION"));
 const HTTP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,6 +54,9 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are Relay, a helpful AI agent. \
 pub struct Server {
     pub state: AppState,
     pub workers: WorkerPoolHandle,
+    /// Owned handle for the MCP refresh coordinator (CLAUDE.md §7 — no floating tasks).
+    /// Held here so graceful shutdown can stop it before the workers wind down.
+    pub mcp_refresher: McpRefresher,
     pub http_addr: SocketAddr,
 }
 
@@ -65,7 +69,9 @@ struct Collaborators {
     sessions: SharedSessionStore,
     memory: SharedMemory,
     clock: SharedClock,
-    tools: ToolRegistry,
+    builtin_tools: ToolRegistry,
+    mcp_store: SharedMcpServerStore,
+    mcp_registry: Arc<McpRegistry>,
 }
 
 impl Collaborators {
@@ -80,14 +86,23 @@ impl Collaborators {
             .run(&pool)
             .await
             .map_err(|source| AppError::Migrate { source })?;
+        let mcp_store: SharedMcpServerStore =
+            Arc::new(PgMcpServerStore::new(pool.clone(), clock.clone()));
+        let mcp_registry = McpRegistry::new(mcp_store.clone(), clock.clone());
         Ok(Self {
             provider: build_provider(settings)?,
             pool: pool.clone(),
             sessions: Arc::new(PgSessionStore::new(pool, clock.clone())),
             memory: Arc::new(StaticMemory::new(DEFAULT_SYSTEM_PROMPT)),
             clock,
-            tools: build_tools(settings, http)?,
+            builtin_tools: build_tools(settings, http)?,
+            mcp_store,
+            mcp_registry,
         })
+    }
+
+    fn toolbox(&self) -> ToolBox {
+        ToolBox::new(self.builtin_tools.clone(), self.mcp_registry.clone())
     }
 }
 
@@ -106,7 +121,7 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
         settings.model.clone(),
     )
     .expect("invariant: limits constants are static and parse")
-    .with_tools(pieces.tools.clone())
+    .with_tools(pieces.toolbox())
     .with_hooks(HookChain::new())
     .with_clock(pieces.clock.clone())
     .build()
@@ -117,6 +132,19 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
 pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
     let pieces = Collaborators::new(&settings).await?;
     let agent = build_agent_from(&pieces, &settings);
+
+    // Best-effort initial refresh: connect to every registered MCP server so the very
+    // first turn already sees their tools. A failure here doesn't block startup —
+    // operator visibility comes from `last_error` columns and the warn logs inside
+    // `refresh`. Empty / new deploys take the fast path with no upstream calls.
+    if let Err(e) = pieces.mcp_registry.refresh().await {
+        warn!(error = %e, "mcp.refresh.startup_failed");
+    }
+
+    // Spin the long-running refresh coordinator. Its JoinHandle is owned by `Server`
+    // (§7) and the trigger is cloned into `AppState` so CRUD handlers fire it without
+    // ever spawning a task themselves.
+    let (mcp_refresher, mcp_refresh) = McpRefresher::spawn(pieces.mcp_registry.clone());
 
     let queue_impl = Arc::new(PgPromptQueue::new(
         pieces.pool.clone(),
@@ -146,11 +174,14 @@ pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
         leases,
         responses,
         sessions: pieces.sessions,
+        mcp_store: pieces.mcp_store,
+        mcp_refresh,
     };
 
     Ok(Server {
         state,
         workers,
+        mcp_refresher,
         http_addr: settings.http_addr,
     })
 }
@@ -162,6 +193,7 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
     let Server {
         state,
         workers,
+        mcp_refresher,
         http_addr,
     } = server;
     let app = router(state);
@@ -179,6 +211,10 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
         warn!(error = %e, "http.serve.error");
     }
     info!("http.shutdown.complete");
+    // HTTP first (no more incoming refresh signals), then refresher (no in-flight
+    // upstream MCP calls), then workers.
+    mcp_refresher.shutdown().await;
+    info!("mcp.refresher.shutdown.complete");
     workers.shutdown().await;
     info!("workers.shutdown.complete");
     Ok(())

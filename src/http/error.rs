@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use thiserror::Error;
 
+use crate::mcp::McpError;
 use crate::runtime::{PromptError, ResponseError};
 use crate::session::SessionError;
 use crate::types::ParseError;
@@ -36,6 +37,9 @@ pub enum HttpError {
     #[error("response stream: {0}")]
     Response(#[from] ResponseError),
 
+    #[error("mcp: {0}")]
+    Mcp(#[from] McpError),
+
     #[error("internal error")]
     Internal,
 }
@@ -52,7 +56,8 @@ impl IntoResponse for HttpError {
                 (StatusCode::NOT_FOUND, "session not found".into())
             }
             Self::Session(SessionError::MessageCapExceeded { .. })
-            | Self::Prompt(PromptError::PendingCapExceeded { .. }) => {
+            | Self::Prompt(PromptError::PendingCapExceeded { .. })
+            | Self::Mcp(McpError::ServerCapExceeded { .. }) => {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
             }
             Self::Session(e) => (StatusCode::BAD_REQUEST, e.to_string()),
@@ -64,6 +69,14 @@ impl IntoResponse for HttpError {
                 (StatusCode::NOT_FOUND, "stream not found".into())
             }
             Self::Response(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
+            Self::Mcp(McpError::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, "mcp server not found".into())
+            }
+            Self::Mcp(McpError::AliasTaken(_)) => (StatusCode::CONFLICT, self.to_string()),
+            Self::Mcp(McpError::Parse(_) | McpError::InvalidConfig(_)) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
+            }
+            Self::Mcp(_) => (StatusCode::INTERNAL_SERVER_ERROR, "mcp store error".into()),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
         (status, Json(json!({ "error": message }))).into_response()

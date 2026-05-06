@@ -144,7 +144,7 @@ fn build(db: &TestDb, provider: Arc<ScriptedProvider>, tools: Vec<SharedTool>) -
     }
     AgentBuilder::new(provider, sessions, memory, model)
         .expect("builder")
-        .with_tools(builder.build())
+        .with_builtin_tools(builder.build())
         .with_hooks(HookChain::new())
         .build()
 }

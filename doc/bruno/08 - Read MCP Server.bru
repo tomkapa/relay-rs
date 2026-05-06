@@ -1,0 +1,26 @@
+meta {
+  name: GET /mcp-servers/{id} — read one MCP server, including discovered_tools
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{base_url}}/mcp-servers/{{mcp_server_id}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("id matches", function() {
+    const json = res.getBody();
+    expect(json.id).to.equal(bru.getVar("mcp_server_id"));
+  });
+}

@@ -12,7 +12,7 @@ use crate::provider::{
     UserContent,
 };
 use crate::session::{SessionId, SharedSessionStore};
-use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolRegistry};
+use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolBox, truncate_to_char_boundary};
 use crate::types::{MaxOutputTokens, MaxTurns, ModelId, Prompt, TurnIndex};
 
 use super::error::AgentError;
@@ -29,7 +29,7 @@ pub struct Agent {
     memory: SharedMemory,
     #[allow(dead_code)] // wired through builder; consumed by future scheduling work.
     clock: SharedClock,
-    tools: ToolRegistry,
+    tools: ToolBox,
     hooks: HookChain,
     model: ModelId,
     max_output_tokens: MaxOutputTokens,
@@ -45,7 +45,7 @@ impl Agent {
         sessions: SharedSessionStore,
         memory: SharedMemory,
         clock: SharedClock,
-        tools: ToolRegistry,
+        tools: ToolBox,
         hooks: HookChain,
         model: ModelId,
         max_output_tokens: MaxOutputTokens,
@@ -315,11 +315,7 @@ fn error_result(call_id: ToolCallId, message: String) -> ToolResult {
     // here as a final boundary so a bad implementation cannot blow the budget.
     let mut output = message;
     if output.len() > TOOL_RESULT_MAX_BYTES {
-        let mut cut = TOOL_RESULT_MAX_BYTES;
-        while cut > 0 && !output.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        output.truncate(cut);
+        truncate_to_char_boundary(&mut output, TOOL_RESULT_MAX_BYTES);
     }
     ToolResult {
         call_id,

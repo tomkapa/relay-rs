@@ -33,3 +33,43 @@ pub const TOOL_RESULT_MAX_BYTES: usize = 256 * 1024;
 // §5: per-tool body caps must always fit within the global tool-result cap so the agent
 // boundary doesn't have to truncate something we already truncated upstream.
 const _: () = assert!(FETCH_MAX_BODY_BYTES <= TOOL_RESULT_MAX_BYTES);
+
+/// Truncate `s` to at most `target` bytes, on a UTF-8 boundary.
+///
+/// `String::truncate` panics if the cut lands mid-codepoint; this walks back to the
+/// nearest boundary first. Used wherever we cap a tool result against a byte budget
+/// (§5).
+pub fn truncate_to_char_boundary(s: &mut String, target: usize) {
+    let mut cut = target.min(s.len());
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_to_char_boundary;
+
+    #[test]
+    fn ascii_string_truncates_to_target() {
+        let mut s = "hello world".to_owned();
+        truncate_to_char_boundary(&mut s, 5);
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn target_past_end_is_a_noop() {
+        let mut s = "hi".to_owned();
+        truncate_to_char_boundary(&mut s, 100);
+        assert_eq!(s, "hi");
+    }
+
+    #[test]
+    fn multi_byte_codepoint_is_not_split() {
+        // "héllo" — 'é' is 2 bytes (0xC3 0xA9). Cutting at 2 lands mid-codepoint.
+        let mut s = "héllo".to_owned();
+        truncate_to_char_boundary(&mut s, 2);
+        assert_eq!(s, "h");
+    }
+}

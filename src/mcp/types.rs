@@ -1,0 +1,482 @@
+//! Domain types for the MCP subsystem.
+//!
+//! CLAUDE.md §1: every value carrying an invariant gets a newtype with a `TryFrom`
+//! smart constructor. The HTTP boundary parses raw JSON into these types once; nothing
+//! downstream constructs them directly.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+use crate::types::ParseError;
+
+use super::limits::{
+    MCP_ALIAS_MAX_LEN, MCP_DESCRIPTION_MAX_LEN, MCP_HEADER_NAME_MAX_LEN, MCP_HEADER_VALUE_MAX_LEN,
+    MCP_MAX_HEADERS, MCP_URL_MAX_LEN,
+};
+
+crate::uuid_newtype! {
+    /// Opaque identifier for a registered MCP server row.
+    pub McpServerId
+}
+
+/// Operator-chosen short name. Drives the prefix on every tool the server exposes
+/// (`mcp_<alias>_<remote_name>`); the `ToolName` cap leaves us 16 chars to play with.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct McpServerAlias(String);
+
+impl McpServerAlias {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for McpServerAlias {
+    type Error = ParseError;
+
+    fn try_from(raw: &str) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(ParseError::Empty {
+                field: "mcp_server_alias",
+            });
+        }
+        if raw.len() > MCP_ALIAS_MAX_LEN {
+            return Err(ParseError::TooLong {
+                field: "mcp_server_alias",
+                max: MCP_ALIAS_MAX_LEN,
+                got: raw.len(),
+            });
+        }
+        // The alias is concatenated into a `ToolName`, which only allows
+        // `[a-zA-Z0-9_-]`; we further restrict to lowercase + digits + `_`/`-` so the
+        // wire format is predictable.
+        let valid = raw
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if !valid {
+            return Err(ParseError::Malformed {
+                field: "mcp_server_alias",
+                detail: "allowed: a-z 0-9 _ -",
+            });
+        }
+        Ok(Self(raw.to_owned()))
+    }
+}
+
+impl TryFrom<String> for McpServerAlias {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_from(raw.as_str())
+    }
+}
+
+impl fmt::Debug for McpServerAlias {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("McpServerAlias").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for McpServerAlias {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for McpServerAlias {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpServerAlias {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Operator-facing description. Plain free text, length-bounded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpDescription(String);
+
+impl McpDescription {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for McpDescription {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        if raw.len() > MCP_DESCRIPTION_MAX_LEN {
+            return Err(ParseError::TooLong {
+                field: "mcp_description",
+                max: MCP_DESCRIPTION_MAX_LEN,
+                got: raw.len(),
+            });
+        }
+        Ok(Self(raw))
+    }
+}
+
+/// Validated MCP transport configuration. Persisted as JSONB; round-trips through the
+/// same `TryFrom<McpTransportInput>` so the storage and HTTP boundaries enforce the
+/// same invariants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "McpTransportInput", into = "McpTransportInput")]
+pub enum McpTransport {
+    Http {
+        url: McpHttpUrl,
+        /// `BTreeMap` so the JSONB ordering is deterministic — diffs and tests don't
+        /// flicker on hash randomisation.
+        headers: BTreeMap<McpHeaderName, McpHeaderValue>,
+    },
+}
+
+/// On-the-wire shape used for both deserialize-from and serialize-to. Adding a new
+/// transport variant is a one-tag change here plus one match arm in `TryFrom`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum McpTransportInput {
+    Http {
+        url: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+    },
+}
+
+impl TryFrom<McpTransportInput> for McpTransport {
+    type Error = ParseError;
+    fn try_from(raw: McpTransportInput) -> Result<Self, Self::Error> {
+        match raw {
+            McpTransportInput::Http { url, headers } => {
+                let url = McpHttpUrl::try_from(url.as_str())?;
+                if headers.len() > MCP_MAX_HEADERS {
+                    return Err(ParseError::OutOfRange {
+                        field: "mcp_transport.headers",
+                        detail: "too many headers",
+                    });
+                }
+                let mut parsed = BTreeMap::new();
+                for (name, value) in headers {
+                    let name = McpHeaderName::try_from(name)?;
+                    let value = McpHeaderValue::try_from(value)?;
+                    parsed.insert(name, value);
+                }
+                Ok(Self::Http {
+                    url,
+                    headers: parsed,
+                })
+            }
+        }
+    }
+}
+
+impl From<McpTransport> for McpTransportInput {
+    fn from(value: McpTransport) -> Self {
+        match value {
+            McpTransport::Http { url, headers } => Self::Http {
+                url: url.as_str().to_owned(),
+                headers: headers
+                    .into_iter()
+                    .map(|(k, v)| (k.into_string(), v.into_string()))
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// `https://...` (or `http://localhost...` for dev) URL pointing at an MCP server.
+///
+/// We do **not** apply the SSRF policy here — outbound MCP traffic is operator-trusted
+/// (per design: SaaS operator registers servers explicitly), unlike `web_fetch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpHttpUrl(Url);
+
+impl McpHttpUrl {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl TryFrom<&str> for McpHttpUrl {
+    type Error = ParseError;
+    fn try_from(raw: &str) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(ParseError::Empty {
+                field: "mcp_transport.url",
+            });
+        }
+        if raw.len() > MCP_URL_MAX_LEN {
+            return Err(ParseError::TooLong {
+                field: "mcp_transport.url",
+                max: MCP_URL_MAX_LEN,
+                got: raw.len(),
+            });
+        }
+        let url = Url::parse(raw).map_err(|_| ParseError::Malformed {
+            field: "mcp_transport.url",
+            detail: "not a valid URL",
+        })?;
+        match url.scheme() {
+            "http" | "https" => {}
+            _ => {
+                return Err(ParseError::Malformed {
+                    field: "mcp_transport.url",
+                    detail: "scheme must be http or https",
+                });
+            }
+        }
+        if url.host().is_none() {
+            return Err(ParseError::Malformed {
+                field: "mcp_transport.url",
+                detail: "host missing",
+            });
+        }
+        Ok(Self(url))
+    }
+}
+
+/// Custom HTTP header name.
+///
+/// We allow a permissive but bounded set so we don't need to mirror RFC-compliance
+/// here — the upstream `http::HeaderName` parses the value when we hand it to rmcp,
+/// and rejects anything illegal.
+///
+/// Stored lowercased: HTTP header names are case-insensitive (RFC 7230 §3.2), and
+/// `http::HeaderName` lowercases on insert. Without normalising at parse time, an
+/// operator who registered both `Authorization` and `authorization` would see two
+/// distinct entries in the `BTreeMap` but only one would survive the trip through
+/// rmcp's `HashMap<HeaderName, ...>` — the other silently disappears. Normalise here
+/// so operator intent matches the wire and so `BTreeMap` keying is canonical.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct McpHeaderName(String);
+
+impl McpHeaderName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for McpHeaderName {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(ParseError::Empty {
+                field: "mcp_transport.header_name",
+            });
+        }
+        if raw.len() > MCP_HEADER_NAME_MAX_LEN {
+            return Err(ParseError::TooLong {
+                field: "mcp_transport.header_name",
+                max: MCP_HEADER_NAME_MAX_LEN,
+                got: raw.len(),
+            });
+        }
+        // rfc7230 allows tchar; we restrict further to the printable ASCII subset
+        // commonly seen in headers and avoid spaces / control chars / non-ASCII.
+        let valid = raw.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
+        });
+        if !valid {
+            return Err(ParseError::Malformed {
+                field: "mcp_transport.header_name",
+                detail: "rfc7230 token characters only",
+            });
+        }
+        Ok(Self(raw.to_ascii_lowercase()))
+    }
+}
+
+impl Serialize for McpHeaderName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpHeaderName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Custom HTTP header value. Length-bounded, ASCII-printable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct McpHeaderValue(String);
+
+impl McpHeaderValue {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for McpHeaderValue {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(ParseError::Empty {
+                field: "mcp_transport.header_value",
+            });
+        }
+        if raw.len() > MCP_HEADER_VALUE_MAX_LEN {
+            return Err(ParseError::TooLong {
+                field: "mcp_transport.header_value",
+                max: MCP_HEADER_VALUE_MAX_LEN,
+                got: raw.len(),
+            });
+        }
+        // rfc7230 field-value: visible ASCII + space/htab. Reject CR/LF (header smuggling)
+        // and any non-ASCII.
+        let valid = raw
+            .chars()
+            .all(|c| c == ' ' || c == '\t' || (c.is_ascii_graphic()));
+        if !valid {
+            return Err(ParseError::Malformed {
+                field: "mcp_transport.header_value",
+                detail: "must be ascii-printable, no control chars",
+            });
+        }
+        Ok(Self(raw))
+    }
+}
+
+impl Serialize for McpHeaderValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpHeaderValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One row in `mcp_servers`. Returned by the store; consumed by `McpRegistry::refresh`.
+#[derive(Debug, Clone)]
+pub struct McpServerRecord {
+    pub id: McpServerId,
+    pub alias: McpServerAlias,
+    pub enabled: bool,
+    pub config: McpTransport,
+    pub description: Option<McpDescription>,
+    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub discovered_tools: Option<Vec<DiscoveredTool>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Tool metadata cached on the row after a successful refresh, surfaced by the
+/// list/read API so operators can see what a server is exposing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredTool {
+    pub remote_name: String,
+    pub prefixed_name: String,
+    pub description: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_rejects_uppercase_and_spaces() {
+        assert!(McpServerAlias::try_from("hello").is_ok());
+        assert!(McpServerAlias::try_from("h-1_2").is_ok());
+        assert!(McpServerAlias::try_from("Hello").is_err());
+        assert!(McpServerAlias::try_from("hi there").is_err());
+        assert!(McpServerAlias::try_from("").is_err());
+        assert!(McpServerAlias::try_from("a".repeat(MCP_ALIAS_MAX_LEN + 1).as_str()).is_err());
+    }
+
+    #[test]
+    fn url_requires_http_scheme_and_host() {
+        assert!(McpHttpUrl::try_from("https://example.com/mcp").is_ok());
+        assert!(McpHttpUrl::try_from("http://localhost:9000").is_ok());
+        assert!(McpHttpUrl::try_from("file:///etc/passwd").is_err());
+        assert!(McpHttpUrl::try_from("not a url").is_err());
+        assert!(McpHttpUrl::try_from("").is_err());
+    }
+
+    #[test]
+    fn header_name_rejects_separators_and_controls() {
+        assert!(McpHeaderName::try_from("Authorization".to_owned()).is_ok());
+        assert!(McpHeaderName::try_from("X-Custom_Header".to_owned()).is_ok());
+        assert!(McpHeaderName::try_from("bad header".to_owned()).is_err());
+        assert!(McpHeaderName::try_from("bad/header".to_owned()).is_err());
+        assert!(McpHeaderName::try_from(String::new()).is_err());
+    }
+
+    #[test]
+    fn header_name_is_canonicalised_to_lowercase() {
+        let upper = McpHeaderName::try_from("Authorization".to_owned()).expect("valid");
+        let lower = McpHeaderName::try_from("authorization".to_owned()).expect("valid");
+        assert_eq!(upper.as_str(), "authorization");
+        assert_eq!(upper, lower);
+    }
+
+    #[test]
+    fn header_value_rejects_crlf() {
+        assert!(McpHeaderValue::try_from("Bearer abc.def".to_owned()).is_ok());
+        assert!(McpHeaderValue::try_from("oops\r\nInjected: 1".to_owned()).is_err());
+        assert!(McpHeaderValue::try_from("nul\0byte".to_owned()).is_err());
+    }
+
+    #[test]
+    fn transport_round_trips_through_serde() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            McpHeaderName::try_from("Authorization".to_owned()).expect("valid"),
+            McpHeaderValue::try_from("Bearer token-123".to_owned()).expect("valid"),
+        );
+        let original = McpTransport::Http {
+            url: McpHttpUrl::try_from("https://example.com/mcp").expect("valid"),
+            headers,
+        };
+        let json = serde_json::to_value(&original).expect("serialize");
+        let round: McpTransport = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round, original);
+    }
+
+    #[test]
+    fn transport_rejects_unknown_scheme_via_serde() {
+        let json = serde_json::json!({"type": "http", "url": "ftp://x"});
+        let res: Result<McpTransport, _> = serde_json::from_value(json);
+        assert!(res.is_err());
+    }
+}

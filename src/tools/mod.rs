@@ -9,13 +9,15 @@
 
 pub mod limits;
 mod registry;
+mod toolbox;
 mod traits;
 mod url;
 mod web_fetch;
 mod web_search;
 
-pub use limits::TOOL_RESULT_MAX_BYTES;
+pub use limits::{TOOL_RESULT_MAX_BYTES, truncate_to_char_boundary};
 pub use registry::{ToolRegistry, ToolRegistryBuilder};
+pub use toolbox::{DynamicToolSource, ToolBox};
 pub use traits::{SharedTool, Tool, ToolError};
 pub use url::{FetchUrl, UrlError};
 pub use web_fetch::WebFetchTool;

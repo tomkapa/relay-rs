@@ -162,17 +162,12 @@ fn assistant_to_wire(blocks: Vec<AssistantContent>) -> Vec<WireMessage> {
         }
     }
 
-    let content = if text.is_empty() { None } else { Some(text) };
-    let tool_calls = if tool_calls.is_empty() {
-        None
-    } else {
-        Some(tool_calls)
-    };
-    let reasoning_content = if reasoning.is_empty() {
-        None
-    } else {
-        Some(reasoning)
-    };
+    // `bool::then_some` is the one-liner equivalent of
+    // `if cond { Some(val) } else { None }`. The string/vec is moved into the call in
+    // either branch — same semantics as the if-else, fewer lines.
+    let content = (!text.is_empty()).then_some(text);
+    let tool_calls = (!tool_calls.is_empty()).then_some(tool_calls);
+    let reasoning_content = (!reasoning.is_empty()).then_some(reasoning);
 
     vec![WireMessage::Assistant {
         content,

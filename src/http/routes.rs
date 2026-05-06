@@ -12,7 +12,7 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tower_http::trace::TraceLayer;
@@ -27,6 +27,9 @@ use crate::session::SessionId;
 use crate::types::Prompt;
 
 use super::error::HttpError;
+use super::mcp_routes::{
+    create_mcp_server, delete_mcp_server, list_mcp_servers, read_mcp_server, update_mcp_server,
+};
 use super::state::AppState;
 
 const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -37,6 +40,16 @@ pub fn router(state: AppState) -> Router {
         .route("/prompts", post(submit_prompt))
         .route("/requests/{id}/stream", get(stream_request))
         .route("/requests/{id}/cancel", post(cancel_request))
+        .route(
+            "/mcp-servers",
+            post(create_mcp_server).get(list_mcp_servers),
+        )
+        .route(
+            "/mcp-servers/{id}",
+            get(read_mcp_server)
+                .merge(put(update_mcp_server))
+                .merge(delete(delete_mcp_server)),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

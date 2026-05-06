@@ -5,7 +5,7 @@ use crate::hook::HookChain;
 use crate::memory::SharedMemory;
 use crate::provider::SharedProvider;
 use crate::session::SharedSessionStore;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolBox, ToolRegistry};
 use crate::types::{MaxOutputTokens, MaxTurns, ModelId, ParseError};
 
 use super::core::Agent;
@@ -24,7 +24,7 @@ pub struct AgentBuilder {
     sessions: SharedSessionStore,
     memory: SharedMemory,
     clock: SharedClock,
-    tools: ToolRegistry,
+    tools: ToolBox,
     hooks: HookChain,
     model: ModelId,
     max_output_tokens: MaxOutputTokens,
@@ -46,7 +46,7 @@ impl AgentBuilder {
             sessions,
             memory,
             clock: SystemClock::shared(),
-            tools: ToolRegistry::empty(),
+            tools: ToolBox::from_builtins(ToolRegistry::empty()),
             hooks: HookChain::new(),
             model,
             max_output_tokens: MaxOutputTokens::try_from(DEFAULT_MAX_OUTPUT_TOKENS)?,
@@ -57,9 +57,16 @@ impl AgentBuilder {
     }
 
     #[must_use]
-    pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+    pub fn with_tools(mut self, tools: ToolBox) -> Self {
         self.tools = tools;
         self
+    }
+
+    /// Convenience: build a [`ToolBox`] from `registry` with no MCP source attached.
+    /// Lets composition that doesn't care about MCP keep its existing builder chain.
+    #[must_use]
+    pub fn with_builtin_tools(self, registry: ToolRegistry) -> Self {
+        self.with_tools(ToolBox::from_builtins(registry))
     }
 
     #[must_use]
