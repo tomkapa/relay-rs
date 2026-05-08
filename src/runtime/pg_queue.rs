@@ -17,11 +17,12 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::clock::SharedClock;
+use crate::observability::propagation;
 use crate::session::SessionId;
-use crate::types::Prompt;
+use crate::types::{MessageSender, Participant, Prompt};
 
 use super::error::PromptError;
-use super::limits::{MAX_ATTEMPTS, MAX_PENDING_PER_SESSION};
+use super::limits::{MAX_ATTEMPTS, MAX_DAG_TURNS, MAX_PENDING_PER_SESSION};
 use super::queue::{
     ClaimReceipt, ClaimedPrompt, ClaimedSession, EnqueueOutcome, LeaseManager, LeaseTiming,
     LeaseToken, NewPromptRequest, PromptQueue, RequestStatusView,
@@ -150,16 +151,29 @@ impl fmt::Debug for PgPromptQueue {
     }
 }
 
+// `clippy::too_many_lines` here counts the *entire* `#[async_trait]`-expanded
+// impl block (every method's body inlined), not any one method. Each method
+// is itself bounded; splitting the impl into multiple `impl` blocks would
+// just hide the count without changing the code shape.
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl PromptQueue for PgPromptQueue {
     async fn enqueue(&self, req: NewPromptRequest) -> Result<EnqueueOutcome, PromptError> {
         let now = self.now();
+        let receiver = Participant::agent(req.receiver_agent_id);
+        // §1: parse, don't validate. Sessions cannot host equal participants;
+        // catch the violation before we hit Postgres.
+        if req.sender == receiver {
+            return Err(PromptError::SelfSession);
+        }
+
         let mut tx = self.pool.begin().await?;
 
-        // Idempotent path — return the existing row's id and status if the key is
-        // already known. Lock the row to keep concurrent enqueues consistent.
-        let existing: Option<(PromptRequestId, RequestStatus)> = sqlx::query_as(
-            "SELECT id, status FROM prompt_requests
+        // Idempotent path — return the existing row's id, session, and status
+        // if the key is already known. Lock the row to keep concurrent enqueues
+        // consistent.
+        let existing: Option<(PromptRequestId, SessionId, RequestStatus)> = sqlx::query_as(
+            "SELECT id, session_id, status FROM prompt_requests
              WHERE idempotency_key = $1
              FOR UPDATE",
         )
@@ -167,10 +181,27 @@ impl PromptQueue for PgPromptQueue {
         .fetch_optional(&mut *tx)
         .await?;
 
-        if let Some((request_id, status)) = existing {
+        if let Some((request_id, session, status)) = existing {
             tx.commit().await?;
-            return Ok(EnqueueOutcome::Existing { request_id, status });
+            return Ok(EnqueueOutcome::Existing {
+                request_id,
+                session,
+                status,
+            });
         }
+
+        // Resolve session: continuing an existing one, or minting a new one.
+        // For new sessions the request id IS the DAG root id, so we mint the
+        // request id first, then the session row referencing it, then the
+        // request row, then the dag row. The init.sql FK on
+        // prompt_requests.session_id requires the session to exist first.
+        let request_id = PromptRequestId::new();
+        let resolved = resolve_session(&mut tx, &req, receiver, request_id, now).await?;
+        let SessionResolution {
+            session,
+            root_request_id,
+            is_new_session,
+        } = resolved;
 
         // Pending-cap check. Counted inside the same tx as the insert so a racing
         // enqueue cannot push us past the cap.
@@ -179,38 +210,40 @@ impl PromptQueue for PgPromptQueue {
             "SELECT COUNT(*) FROM prompt_requests
              WHERE session_id = $1 AND status = $2",
         )
-        .bind(req.session)
+        .bind(session)
         .bind(RequestStatus::Pending)
         .fetch_one(&mut *tx)
         .await?;
         if pending_count >= pending_cap_i64 {
             return Err(PromptError::PendingCapExceeded {
-                session: req.session,
+                session,
                 max: self.pending_cap,
             });
         }
 
-        let request_id = PromptRequestId::new();
-        sqlx::query(
-            "INSERT INTO prompt_requests
-                 (id, session_id, content, idempotency_key, status,
-                  attempts, turn_seq, cancellation_requested, failure_reason,
-                  created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, 0, 0, FALSE, NULL, $6, $6)",
-        )
-        .bind(request_id)
-        .bind(req.session)
-        .bind(req.content.as_str())
-        .bind(req.idempotency_key.as_str())
-        .bind(RequestStatus::Pending)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        insert_prompt_request(&mut tx, &req, request_id, session, root_request_id, now).await?;
+
+        if is_new_session {
+            // Seed the DAG budget. `MAX_DAG_TURNS` is the per-DAG send_message
+            // ceiling enforced by the (future) send_message tool.
+            let cap = i64::from(MAX_DAG_TURNS);
+            sqlx::query(
+                "INSERT INTO prompt_request_dags
+                     (root_request_id, turns_used, turns_cap, created_at)
+                 VALUES ($1, 0, $2, $3)",
+            )
+            .bind(root_request_id)
+            .bind(cap)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
 
         Ok(EnqueueOutcome::Inserted {
             request_id,
+            session,
             status: RequestStatus::Pending,
         })
     }
@@ -294,15 +327,23 @@ impl PromptQueue for PgPromptQueue {
         }
 
         // Drain pending rows for the session: flip them to processing, stamp the
-        // turn_seq, bump attempts.
-        let drained: Vec<(PromptRequestId, String)> = sqlx::query_as(
+        // turn_seq, bump attempts. `receiver_agent_id` and `traceparent` are
+        // returned so the worker can resolve the right Agent from the
+        // registry and attach its `handle_claim` span to the producer's
+        // trace.
+        let drained: Vec<(
+            PromptRequestId,
+            String,
+            crate::agents::AgentId,
+            Option<String>,
+        )> = sqlx::query_as(
             "UPDATE prompt_requests
              SET status = $1,
                  turn_seq = $2,
                  attempts = attempts + 1,
                  updated_at = $3
              WHERE session_id = $4 AND status = $5
-             RETURNING id, content",
+             RETURNING id, content, receiver_agent_id, traceparent",
         )
         .bind(RequestStatus::Processing)
         .bind(next_seq)
@@ -322,8 +363,28 @@ impl PromptQueue for PgPromptQueue {
             return Ok(None);
         }
 
+        // §6: every drained row should target the same receiver — sessions are
+        // strictly 2-party, so prompts on one session cannot address different
+        // agents. A divergence means schema corruption.
+        let receiver_agent_id = drained[0].2;
+        for (_, _, rcv, _) in &drained[1..] {
+            assert_eq!(
+                *rcv, receiver_agent_id,
+                "invariant: drained prompts for one session must share receiver_agent_id"
+            );
+        }
+
+        // Pick the first non-empty traceparent. A claim batch is the
+        // worker's view of one logical turn — every prompt in it traces
+        // back to the same producer span (the human POST or one
+        // `send_message` call), so the heads agree. If a batch ever mixes
+        // producers we still anchor to the first one rather than spawning
+        // an orphan span; the divergence shows up as multiple inbound
+        // links in Honeycomb, which is the right way to surface it.
+        let traceparent = drained.iter().find_map(|(_, _, _, tp)| tp.clone());
+
         let mut prompts = Vec::with_capacity(drained.len());
-        for (request_id, content) in drained {
+        for (request_id, content, _, _) in drained {
             let parsed = Prompt::try_from(content)?;
             prompts.push(ClaimedPrompt {
                 request_id,
@@ -335,8 +396,10 @@ impl PromptQueue for PgPromptQueue {
 
         Ok(Some(ClaimedSession {
             session,
+            receiver_agent_id,
             prompts,
             lease,
+            traceparent,
         }))
     }
 
@@ -397,6 +460,48 @@ impl PromptQueue for PgPromptQueue {
             failure_reason,
         })
     }
+
+    /// Batch version: one round-trip via `WHERE id = ANY($1)`. A missing id
+    /// is silently skipped (the cancel watcher and quiescence checks treat
+    /// "row vanished" the same as "row not actionable"); callers that need
+    /// strict NotFound can use the singular [`status`](Self::status).
+    async fn statuses(
+        &self,
+        ids: &[PromptRequestId],
+    ) -> Result<Vec<RequestStatusView>, PromptError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(
+            PromptRequestId,
+            SessionId,
+            RequestStatus,
+            bool,
+            Option<FailureReason>,
+        )> = sqlx::query_as(
+            "SELECT id, session_id, status, cancellation_requested, failure_reason
+             FROM prompt_requests
+             WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(request_id, session, status, cancellation_requested, failure_reason)| {
+                    RequestStatusView {
+                        request_id,
+                        session,
+                        status,
+                        cancellation_requested,
+                        failure_reason,
+                    }
+                },
+            )
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -436,6 +541,146 @@ impl LeaseManager for PgPromptQueue {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+/// Insert a `prompt_requests` row inside the enqueue transaction. The
+/// producer's W3C trace-context is captured here so the worker can stitch
+/// its `handle_claim` span onto the same trace; a `None` return from
+/// `current_traceparent` (exporter off, no active span) leaves the column
+/// NULL and the worker starts a fresh root.
+async fn insert_prompt_request(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    req: &NewPromptRequest,
+    request_id: PromptRequestId,
+    session: SessionId,
+    root_request_id: PromptRequestId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), PromptError> {
+    let traceparent = propagation::current_traceparent();
+
+    sqlx::query(
+        "INSERT INTO prompt_requests
+             (id, session_id, content, idempotency_key, status,
+              attempts, turn_seq, cancellation_requested, failure_reason,
+              sender_kind, sender_agent_id,
+              receiver_kind, receiver_agent_id, root_request_id,
+              traceparent,
+              created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 0, 0, FALSE, NULL,
+                 $6, $7, 'agent', $8, $9,
+                 $10,
+                 $11, $11)",
+    )
+    .bind(request_id)
+    .bind(session)
+    .bind(req.content.as_str())
+    .bind(req.idempotency_key.as_str())
+    .bind(RequestStatus::Pending)
+    .bind(MessageSender::from_participant(req.sender).kind())
+    .bind(req.sender.agent_id())
+    .bind(req.receiver_agent_id)
+    .bind(root_request_id)
+    .bind(traceparent)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Result of `resolve_session` — the (session, dag root, is-new) triple
+/// the enqueue path needs to populate the prompt_requests / dag rows.
+#[derive(Debug)]
+struct SessionResolution {
+    session: SessionId,
+    root_request_id: PromptRequestId,
+    is_new_session: bool,
+}
+
+/// Resolve the session for an `enqueue`: either look up the existing one's
+/// DAG root or mint a brand-new session row anchored at `request_id`.
+async fn resolve_session(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    req: &NewPromptRequest,
+    receiver: Participant,
+    request_id: PromptRequestId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<SessionResolution, PromptError> {
+    if let Some(existing_session) = req.session {
+        let row: Option<(PromptRequestId,)> =
+            sqlx::query_as("SELECT root_request_id FROM sessions WHERE id = $1")
+                .bind(existing_session)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let (root,) = row.ok_or(PromptError::SessionNotFound(existing_session))?;
+        return Ok(SessionResolution {
+            session: existing_session,
+            root_request_id: root,
+            is_new_session: false,
+        });
+    }
+    let session_id = create_session_row(
+        tx,
+        request_id,
+        req.sender,
+        receiver,
+        req.parent_session,
+        now,
+    )
+    .await?;
+    Ok(SessionResolution {
+        session: session_id,
+        root_request_id: request_id,
+        is_new_session: true,
+    })
+}
+
+/// Mint a session row for a fresh DAG, returning the session id.
+///
+/// The participant pair is canonicalised inside this helper so a caller that
+/// passes `(sender, receiver)` either way round always produces the same row.
+/// `root_request_id` is the about-to-be-inserted `prompt_requests.id`; the FK
+/// from `prompt_requests.session_id` to `sessions.id` requires the session
+/// row first, hence the explicit ordering. No FK is enforced from
+/// `sessions.root_request_id` to `prompt_requests.id` so the
+/// session-before-request order is legal.
+async fn create_session_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    root_request_id: PromptRequestId,
+    sender: Participant,
+    receiver: Participant,
+    parent_session: Option<SessionId>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<SessionId, PromptError> {
+    let (a, b) = Participant::canonical_pair(sender, receiver).ok_or(PromptError::SelfSession)?;
+    let session_id = SessionId::new();
+    let res = sqlx::query(
+        "INSERT INTO sessions
+             (id, created_at,
+              parent_session_id, root_request_id,
+              participant_a_kind, participant_a_agent_id,
+              participant_b_kind, participant_b_agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(session_id)
+    .bind(now)
+    .bind(parent_session)
+    .bind(root_request_id)
+    .bind(a.kind())
+    .bind(a.agent_id())
+    .bind(b.kind())
+    .bind(b.agent_id())
+    .execute(&mut **tx)
+    .await;
+    match res {
+        Ok(_) => Ok(session_id),
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23503") => {
+            Err(PromptError::Backend(format!(
+                "agent_id FK violation creating session: {}",
+                db.message(),
+            )))
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

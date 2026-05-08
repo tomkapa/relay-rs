@@ -8,10 +8,11 @@ use super::convert::{
     ChatRequestBody, ChatResponseBody, choice_to_content, map_finish_reason, message_to_wire,
     system_message, tool_spec_to_wire,
 };
-use crate::provider::chat::{ChatRequest, ChatResponse};
+use crate::observability::gen_ai;
+use crate::provider::chat::{ChatRequest, ChatResponse, Usage};
 use crate::provider::error::ProviderError;
 use crate::provider::traits::LlmProvider;
-use crate::types::SecretString;
+use crate::types::{ModelId, SecretString};
 
 /// OpenAI-Chat-Completions implementation of [`LlmProvider`].
 pub struct OpenAiProvider {
@@ -50,6 +51,11 @@ impl LlmProvider for OpenAiProvider {
         "openai"
     }
 
+    // GenAI semconv fields are declared `Empty` here and recorded inside the body so
+    // both the request- and response-shaped attributes ride on the same span. Keeping
+    // the span name stable (`provider.openai.send`) per CLAUDE.md §2; the spec's
+    // recommended `chat <model>` form would put the model in the name and inflate
+    // cardinality.
     #[instrument(
         name = "provider.openai.send",
         skip_all,
@@ -59,9 +65,21 @@ impl LlmProvider for OpenAiProvider {
             relay.messages = request.messages.len(),
             relay.tools = request.tools.len(),
             relay.max_output_tokens = request.max_output_tokens.get(),
+            gen_ai.system = tracing::field::Empty,
+            gen_ai.operation.name = tracing::field::Empty,
+            gen_ai.request.model = tracing::field::Empty,
+            gen_ai.request.max_tokens = tracing::field::Empty,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.input.messages = tracing::field::Empty,
+            gen_ai.output.messages = tracing::field::Empty,
         ),
     )]
     async fn send(&self, request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        gen_ai::record_chat_request("openai", &request);
+
         let mut messages = Vec::with_capacity(request.messages.len() + 1);
         messages.push(system_message(&request.system));
         for msg in request.messages {
@@ -90,6 +108,23 @@ impl LlmProvider for OpenAiProvider {
             .await
             .map_err(map_runtime_error)?;
 
+        // Extract usage / model before consuming `response.choices` below — these
+        // attributes ride on the span, not on the request shape.
+        let usage = response
+            .usage
+            .as_ref()
+            .map(|u| Usage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            })
+            .unwrap_or_default();
+        let model = response
+            .model
+            .as_deref()
+            .and_then(|m| ModelId::try_from(m).ok());
+
         let choice = response
             .choices
             .into_iter()
@@ -101,10 +136,14 @@ impl LlmProvider for OpenAiProvider {
             return Err(ProviderError::EmptyResponse);
         }
 
-        Ok(ChatResponse {
+        let resp = ChatResponse {
             content,
             stop_reason,
-        })
+            usage,
+            model,
+        };
+        gen_ai::record_chat_response(&resp);
+        Ok(resp)
     }
 }
 

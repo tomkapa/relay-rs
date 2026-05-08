@@ -40,6 +40,28 @@ pub enum PromptError {
     #[error("session {0:?} not found")]
     SessionNotFound(SessionId),
 
+    /// `enqueue` was called with `sender == Participant::agent(receiver_agent_id)`
+    /// — a self-session has no representational shape. Caller should not have
+    /// reached the queue with this combination.
+    #[error("self-session: sender equals receiver")]
+    SelfSession,
+
+    /// [`crate::runtime::DagBudget::bump_or_fail`] observed `turns_used >=
+    /// turns_cap`. Caller (the `send_message` tool) rolls its insert back so
+    /// the new message disappears with the rejection.
+    #[error("dag {root:?} budget exceeded: {turns_used}/{turns_cap}")]
+    DagBudgetExceeded {
+        root: PromptRequestId,
+        turns_used: u32,
+        turns_cap: u32,
+    },
+
+    /// [`crate::runtime::DagBudget::bump_or_fail`] could not find the dag row
+    /// for `root`. Distinct from `DagBudgetExceeded` so a missing row (caller
+    /// error) does not look like a normal budget rejection.
+    #[error("dag {0:?} not found")]
+    DagNotFound(PromptRequestId),
+
     #[error("lease for session {session:?} expired or superseded")]
     LeaseStale { session: SessionId },
 

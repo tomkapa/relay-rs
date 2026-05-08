@@ -10,9 +10,9 @@ use tracing::instrument;
 
 use crate::types::ToolName;
 
-use super::limits::{FETCH_MAX_BODY_BYTES, FETCH_MAX_REDIRECTS, FETCH_TIMEOUT};
-use super::traits::{Tool, ToolError};
-use super::url::{FetchUrl, UrlError, check_host};
+use super::super::limits::{FETCH_MAX_BODY_BYTES, FETCH_MAX_REDIRECTS, FETCH_TIMEOUT};
+use super::super::traits::{Tool, ToolError};
+use super::super::url::{FetchUrl, UrlError, check_host};
 
 /// Content-type prefixes treated as HTML for the markdown-conversion path.
 /// Plain ASCII compare on the lower-cased header value — `text/html; charset=utf-8`

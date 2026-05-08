@@ -1,22 +1,17 @@
-//! Per-session [`Memory`] backed by the agents registry.
+//! Per-turn [`Memory`] backed by the agents registry.
 //!
-//! On each turn:
-//! 1. Resolve the session's `agent_id` via [`SessionStore::agent_id`].
-//! 2. Load the agent's role-specific prompt through [`AgentPromptCache`].
-//! 3. Concatenate it with the in-code core prompt as
-//!    `<core>...</core>\n<role>{prompt}</role>` so the model sees a clear
-//!    separation between universal personality and role-specific job
-//!    description.
-//!
-//! Agents can be edited at runtime; the cache TTL bounds how long stale text
-//! lingers ([`crate::agents::AGENT_PROMPT_CACHE_TTL`]).
+//! Each call resolves the viewer's role prompt (cached, TTL-bounded by
+//! [`crate::agents::AGENT_PROMPT_CACHE_TTL`]) and wraps it with the in-code
+//! core prompt as `<core>...</core>\n<role>{prompt}</role>` so the model
+//! sees a clear separation.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::agents::{AgentPromptCache, SharedAgentStore};
-use crate::session::{SessionId, SharedSessionStore};
+use crate::session::SessionId;
+use crate::types::Participant;
 
 use super::traits::{Memory, MemoryError};
 
@@ -30,7 +25,6 @@ pub const ROLE_TAG_CLOSE: &str = "\n</role>";
 /// Composite memory that assembles the system prompt from a constant core and a
 /// per-agent role string fetched on demand.
 pub struct AgentMemory {
-    sessions: SharedSessionStore,
     agents: SharedAgentStore,
     cache: Arc<AgentPromptCache>,
     core: Arc<str>,
@@ -39,13 +33,11 @@ pub struct AgentMemory {
 impl AgentMemory {
     #[must_use]
     pub fn new(
-        sessions: SharedSessionStore,
         agents: SharedAgentStore,
         cache: Arc<AgentPromptCache>,
         core: impl Into<Arc<str>>,
     ) -> Self {
         Self {
-            sessions,
             agents,
             cache,
             core: core.into(),
@@ -63,8 +55,15 @@ impl std::fmt::Debug for AgentMemory {
 
 #[async_trait]
 impl Memory for AgentMemory {
-    async fn system_prompt(&self, session: SessionId) -> Result<Arc<str>, MemoryError> {
-        let agent_id = self.sessions.agent_id(session).await?;
+    async fn system_prompt(
+        &self,
+        _session: SessionId,
+        viewer: Participant,
+    ) -> Result<Arc<str>, MemoryError> {
+        // Workers only run for agent receivers; a Human viewer is a wiring bug.
+        let agent_id = viewer.agent_id().ok_or_else(|| {
+            MemoryError::Backend("system_prompt called with Human viewer; agent worker only".into())
+        })?;
         let role = self.cache.get_or_load(agent_id, &self.agents).await?;
 
         let core = self.core.as_ref();

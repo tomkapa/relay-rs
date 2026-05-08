@@ -56,3 +56,30 @@ pub const WORKER_IDLE_POLL: Duration = Duration::from_secs(1);
 /// observed within `CANCEL_POLL_INTERVAL` and fires the agent's
 /// `CancellationToken`.
 pub const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Total `send_message` calls permitted across one DAG.
+///
+/// One DAG is the causal tree rooted at a human's first request. Once this
+/// cap is reached every further `send_message` rolls back with
+/// `DagBudgetExceeded`. Sized to allow reasonable multi-agent collaboration
+/// without runaway loops.
+pub const MAX_DAG_TURNS: u32 = 64;
+
+/// Worker-level retry budget for the ping-pong defence.
+///
+/// If an agent's reply did not call `send_message`, the worker injects a
+/// system nudge and retries up to this many times before parking the request
+/// as `NoEgress`.
+pub const MAX_PINGPONG_RETRIES: u8 = 2;
+
+/// Hard cap on `get_session` pagination.
+///
+/// Keeps the cross-session lookup cheap so an agent cannot exhaust memory
+/// pulling its sibling's history.
+pub const MAX_GET_SESSION_LIMIT: u32 = 200;
+
+/// Maximum bytes for `send_message.context_summary`.
+///
+/// Honoured only on the first `send_message` to a new receiver inside a DAG;
+/// subsequent calls drop the field.
+pub const CONTEXT_SUMMARY_MAX_BYTES: usize = 4096;

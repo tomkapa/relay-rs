@@ -242,6 +242,15 @@ pub enum FailureReason {
     Poison,
     /// A precondition the worker can never recover from (e.g. session vanished).
     Unrecoverable(String),
+    /// The DAG's `turns_used` reached `turns_cap`; the offending
+    /// `send_message` insert was rolled back. Surfaced as a terminal chunk
+    /// on the root request's stream so the caller learns the conversation
+    /// hit its loop budget.
+    DagBudgetExceeded,
+    /// Agent produced text without ever calling `send_message`. The worker
+    /// nudged it `MAX_PINGPONG_RETRIES` times and still got no delivery —
+    /// the request is parked so the caller knows the model misbehaved.
+    NoEgress,
 }
 
 impl FailureReason {
@@ -255,6 +264,8 @@ impl FailureReason {
             Self::Hook(_) => "hook",
             Self::Poison => "poison",
             Self::Unrecoverable(_) => "unrecoverable",
+            Self::DagBudgetExceeded => "dag_budget_exceeded",
+            Self::NoEgress => "no_egress",
         }
     }
 }
@@ -268,6 +279,10 @@ impl fmt::Display for FailureReason {
             Self::Hook(s) => write!(f, "hook denied: {s}"),
             Self::Poison => f.write_str("max attempts exceeded"),
             Self::Unrecoverable(s) => write!(f, "unrecoverable: {s}"),
+            Self::DagBudgetExceeded => f.write_str("dag turn budget exceeded"),
+            Self::NoEgress => {
+                f.write_str("agent produced text without calling send_message after retries")
+            }
         }
     }
 }

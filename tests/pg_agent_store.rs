@@ -10,10 +10,10 @@ use relay_rs::agents::{
     DefaultAgentSeed, NewAgent, PgAgentStore,
 };
 use relay_rs::clock::SystemClock;
-use relay_rs::session::{PgSessionStore, SessionStore};
+use relay_rs::session::PgSessionStore;
 
 mod common;
-use common::pg::TestDb;
+use common::pg::{TestDb, human_to_agent_session};
 
 fn store(db: &TestDb) -> Arc<PgAgentStore> {
     Arc::new(PgAgentStore::new(db.pool.clone(), SystemClock::shared()))
@@ -249,7 +249,7 @@ async fn delete_refuses_when_referenced_by_a_session() {
         .await
         .expect("create");
     let sessions = PgSessionStore::new(db.pool.clone(), SystemClock::shared());
-    sessions.create(agent.id).await.expect("session");
+    let _ = human_to_agent_session(&sessions, agent.id).await;
 
     let err = store.delete(agent.id).await.expect_err("in use");
     assert!(matches!(err, AgentStoreError::InUse(_)));

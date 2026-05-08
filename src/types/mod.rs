@@ -4,17 +4,23 @@
 //! with a `TryFrom` smart constructor. Bare `String` / `u32` / `Uuid` are reserved for values
 //! that genuinely have none.
 
+mod agent_reply;
 mod error;
 mod limits;
 mod macros;
 mod model_id;
+mod participant;
 mod prompt;
 mod secret;
 mod tool_name;
 
+pub use agent_reply::AgentReply;
 pub use error::ParseError;
 pub use limits::{MAX_OUTPUT_TOKENS_CAP, MAX_TURNS_CAP, MaxOutputTokens, MaxTurns, TurnIndex};
 pub use model_id::ModelId;
+pub use participant::{
+    MessageSender, MessageSenderKind, Participant, ParticipantDecodeError, ParticipantKind,
+};
 pub use prompt::{PROMPT_MAX_BYTES, Prompt};
 pub use secret::SecretString;
 pub use tool_name::{TOOL_NAME_MAX_LEN, ToolName};

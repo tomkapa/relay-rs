@@ -12,7 +12,7 @@ mod traits;
 
 pub use chat::{
     AssistantContent, ChatMessage, ChatRequest, ChatResponse, Role, StopReason,
-    TOOL_CALL_ID_MAX_BYTES, ToolCall, ToolCallId, ToolResult, ToolSpec, UserContent,
+    TOOL_CALL_ID_MAX_BYTES, ToolCall, ToolCallId, ToolResult, ToolSpec, Usage, UserContent,
 };
 pub use error::ProviderError;
 pub use traits::{LlmProvider, SharedProvider};

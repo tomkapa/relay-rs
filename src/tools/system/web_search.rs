@@ -9,8 +9,10 @@ use tracing::instrument;
 
 use crate::types::{ParseError, SecretString, ToolName};
 
-use super::limits::{SEARCH_DEFAULT_COUNT, SEARCH_MAX_COUNT, SEARCH_TIMEOUT};
-use super::traits::{Tool, ToolError};
+use super::super::limits::{
+    SEARCH_DEFAULT_COUNT, SEARCH_MAX_COUNT, SEARCH_TIMEOUT, truncate_to_char_boundary,
+};
+use super::super::traits::{Tool, ToolError};
 
 const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
 const SEARCH_QUERY_MAX_BYTES: usize = 400;
@@ -220,10 +222,11 @@ impl Tool for WebSearchTool {
         if !status.is_success() {
             // §5: cap the upstream body before surfacing it; a runaway 50 MB error page
             // must not end up on a span attribute or in a tool result.
-            let body = response.text().await?;
+            let mut body = response.text().await?;
+            truncate_to_char_boundary(&mut body, UPSTREAM_BODY_MAX_BYTES);
             return Err(ToolError::Upstream {
                 status: status.as_u16(),
-                body: truncate_to_chars(body, UPSTREAM_BODY_MAX_BYTES),
+                body,
             });
         }
 
@@ -250,19 +253,6 @@ impl Tool for WebSearchTool {
         }
         Ok(out)
     }
-}
-
-/// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint.
-fn truncate_to_chars(mut s: String, max: usize) -> String {
-    if s.len() <= max {
-        return s;
-    }
-    let mut cut = max;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    s.truncate(cut);
-    s
 }
 
 #[cfg(test)]
@@ -297,21 +287,5 @@ mod tests {
     #[test]
     fn search_count_default_matches_constant() {
         assert_eq!(SearchCount::default().get(), SEARCH_DEFAULT_COUNT);
-    }
-
-    #[test]
-    fn truncate_respects_char_boundaries() {
-        // Multi-byte char straddling the cap must not panic and must not be split.
-        let s = "aaa🦀bbb".to_string();
-        // the crab emoji is at byte offset 3 (4 bytes long)
-        let out = truncate_to_chars(s, 5);
-        assert!(out.is_char_boundary(out.len()));
-        assert_eq!(out, "aaa");
-    }
-
-    #[test]
-    fn truncate_noop_when_under_cap() {
-        let out = truncate_to_chars("short".to_string(), 100);
-        assert_eq!(out, "short");
     }
 }

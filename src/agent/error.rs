@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::hook::HookError;
+use crate::hook::{HookDenied, HookError};
 use crate::memory::MemoryError;
 use crate::provider::ProviderError;
 use crate::session::SessionError;
@@ -19,8 +19,8 @@ pub enum AgentError {
     #[error("hook: {0}")]
     Hook(#[from] HookError),
 
-    #[error("hook denied: {0}")]
-    HookDenied(String),
+    #[error(transparent)]
+    HookDenied(#[from] HookDenied),
 
     #[error("provider call timed out")]
     ProviderTimeout,

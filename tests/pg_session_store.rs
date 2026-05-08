@@ -8,10 +8,12 @@ use std::sync::Arc;
 use relay_rs::agents::AgentId;
 use relay_rs::clock::SystemClock;
 use relay_rs::provider::{ChatMessage, UserContent};
+use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{PgSessionStore, SessionError, SessionId, SessionStore};
+use relay_rs::types::{MessageSender, Participant};
 
 mod common;
-use common::pg::TestDb;
+use common::pg::{TestDb, human_to_agent_session};
 
 fn store(db: &TestDb) -> Arc<PgSessionStore> {
     Arc::new(PgSessionStore::new(db.pool.clone(), SystemClock::shared()))
@@ -22,20 +24,30 @@ async fn create_append_snapshot_roundtrip() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
-    let id = store.create(db.default_agent_id).await.expect("create");
+    let agent = Participant::agent(db.default_agent_id);
+    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
     store
-        .append(id, ChatMessage::User(vec![UserContent::Text("hi".into())]))
+        .append(
+            id,
+            MessageSender::Human,
+            agent,
+            ChatMessage::User(vec![UserContent::Text("hi".into())]),
+        )
         .await
         .expect("append");
     store
         .append(
             id,
+            MessageSender::Human,
+            agent,
             ChatMessage::User(vec![UserContent::Text("again".into())]),
         )
         .await
         .expect("append2");
 
-    let snap = store.snapshot(id).await.expect("snapshot");
+    // Viewer = the agent. Both rows came from human → render as User to the
+    // agent.
+    let snap = store.snapshot(id, agent).await.expect("snapshot");
     assert_eq!(snap.len(), 2);
     let ChatMessage::User(contents) = &snap[0] else {
         panic!("first message should be user");
@@ -49,11 +61,17 @@ async fn missing_session_is_not_found() {
     let store = store(&db);
 
     let id = SessionId::new();
-    let err = store.snapshot(id).await.expect_err("absent");
+    let viewer = Participant::agent(db.default_agent_id);
+    let err = store.snapshot(id, viewer).await.expect_err("absent");
     assert!(matches!(err, SessionError::NotFound(_)));
 
     let err = store
-        .append(id, ChatMessage::User(vec![UserContent::Text("hi".into())]))
+        .append(
+            id,
+            MessageSender::Human,
+            viewer,
+            ChatMessage::User(vec![UserContent::Text("hi".into())]),
+        )
         .await
         .expect_err("absent append");
     assert!(matches!(err, SessionError::NotFound(_)));
@@ -70,16 +88,24 @@ async fn enforces_message_cap() {
         SystemClock::shared(),
         2,
     ));
-    let id = store.create(db.default_agent_id).await.expect("create");
+    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let agent = Participant::agent(db.default_agent_id);
     for _ in 0..2 {
         store
-            .append(id, ChatMessage::User(vec![UserContent::Text("x".into())]))
+            .append(
+                id,
+                MessageSender::Human,
+                agent,
+                ChatMessage::User(vec![UserContent::Text("x".into())]),
+            )
             .await
             .expect("under cap");
     }
     let err = store
         .append(
             id,
+            MessageSender::Human,
+            agent,
             ChatMessage::User(vec![UserContent::Text("over".into())]),
         )
         .await
@@ -91,14 +117,20 @@ async fn enforces_message_cap() {
 async fn delete_cascades_messages() {
     let db = TestDb::fresh().await;
     let store = store(&db);
-    let id = store.create(db.default_agent_id).await.expect("create");
+    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let agent = Participant::agent(db.default_agent_id);
     store
-        .append(id, ChatMessage::User(vec![UserContent::Text("hi".into())]))
+        .append(
+            id,
+            MessageSender::Human,
+            agent,
+            ChatMessage::User(vec![UserContent::Text("hi".into())]),
+        )
         .await
         .expect("append");
 
     store.delete(id).await.expect("delete");
-    let err = store.snapshot(id).await.expect_err("gone");
+    let err = store.snapshot(id, agent).await.expect_err("gone");
     assert!(matches!(err, SessionError::NotFound(_)));
 }
 
@@ -108,19 +140,71 @@ async fn create_with_unknown_agent_returns_agent_not_found() {
     let store = store(&db);
 
     // Random uuid that does not exist in the agents table — the FK on
-    // sessions.agent_id should reject the insert and surface as
+    // participant_*_agent_id should reject the insert and surface as
     // SessionError::AgentNotFound.
     let phantom = AgentId::new();
-    let err = store.create(phantom).await.expect_err("fk");
+    let root = PromptRequestId::new();
+    let err = store
+        .resolve_or_create_for_pair(root, Participant::Human, Participant::agent(phantom), None)
+        .await
+        .expect_err("fk");
     assert!(matches!(err, SessionError::AgentNotFound(_)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_id_round_trips_through_session() {
+async fn participants_round_trip_through_session() {
+    // Canonical order is Agent < Human (matches SQL CHECK).
     let db = TestDb::fresh().await;
     let store = store(&db);
 
-    let id = store.create(db.default_agent_id).await.expect("create");
-    let resolved = store.agent_id(id).await.expect("resolve");
-    assert_eq!(resolved, db.default_agent_id);
+    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let (a, b) = store.participants(id).await.expect("resolve");
+    assert_eq!(a, Participant::agent(db.default_agent_id));
+    assert_eq!(b, Participant::Human);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_renders_messages_from_viewer_perspective() {
+    // sender == viewer => Assistant; otherwise => User. This is the central
+    // contract of the new viewer-mapped snapshot.
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+    let agent = Participant::agent(db.default_agent_id);
+
+    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    // Human → Agent: text prompt.
+    store
+        .append(
+            id,
+            MessageSender::Human,
+            agent,
+            ChatMessage::User(vec![UserContent::Text("ping".into())]),
+        )
+        .await
+        .expect("append");
+    // Agent → Human: assistant text.
+    store
+        .append(
+            id,
+            MessageSender::from_participant(agent),
+            Participant::Human,
+            ChatMessage::Assistant(vec![relay_rs::provider::AssistantContent::Text(
+                "pong".into(),
+            )]),
+        )
+        .await
+        .expect("append");
+
+    // Viewer = agent: the human's row is User, agent's row is Assistant.
+    let snap = store.snapshot(id, agent).await.expect("agent view");
+    assert!(matches!(&snap[0], ChatMessage::User(_)));
+    assert!(matches!(&snap[1], ChatMessage::Assistant(_)));
+
+    // Viewer = human: the human's row is Assistant, agent's row is User.
+    let snap = store
+        .snapshot(id, Participant::Human)
+        .await
+        .expect("human view");
+    assert!(matches!(&snap[0], ChatMessage::Assistant(_)));
+    assert!(matches!(&snap[1], ChatMessage::User(_)));
 }

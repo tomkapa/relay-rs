@@ -4,14 +4,27 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::types::ToolName;
+use crate::runtime::PromptRequestId;
+use crate::session::SessionId;
+use crate::types::{Participant, ToolName};
 
 use super::url::UrlError;
 
 #[derive(Debug, Error)]
 pub enum ToolError {
+    /// Model gave us bad arguments — wrong shape, oversize, refers to a
+    /// non-existent receiver, etc. Surfacing as `invalid_input` lets the
+    /// model self-correct on the next turn.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// A downstream subsystem (session store, queue, sink, agent store) the
+    /// tool depends on failed in a way that is *not* the model's fault. Kept
+    /// distinct from `InvalidInput` so dashboards can separate model-driven
+    /// errors from infrastructure-driven ones, and so a future retry policy
+    /// can target backend faults without retrying bad-input rejections.
+    #[error("backend error: {0}")]
+    Backend(String),
 
     #[error("disallowed url: {0}")]
     DisallowedUrl(#[from] UrlError),
@@ -27,6 +40,24 @@ pub enum ToolError {
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+/// Per-call context passed to tools that need to know who's calling them.
+///
+/// Threaded by the agent loop into [`Tool::execute_with_ctx`]. Most tools
+/// (`web_fetch`, `web_search`, MCP tools) ignore it and fall through to
+/// [`Tool::execute`]. System tools (`send_message`, `get_session`) consume it.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCallContext {
+    /// The session that produced this tool call.
+    pub session_id: SessionId,
+    /// The agent currently running — its identity is what `send_message`'s
+    /// receiver is checked against and what authors any messages the tool
+    /// appends.
+    pub viewer: Participant,
+    /// DAG anchor for the conversation tree this turn belongs to. Used by
+    /// `send_message` to upsert sibling sessions and bump the budget.
+    pub root_request_id: PromptRequestId,
 }
 
 /// A side-effecting capability the model can request.
@@ -48,6 +79,17 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     fn input_schema(&self) -> Arc<Value>;
 
     async fn execute(&self, input: Value) -> Result<String, ToolError>;
+
+    /// Context-aware variant. Default falls through to `execute` so existing
+    /// tools (web_fetch, web_search, MCP wrappers) need no change. System
+    /// tools — `send_message`, `get_session` — override to consume `ctx`.
+    async fn execute_with_ctx(
+        &self,
+        input: Value,
+        _ctx: &ToolCallContext,
+    ) -> Result<String, ToolError> {
+        self.execute(input).await
+    }
 }
 
 /// Cheap-clone alias used by the registry.

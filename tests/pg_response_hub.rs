@@ -17,11 +17,11 @@ use relay_rs::runtime::{
     IdempotencyKey, LeaseTiming, NewPromptRequest, PgPromptQueue, PgResponseHub, PromptRequestId,
     ResponseChunk, ResponseSink as _, ResponseSource as _, StreamEvent,
 };
-use relay_rs::session::{PgSessionStore, SessionId, SessionStore};
-use relay_rs::types::Prompt;
+use relay_rs::session::{PgSessionStore, SessionId};
+use relay_rs::types::{Participant, Prompt};
 
 mod common;
-use common::pg::TestDb;
+use common::pg::{TestDb, human_to_agent_session};
 
 /// Stage a prompt request row so the chunks table's FK is satisfied. Returns the
 /// request id we can publish chunks against.
@@ -31,7 +31,7 @@ async fn stage_request(
     agent_id: AgentId,
 ) -> (SessionId, PromptRequestId) {
     let session_store = PgSessionStore::new(pool.clone(), clock.clone());
-    let session = session_store.create(agent_id).await.expect("session");
+    let session = human_to_agent_session(&session_store, agent_id).await;
 
     let queue = Arc::new(PgPromptQueue::with_caps(
         pool.clone(),
@@ -43,7 +43,10 @@ async fn stage_request(
     let key = format!("k-{}", uuid::Uuid::new_v4());
     let id = queue
         .enqueue(NewPromptRequest {
-            session,
+            session: Some(session),
+            sender: Participant::Human,
+            receiver_agent_id: agent_id,
+            parent_session: None,
             content: Prompt::try_from("hi").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from(key).expect("key"),
         })

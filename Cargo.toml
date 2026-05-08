@@ -14,6 +14,13 @@ publish = false
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion", "byot"] }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log", "tracing", "macros"] }
+# §8 (zero-dep bias): we already pull `base64` transitively via reqwest/jsonwebtoken/etc, but
+# Langfuse OTLP ingestion needs a Basic-auth header (`base64(public:secret)`). Declaring it
+# directly insulates us from a transitive bump silently dropping the crate. The standard
+# `general_purpose::STANDARD` engine is ~one call site; rolling our own MIME-base64 is a
+# trivial 30-LOC table lookup, but the crate is the de-facto choice and has no surface area
+# beyond `Engine::encode`.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 # §8 (zero-dep bias): wall-clock TIMESTAMPTZ bridge for storage code. The Clock trait
 # returns SystemTime, but sqlx maps Postgres TIMESTAMPTZ to chrono::DateTime<Utc> (or
 # time::OffsetDateTime). We prefer chrono because the CLAUDE.md §11 sample names it
@@ -73,6 +80,33 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-http = { version = "0.6", default-features = false, features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# §2 (instrumentation stack): the OpenTelemetry layer next to the console formatter.
+# Crates release in lockstep — pin them as a paired set so a `cargo update` cannot
+# silently desync the bridge from the SDK. The HTTP/protobuf transport reuses our
+# existing `reqwest` + `rustls` chain so no second TLS stack is pulled in.
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "rt-tokio"] }
+# `reqwest-blocking-client` (not the async one): in opentelemetry_sdk 0.31 the
+# BatchSpanProcessor runs on a dedicated OS thread that has no tokio reactor,
+# so the async reqwest client panics with "no reactor running" on every flush.
+# The blocking client owns its own thread internally; the OTel batch thread
+# calls it synchronously and stays self-contained.
+#
+# `reqwest-rustls` is required even with the blocking client: the otlp feature
+# only flips `reqwest/blocking` on, leaving the underlying client without a
+# TLS backend, so every HTTPS export fails (silently — the SDK swallows the
+# error). Adding this feature pulls in `reqwest/rustls-tls-native-roots` and
+# the `opentelemetry-http/reqwest-rustls` adapter on top of the blocking flag.
+#
+# `internal-logs` routes the exporter's own diagnostics through `tracing` so
+# auth failures and dropped batches show up in the console layer instead of
+# being eaten by the batch thread.
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "internal-logs"] }
+# `semconv_experimental` is the feature flag that exposes the GenAI (`gen_ai_*`)
+# constants. The GenAI spec is still development-status; we pin the feature so a
+# spec bump shows up as a deliberate dep upgrade, not a silent rename.
+opentelemetry-semantic-conventions = { version = "0.31", features = ["semconv_experimental"] }
+tracing-opentelemetry = { version = "0.32", default-features = false }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 

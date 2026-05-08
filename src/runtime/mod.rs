@@ -5,6 +5,7 @@
 //! ([`PgPromptQueue`], [`PgResponseHub`]) sit behind them today; future backends drop
 //! in the same way. See `doc/task1.md` for the full design.
 
+pub mod dag;
 pub mod error;
 pub mod limits;
 pub mod pg_queue;
@@ -14,10 +15,12 @@ pub mod response;
 pub mod types;
 pub mod worker;
 
+pub use dag::{BudgetBumped, DagBudget, PgDagBudget, SharedDagBudget};
 pub use error::{LeaseTimingError, PromptError, ResponseError};
 pub use limits::{
-    CANCEL_POLL_INTERVAL, LEASE_HEARTBEAT_INTERVAL, LEASE_TTL, MAX_ATTEMPTS,
-    MAX_CHUNK_BUFFER_PER_REQUEST, MAX_PENDING_PER_SESSION, MAX_PROMPT_BYTES, MAX_TURN_DURATION,
+    CANCEL_POLL_INTERVAL, CONTEXT_SUMMARY_MAX_BYTES, LEASE_HEARTBEAT_INTERVAL, LEASE_TTL,
+    MAX_ATTEMPTS, MAX_CHUNK_BUFFER_PER_REQUEST, MAX_DAG_TURNS, MAX_GET_SESSION_LIMIT,
+    MAX_PENDING_PER_SESSION, MAX_PINGPONG_RETRIES, MAX_PROMPT_BYTES, MAX_TURN_DURATION,
     MAX_WORKERS,
 };
 pub use pg_queue::PgPromptQueue;

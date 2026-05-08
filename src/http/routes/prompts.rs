@@ -1,7 +1,13 @@
 //! Prompt and request endpoints:
-//! * `POST /prompts` — enqueue a prompt for a session
+//! * `POST /prompts` — submit a prompt; creates a session lazily on first call
 //! * `POST /requests/{id}/cancel` — request cancellation
 //! * `GET  /requests/{id}/stream` — SSE stream of response chunks
+//!
+//! Sessions are created lazily by the queue: the first POST without a
+//! `session_id` mints a new conversation; subsequent POSTs pass the
+//! `session_id` returned from the response. There is no separate
+//! `POST /sessions` — that intermediate step is gone with the multi-agent
+//! schema (see `migrations/00000000000004_multi_agent_comm.up.sql`).
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -17,12 +23,13 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::agents::AgentId;
 use crate::runtime::{
     ChunkSeq, EnqueueOutcome, IdempotencyKey, NewPromptRequest, PromptRequestId, RequestStatus,
     ResponseChunk, StreamEvent,
 };
 use crate::session::SessionId;
-use crate::types::Prompt;
+use crate::types::{Participant, Prompt};
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
@@ -38,7 +45,14 @@ pub(super) fn router() -> Router<AppState> {
 
 #[derive(Debug, Deserialize)]
 struct SubmitPromptRequest {
-    session_id: SessionId,
+    /// Continuing an existing conversation — omit for the first prompt.
+    #[serde(default)]
+    session_id: Option<SessionId>,
+    /// Which agent should handle this prompt. Omit to bind the new conversation
+    /// to the seeded default agent. Ignored when `session_id` is `Some` —
+    /// the existing session's receiver agent is preserved.
+    #[serde(default)]
+    agent_id: Option<AgentId>,
     content: String,
     idempotency_key: String,
 }
@@ -46,6 +60,7 @@ struct SubmitPromptRequest {
 #[derive(Debug, Serialize)]
 struct SubmitPromptResponse {
     request_id: PromptRequestId,
+    session_id: SessionId,
     status: RequestStatus,
 }
 
@@ -58,10 +73,18 @@ async fn submit_prompt(
     let idempotency_key = IdempotencyKey::try_from(payload.idempotency_key)
         .map_err(|e| HttpError::BadRequest(e.to_string()))?;
 
+    let receiver_agent_id = match payload.agent_id {
+        Some(id) => id,
+        None => state.agents.default_id().await?,
+    };
+
     let outcome = state
         .queue
         .enqueue(NewPromptRequest {
             session: payload.session_id,
+            sender: Participant::Human,
+            receiver_agent_id,
+            parent_session: None,
             content,
             idempotency_key,
         })
@@ -75,6 +98,7 @@ async fn submit_prompt(
         status_code,
         Json(SubmitPromptResponse {
             request_id: outcome.request_id(),
+            session_id: outcome.session(),
             status: outcome.status(),
         }),
     ))

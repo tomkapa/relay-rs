@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::agents::AgentId;
 use crate::session::SessionId;
-use crate::types::Prompt;
+use crate::types::{Participant, Prompt};
 
 use super::error::{LeaseTimingError, PromptError};
 use super::limits::{LEASE_HEARTBEAT_INTERVAL, LEASE_TTL};
@@ -103,6 +104,22 @@ pub trait PromptQueue: fmt::Debug + Send + Sync {
     /// Status accessor used by the SSE and cancel handlers — never required to be live;
     /// a snapshot is sufficient.
     async fn status(&self, id: PromptRequestId) -> Result<RequestStatusView, PromptError>;
+    /// Batched [`status`](Self::status). The cancel watcher and quiescence
+    /// checks need to inspect every id in a claim on every poll — running one
+    /// round-trip per id turns into N×T queries per claim. The default here
+    /// fans out to the singular method so impls that don't override stay
+    /// correct; the Postgres impl overrides with a single `WHERE id = ANY`
+    /// scan. Returned order is unspecified — match by `request_id`.
+    async fn statuses(
+        &self,
+        ids: &[PromptRequestId],
+    ) -> Result<Vec<RequestStatusView>, PromptError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.status(*id).await?);
+        }
+        Ok(out)
+    }
 }
 
 /// Lease-side surface — heartbeat and release. The token is opaque; only the impl
@@ -113,11 +130,29 @@ pub trait LeaseManager: fmt::Debug + Send + Sync {
     async fn release(&self, lease: &LeaseToken) -> Result<(), PromptError>;
 }
 
-/// Input to [`PromptQueue::enqueue`]. Server-side fields (`request_id`, `attempts`,
-/// `turn_seq`) are minted by the queue, never carried in.
+/// Input to [`PromptQueue::enqueue`].
+///
+/// `session` is `Some` for follow-up prompts on an existing conversation;
+/// `None` mints a fresh session bound to the canonical `(sender, Agent(receiver))`
+/// pair and seeds a new DAG anchored at the resulting request id. Server-side
+/// fields (`request_id`, `attempts`, `turn_seq`, `root_request_id`) are minted
+/// by the queue, never carried in.
+///
+/// `sender` is currently always `Participant::Human` for HTTP entry but the
+/// shape carries `Participant` so the future `send_message` tool can submit
+/// agent-authored prompts through the same path.
 #[derive(Debug, Clone)]
 pub struct NewPromptRequest {
-    pub session: SessionId,
+    /// Continuing an existing conversation. `None` ⇒ create a new session.
+    pub session: Option<SessionId>,
+    /// Author of the prompt.
+    pub sender: Participant,
+    /// Agent that should pick this up. Resolved on the HTTP boundary against
+    /// the agents registry (defaults to the seeded default agent).
+    pub receiver_agent_id: AgentId,
+    /// Parent of the new session in the causal DAG. `None` for the root
+    /// human-to-agent session; `Some` when an agent forks a sub-conversation.
+    pub parent_session: Option<SessionId>,
     pub content: Prompt,
     pub idempotency_key: IdempotencyKey,
 }
@@ -129,12 +164,14 @@ pub enum EnqueueOutcome {
     /// A new row was inserted.
     Inserted {
         request_id: PromptRequestId,
+        session: SessionId,
         status: RequestStatus,
     },
     /// The (idempotency_key) was already present; the original request id is returned
     /// verbatim along with its current status.
     Existing {
         request_id: PromptRequestId,
+        session: SessionId,
         status: RequestStatus,
     },
 }
@@ -144,6 +181,13 @@ impl EnqueueOutcome {
     pub const fn request_id(&self) -> PromptRequestId {
         match self {
             Self::Inserted { request_id, .. } | Self::Existing { request_id, .. } => *request_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn session(&self) -> SessionId {
+        match self {
+            Self::Inserted { session, .. } | Self::Existing { session, .. } => *session,
         }
     }
 
@@ -158,11 +202,26 @@ impl EnqueueOutcome {
 /// Snapshot returned to a worker on a successful claim. The `prompts` are drained from
 /// the queue under the same critical section as the lease so a second worker sees a
 /// stable picture.
+///
+/// `receiver_agent_id` drives agent resolution at the worker — the worker
+/// looks up the right `Agent` instance from a [`crate::agents::Agents`]
+/// registry and runs the turn against it. All prompts in `prompts` share the
+/// same receiver (every queue row carries the field; the drain assertion
+/// confirms they agree).
+///
+/// `traceparent` is the W3C trace-context header the producer captured when
+/// it enqueued the prompt; the worker uses it to attach its `handle_claim`
+/// span to the producer's trace so an agent-chain conversation shows up as
+/// one connected waterfall rather than N disconnected traces. `None` when
+/// the producer had no active OTel context (exporter off, or the row was
+/// enqueued before this column existed).
 #[derive(Debug, Clone)]
 pub struct ClaimedSession {
     pub session: SessionId,
+    pub receiver_agent_id: AgentId,
     pub prompts: Vec<ClaimedPrompt>,
     pub lease: LeaseToken,
+    pub traceparent: Option<String>,
 }
 
 impl ClaimedSession {

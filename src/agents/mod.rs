@@ -16,6 +16,7 @@ mod cache;
 mod error;
 mod limits;
 mod pg_store;
+mod registry;
 mod store;
 mod types;
 
@@ -25,5 +26,6 @@ pub use limits::{
     AGENT_NAME_MAX_LEN, AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AGENT_SYSTEM_PROMPT_MAX_LEN,
 };
 pub use pg_store::PgAgentStore;
+pub use registry::{AgentFactory, Agents, AgentsError, CachedAgents, SharedAgents};
 pub use store::{AgentStore, AgentUpdate, NewAgent, SharedAgentStore};
 pub use types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, DefaultAgentSeed};

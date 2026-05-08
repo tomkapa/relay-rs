@@ -21,34 +21,43 @@ use std::time::Duration;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, info, instrument, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use async_trait::async_trait;
 
 use crate::agent::{Agent, AgentError, SharedTurnObserver, TurnObserver};
+use crate::agents::SharedAgents;
+use crate::observability::log::preview;
 use crate::provider::{AssistantContent, ToolResult};
-use crate::types::Prompt;
+use crate::session::{SessionId, SharedSessionStore};
+use crate::types::{AgentReply, Participant, Prompt};
 
-use super::limits::{CANCEL_POLL_INTERVAL, MAX_TURN_DURATION, MAX_WORKERS, WORKER_IDLE_POLL};
+use super::dag::SharedDagBudget;
+use super::limits::{
+    CANCEL_POLL_INTERVAL, MAX_PINGPONG_RETRIES, MAX_TURN_DURATION, MAX_WORKERS, WORKER_IDLE_POLL,
+};
 use super::queue::{
     ClaimReceipt, ClaimedSession, LeaseTiming, SharedLeaseManager, SharedPromptQueue,
 };
 use super::response::{ResponseChunk, SharedResponseSink};
 use super::types::{FailureReason, PromptRequestId, WorkerId};
 
+/// System nudge appended to the receiver's history when the agent emitted a
+/// turn without calling `send_message`.
+const PINGPONG_NUDGE: &str = "you produced text without calling send_message; \
+    the message was not delivered. Call send_message to communicate.";
+
 /// Construction-time configuration for the pool.
 ///
-/// `lease_timing` is shared with the queue: construct a single [`LeaseTiming`] and
-/// pass it to both [`PgPromptQueue::with_caps`](super::pg_queue::PgPromptQueue::with_caps)
-/// and this struct so the worker's heartbeat cadence is co-validated with the queue's TTL.
+/// `lease_timing` is shared with
+/// [`PgPromptQueue::with_caps`](super::pg_queue::PgPromptQueue::with_caps) so
+/// the worker's heartbeat cadence stays co-validated with the queue's TTL.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub workers: usize,
     pub lease_timing: LeaseTiming,
     pub max_turn_duration: Duration,
     pub idle_poll: Duration,
-    /// Cadence at which the per-claim cancel watcher polls `queue.status`. Defaults
-    /// to [`CANCEL_POLL_INTERVAL`].
     pub cancel_poll: Duration,
 }
 
@@ -64,11 +73,10 @@ impl Default for WorkerConfig {
     }
 }
 
-/// Handle returned by [`WorkerPool::spawn`]. Drop or call `shutdown().await` to wind
-/// down — never `tokio::spawn` a worker without holding its handle (CLAUDE.md §7).
+/// Handle returned by [`WorkerPool::spawn`]. Drop or call `shutdown().await`
+/// to wind down — CLAUDE.md §7 forbids floating tasks.
 #[derive(Debug)]
 pub struct WorkerPoolHandle {
-    /// Drop fires the shared cancellation token, signalling every worker to exit.
     shutdown: DropGuard,
     workers: JoinSet<()>,
 }
@@ -76,7 +84,6 @@ pub struct WorkerPoolHandle {
 impl WorkerPoolHandle {
     /// Signal every worker to stop and await all of them. Idempotent.
     pub async fn shutdown(mut self) {
-        // Dropping the guard cancels the token; workers observe it and exit.
         drop(self.shutdown);
         while let Some(joined) = self.workers.join_next().await {
             if let Err(e) = joined {
@@ -91,24 +98,31 @@ pub struct WorkerPool {
     queue: SharedPromptQueue,
     leases: SharedLeaseManager,
     sink: SharedResponseSink,
-    agent: Agent,
+    agents: SharedAgents,
+    sessions: SharedSessionStore,
+    dag: SharedDagBudget,
     cfg: WorkerConfig,
 }
 
 impl WorkerPool {
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         queue: SharedPromptQueue,
         leases: SharedLeaseManager,
         sink: SharedResponseSink,
-        agent: Agent,
+        agents: SharedAgents,
+        sessions: SharedSessionStore,
+        dag: SharedDagBudget,
         cfg: WorkerConfig,
     ) -> Self {
         Self {
             queue,
             leases,
             sink,
-            agent,
+            agents,
+            sessions,
+            dag,
             cfg,
         }
     }
@@ -128,7 +142,9 @@ impl WorkerPool {
                 queue: self.queue.clone(),
                 leases: self.leases.clone(),
                 sink: self.sink.clone(),
-                agent: self.agent.clone(),
+                agents: self.agents.clone(),
+                sessions: self.sessions.clone(),
+                dag: self.dag.clone(),
                 cfg: cfg.clone(),
                 shutdown: shutdown.clone(),
             };
@@ -148,24 +164,28 @@ struct Worker {
     queue: SharedPromptQueue,
     leases: SharedLeaseManager,
     sink: SharedResponseSink,
-    agent: Agent,
+    agents: SharedAgents,
+    sessions: SharedSessionStore,
+    dag: SharedDagBudget,
     cfg: WorkerConfig,
     shutdown: CancellationToken,
 }
 
 impl Worker {
-    #[instrument(name = "worker.run", skip_all, fields(relay.worker.id = %self.id))]
+    /// Worker's main loop. Not wrapped in `#[instrument]` — the span would
+    /// outlive the worker and orphan every per-claim child span. Letting
+    /// `handle_claim` be the trace root keeps each prompt batch on one trace.
     async fn run(self) {
         loop {
             if self.shutdown.is_cancelled() {
-                debug!("worker.shutdown");
+                debug!(relay.worker.id = %self.id, "worker.shutdown");
                 return;
             }
             match self.queue.claim_next_session(self.id).await {
                 Ok(Some(claim)) => self.handle_claim(claim).await,
                 Ok(None) => self.idle().await,
                 Err(e) => {
-                    warn!(error = %e, "worker.claim.error");
+                    warn!(relay.worker.id = %self.id, error = %e, "worker.claim.error");
                     self.idle().await;
                 }
             }
@@ -180,29 +200,54 @@ impl Worker {
         }
     }
 
-    #[instrument(
-        name = "worker.handle_claim",
-        skip_all,
-        fields(
+    async fn handle_claim(&self, claim: ClaimedSession) {
+        // Manual span — the `#[instrument]` macro doesn't emit OTel spans
+        // for tasks spawned outside an open root.
+        let span = tracing::info_span!(
+            "worker.handle_claim",
             relay.worker.id = %self.id,
             relay.session.id = %claim.session,
+            relay.agent.id = %claim.receiver_agent_id,
             relay.batch_size = claim.prompts.len(),
             relay.turn_seq = claim.lease.turn_seq().get(),
-        ),
-    )]
-    async fn handle_claim(&self, claim: ClaimedSession) {
+        );
+        // Stitch onto the producer's trace so an agent-chain conversation
+        // shows up as one connected waterfall.
+        crate::observability::propagation::apply_parent(&span, claim.traceparent.as_deref());
+        self.handle_claim_inner(claim).instrument(span).await;
+    }
+
+    async fn handle_claim_inner(&self, claim: ClaimedSession) {
         let prompts: Vec<Prompt> = claim.prompts.iter().map(|p| p.content.clone()).collect();
         let receipt = Arc::new(claim.receipt());
         let cancel = CancellationToken::new();
 
-        // Pre-turn cancellation check (any request flagged) — task1: "Cancellation
-        // flag is checked once before the turn starts and once after it ends".
         if self.any_cancelled(receipt.ids()).await {
             self.publish_failure(receipt.ids(), &FailureReason::Cancelled)
                 .await;
             self.finalise(&receipt, FailureReason::Cancelled).await;
             return;
         }
+
+        // Resolve the agent before spawning watchers so an unknown id fails
+        // fast without holding a lease.
+        let agent = match self.agents.get(claim.receiver_agent_id).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    relay.agent.id = %claim.receiver_agent_id,
+                    "worker.agent.resolve.error",
+                );
+                let reason = FailureReason::Unrecoverable(format!("agent resolve: {e}"));
+                self.publish_failure(receipt.ids(), &reason).await;
+                self.finalise(&receipt, reason).await;
+                if let Err(e) = self.leases.release(receipt.lease()).await {
+                    warn!(error = %e, "worker.lease.release.error");
+                }
+                return;
+            }
+        };
 
         let heartbeat = self.spawn_heartbeat(receipt.clone());
         let cancel_watcher = self.spawn_cancel_watcher(receipt.clone(), cancel.clone());
@@ -211,86 +256,171 @@ impl Worker {
             receipt: receipt.clone(),
         });
 
-        let outcome = timeout(
-            self.cfg.max_turn_duration,
-            self.agent
-                .reply(claim.session, prompts, cancel.clone(), Some(observer)),
-        )
-        .await;
+        self.run_with_pingpong_guard(&agent, &claim, prompts, cancel.clone(), observer, &receipt)
+            .await;
 
-        // Stop watcher and heartbeat as soon as the turn returns; failure to abort is benign.
         cancel_watcher.abort();
         let _ = cancel_watcher.await;
         heartbeat.abort();
         let _ = heartbeat.await;
-
-        match outcome {
-            Ok(Ok(text)) => self.handle_success(&receipt, text).await,
-            Ok(Err(e)) => self.handle_agent_error(&receipt, e).await,
-            Err(_elapsed) => {
-                warn!("worker.turn.timeout");
-                self.publish_failure(receipt.ids(), &FailureReason::Timeout)
-                    .await;
-                self.finalise(&receipt, FailureReason::Timeout).await;
-            }
-        }
 
         if let Err(e) = self.leases.release(receipt.lease()).await {
             warn!(error = %e, "worker.lease.release.error");
         }
     }
 
-    async fn any_cancelled(&self, ids: &[PromptRequestId]) -> bool {
-        for id in ids {
-            match self.queue.status(*id).await {
-                Ok(view) => {
-                    if view.cancellation_requested || view.status.is_terminal() {
-                        return true;
+    async fn run_with_pingpong_guard(
+        &self,
+        agent: &Agent,
+        claim: &ClaimedSession,
+        prompts: Vec<Prompt>,
+        cancel: CancellationToken,
+        observer: SharedTurnObserver,
+        receipt: &Arc<ClaimReceipt>,
+    ) {
+        // The session row alone can't disambiguate which side runs in an
+        // agent↔agent session — `receiver_agent_id` is the queue's answer.
+        let viewer = Participant::agent(claim.receiver_agent_id);
+        let mut retries: u8 = 0;
+        let mut prompts_consumed = false;
+        loop {
+            let outcome = self
+                .run_one_attempt(
+                    agent,
+                    claim.session,
+                    viewer,
+                    prompts.clone(),
+                    cancel.clone(),
+                    observer.clone(),
+                    prompts_consumed,
+                )
+                .await;
+            prompts_consumed = true;
+            match outcome {
+                Ok(Ok(reply)) if reply.send_message_calls() == 0 => {
+                    if retries >= MAX_PINGPONG_RETRIES {
+                        warn!(
+                            relay.session.id = %claim.session,
+                            relay.pingpong.retries = retries,
+                            text.preview = %preview(reply.final_text()),
+                            "worker.turn.no_egress.exceeded",
+                        );
+                        self.publish_failure(receipt.ids(), &FailureReason::NoEgress)
+                            .await;
+                        self.finalise(receipt, FailureReason::NoEgress).await;
+                        return;
+                    }
+                    retries += 1;
+                    info!(
+                        relay.session.id = %claim.session,
+                        relay.pingpong.retries = retries,
+                        text.preview = %preview(reply.final_text()),
+                        "worker.turn.no_egress.retried",
+                    );
+                    if let Err(e) = self.inject_pingpong_nudge(claim).await {
+                        warn!(error = %e, "worker.pingpong.nudge.error");
+                        let reason = FailureReason::Unrecoverable(format!("nudge append: {e}"));
+                        self.publish_failure(receipt.ids(), &reason).await;
+                        self.finalise(receipt, reason).await;
+                        return;
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "worker.status.error");
+                Ok(Ok(reply)) => {
+                    self.handle_success(receipt, reply).await;
+                    return;
+                }
+                Ok(Err(e)) => {
+                    self.handle_agent_error(receipt, e).await;
+                    return;
+                }
+                Err(_elapsed) => {
+                    warn!(relay.session.id = %claim.session, "worker.turn.timeout");
+                    self.publish_failure(receipt.ids(), &FailureReason::Timeout)
+                        .await;
+                    self.finalise(receipt, FailureReason::Timeout).await;
+                    return;
                 }
             }
         }
-        false
     }
 
-    async fn handle_success(&self, receipt: &ClaimReceipt, text: String) {
-        info!(bytes = text.len(), "worker.turn.ok");
-        // The assistant's text chunks were already streamed via the FanOutObserver
-        // during the turn. The only thing left is the terminal `Done` event so SSE
-        // clients (and late subscribers replaying the log) know the turn is final.
-        for id in receipt.ids() {
-            if let Err(e) = self
-                .sink
-                .publish(
-                    *id,
-                    ResponseChunk::Done {
-                        final_text: text.clone(),
-                    },
-                )
-                .await
-            {
-                warn!(error = %e, "worker.publish.done.error");
-            }
-            if let Err(e) = self.sink.close(*id).await {
-                warn!(error = %e, "worker.sink.close.error");
+    /// First attempt calls `reply` (appends the prompt); retries call
+    /// `resume` so the prompt is not appended twice.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_attempt(
+        &self,
+        agent: &Agent,
+        session: SessionId,
+        viewer: Participant,
+        prompts: Vec<Prompt>,
+        cancel: CancellationToken,
+        observer: SharedTurnObserver,
+        prompts_consumed: bool,
+    ) -> Result<Result<AgentReply, AgentError>, tokio::time::error::Elapsed> {
+        if prompts_consumed {
+            timeout(
+                self.cfg.max_turn_duration,
+                agent.resume(session, viewer, cancel, Some(observer)),
+            )
+            .await
+        } else {
+            timeout(
+                self.cfg.max_turn_duration,
+                agent.reply(session, viewer, prompts, cancel, Some(observer)),
+            )
+            .await
+        }
+    }
+
+    async fn inject_pingpong_nudge(
+        &self,
+        claim: &ClaimedSession,
+    ) -> Result<(), super::error::PromptError> {
+        self.sessions
+            .append_system_nudge(
+                claim.session,
+                Participant::agent(claim.receiver_agent_id),
+                PINGPONG_NUDGE.to_string(),
+            )
+            .await
+            .map_err(|e| super::error::PromptError::Backend(format!("nudge: {e}")))
+    }
+
+    async fn any_cancelled(&self, ids: &[PromptRequestId]) -> bool {
+        match self.queue.statuses(ids).await {
+            Ok(views) => views
+                .iter()
+                .any(|v| v.cancellation_requested || v.status.is_terminal()),
+            Err(e) => {
+                warn!(error = %e, "worker.status.error");
+                false
             }
         }
+    }
+
+    async fn handle_success(&self, receipt: &ClaimReceipt, reply: AgentReply) {
+        info!(
+            relay.session.id = %receipt.lease().session(),
+            bytes = reply.final_text().len(),
+            relay.send_message.calls = reply.send_message_calls(),
+            text.preview = %preview(reply.final_text()),
+            "worker.turn.ok",
+        );
+        // No per-receipt `Done`: the terminal chunk fires only on DAG
+        // quiescence so the SSE stream stays open while sibling agents work.
         if let Err(e) = self.queue.mark_done(receipt).await {
             warn!(error = %e, "worker.mark_done.error");
         }
+        self.maybe_emit_quiescence(receipt).await;
     }
 
     async fn handle_agent_error(&self, receipt: &ClaimReceipt, err: AgentError) {
-        // Exhaustive on purpose: a new `AgentError` variant must light up here so
-        // the operator decides which `FailureReason` the worker should park it as,
-        // rather than silently falling through to `Provider`.
+        // Exhaustive — a new `AgentError` variant must light up here rather
+        // than silently falling through to `Provider`.
         let reason = match err {
             AgentError::Cancelled => FailureReason::Cancelled,
             AgentError::ProviderTimeout => FailureReason::Timeout,
-            AgentError::HookDenied(s) => FailureReason::Hook(s),
+            AgentError::HookDenied(d) => FailureReason::Hook(d.0),
             e @ (AgentError::Provider(_)
             | AgentError::Session(_)
             | AgentError::Memory(_)
@@ -301,7 +431,12 @@ impl Worker {
             | AgentError::MaxTurnsExceeded(_)
             | AgentError::EmptyReply) => FailureReason::Provider(e.to_string()),
         };
-        warn!(reason = reason.label(), "worker.turn.error");
+        warn!(
+            relay.session.id = %receipt.lease().session(),
+            reason = reason.label(),
+            detail = %reason,
+            "worker.turn.error",
+        );
         self.publish_failure(receipt.ids(), &reason).await;
         self.finalise(receipt, reason).await;
     }
@@ -325,6 +460,51 @@ impl Worker {
         if let Err(e) = self.queue.mark_failed(receipt, reason).await {
             warn!(error = %e, "worker.mark_failed.error");
         }
+        self.maybe_emit_quiescence(receipt).await;
+    }
+
+    /// Emit the terminal `Done` on the root stream when no `pending` /
+    /// `processing` rows remain in this session's DAG. The only path that
+    /// closes the SSE stream — per-receipt `Done` was dropped so the stream
+    /// stays open while sibling agents are still working.
+    async fn maybe_emit_quiescence(&self, receipt: &ClaimReceipt) {
+        let session = receipt.lease().session();
+        let root = match self.sessions.root_request_id(session).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, relay.session.id = %session, "worker.quiescence.root_lookup.error");
+                return;
+            }
+        };
+        match self.dag.quiescent(root).await {
+            Ok(true) => {
+                if let Err(e) = self
+                    .sink
+                    .publish(
+                        root,
+                        ResponseChunk::Done {
+                            final_text: String::new(),
+                        },
+                    )
+                    .await
+                {
+                    // Synthetic roots that never opened a stream surface as
+                    // NotFound; benign no-op for the test harness.
+                    debug!(error = %e, relay.dag.root = %root, "worker.quiescence.publish.skipped");
+                    return;
+                }
+                if let Err(e) = self.sink.close(root).await {
+                    debug!(error = %e, relay.dag.root = %root, "worker.quiescence.close.skipped");
+                }
+                info!(relay.dag.root = %root, "worker.quiescence.done");
+            }
+            Ok(false) => {
+                debug!(relay.dag.root = %root, "worker.quiescence.live");
+            }
+            Err(e) => {
+                warn!(error = %e, relay.dag.root = %root, "worker.quiescence.query.error");
+            }
+        }
     }
 
     fn spawn_heartbeat(&self, receipt: Arc<ClaimReceipt>) -> JoinHandle<()> {
@@ -346,12 +526,10 @@ impl Worker {
         })
     }
 
-    /// Mid-turn cancellation watcher. Polls `queue.status` for every id in the
-    /// receipt at `cfg.cancel_poll`; the first id observed in a cancelled or
-    /// terminal state fires `cancel`, which the agent honours at its next
-    /// checkpoint (between provider call and tool call). Returning [`AgentError::Cancelled`]
-    /// from `agent.reply` then routes through `handle_agent_error` →
-    /// `mark_failed(reason = Cancelled)`.
+    /// Polls `queue.statuses` for every id in the receipt; the first one
+    /// observed cancelled or terminal fires `cancel`. The agent honours it
+    /// at its next checkpoint (between provider call and tool call). One
+    /// round-trip per poll regardless of receipt size.
     fn spawn_cancel_watcher(
         &self,
         receipt: Arc<ClaimReceipt>,
@@ -368,18 +546,22 @@ impl Worker {
                     () = cancel.cancelled() => return,
                     () = tokio::time::sleep(interval) => {},
                 }
-                for id in receipt.ids() {
-                    match queue.status(*id).await {
-                        Ok(view) => {
-                            if view.cancellation_requested || view.status.is_terminal() {
-                                debug!(relay.request.id = %id, "worker.cancel_watcher.fire");
-                                cancel.cancel();
-                                return;
-                            }
+                match queue.statuses(receipt.ids()).await {
+                    Ok(views) => {
+                        if let Some(view) = views
+                            .iter()
+                            .find(|v| v.cancellation_requested || v.status.is_terminal())
+                        {
+                            debug!(
+                                relay.request.id = %view.request_id,
+                                "worker.cancel_watcher.fire",
+                            );
+                            cancel.cancel();
+                            return;
                         }
-                        Err(e) => {
-                            warn!(error = %e, "worker.cancel_watcher.status.error");
-                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "worker.cancel_watcher.status.error");
                     }
                 }
             }
@@ -387,14 +569,8 @@ impl Worker {
     }
 }
 
-/// Bridges `Agent` → `ResponseSink`. The agent emits per-content / per-tool-result
-/// notifications via [`TurnObserver`]; this impl maps each one to a `ResponseChunk`
-/// and fans it out to every `PromptRequestId` sharing the current turn.
-///
-/// Holds an `Arc<ClaimReceipt>` rather than a free-standing `Vec<PromptRequestId>`:
-/// the receipt's ids are constructed only from a `ClaimedSession`, so the
-/// "every id belongs to this turn's session" invariant is type-level (CLAUDE.md §1)
-/// rather than something the worker has to remember.
+/// Bridges `Agent` → `ResponseSink`: maps each `TurnObserver` event to a
+/// [`ResponseChunk`] and fans it out to every id in the current claim.
 #[derive(Debug)]
 struct FanOutObserver {
     sink: SharedResponseSink,
@@ -427,5 +603,4 @@ impl TurnObserver for FanOutObserver {
     }
 }
 
-// Worker-pool tests live in `tests/runtime_pipeline.rs`, against the real Pg
-// backends — see CLAUDE.md §3 (real Postgres for integration tests).
+// Worker-pool tests live in `tests/runtime_pipeline.rs` against real Postgres.

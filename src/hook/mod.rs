@@ -11,4 +11,4 @@ mod traits;
 
 pub use dispatcher::HookChain;
 pub use error::HookError;
-pub use traits::{Hook, HookDecision, SharedHook, ToolContext, TurnContext};
+pub use traits::{Hook, HookDecision, HookDenied, SharedHook, ToolContext, TurnContext};

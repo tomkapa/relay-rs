@@ -15,9 +15,10 @@ use relay_rs::memory::{
     AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, Memory, ROLE_TAG_CLOSE, ROLE_TAG_OPEN,
 };
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
+use relay_rs::types::Participant;
 
 mod common;
-use common::pg::TestDb;
+use common::pg::{TestDb, human_to_agent_session};
 
 const CORE: &str = "be professional and helpful";
 
@@ -29,7 +30,7 @@ fn build_memory(
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let cache = Arc::new(AgentPromptCache::new(8, Duration::from_secs(60), clock));
-    let memory = AgentMemory::new(sessions.clone(), agents.clone(), cache, CORE);
+    let memory = AgentMemory::new(agents.clone(), cache, CORE);
     (memory, sessions, agents)
 }
 
@@ -39,8 +40,12 @@ async fn assembles_core_then_role_in_order() {
     let clock: SharedClock = Arc::new(TestClock::new());
     let (memory, sessions, _agents) = build_memory(&db, clock);
 
-    let session = sessions.create(db.default_agent_id).await.expect("session");
-    let prompt = memory.system_prompt(session).await.expect("system prompt");
+    let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
+    let viewer = Participant::agent(db.default_agent_id);
+    let prompt = memory
+        .system_prompt(session, viewer)
+        .await
+        .expect("system prompt");
 
     let s = prompt.as_ref();
     let core_open = s.find(CORE_TAG_OPEN).expect("has <core>");

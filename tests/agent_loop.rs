@@ -22,10 +22,17 @@ use relay_rs::provider::{
 };
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::tools::{SharedTool, Tool, ToolError, ToolRegistry};
-use relay_rs::types::{ModelId, Prompt, ToolName};
+use relay_rs::types::{ModelId, Participant, Prompt, ToolName};
 
 mod common;
-use common::pg::TestDb;
+use common::pg::{TestDb, human_to_agent_session};
+
+/// Create a fresh human-to-default-agent session for a test using its own
+/// session store (independent of the agent's internal collaborators).
+async fn fresh_session(db: &TestDb) -> relay_rs::session::SessionId {
+    let store = PgSessionStore::new(db.pool.clone(), SystemClock::shared());
+    human_to_agent_session(&store, db.default_agent_id).await
+}
 
 /// Provider that returns a pre-scripted sequence of responses, one per turn. Records the
 /// requests it sees so tests can assert on them.
@@ -118,6 +125,7 @@ fn text_response(s: &str, stop: StopReason) -> ChatResponse {
     ChatResponse {
         content: vec![AssistantContent::Text(s.into())],
         stop_reason: stop,
+        ..Default::default()
     }
 }
 
@@ -129,6 +137,7 @@ fn tool_call_response(name: &str, id: &str) -> ChatResponse {
             input: json!({}),
         })],
         stop_reason: StopReason::ToolUse,
+        ..Default::default()
     }
 }
 
@@ -158,17 +167,20 @@ async fn returns_text_when_no_tool_call() {
     )]));
     let agent = build(&db, provider.clone(), vec![]);
 
-    let session = agent
-        .start_session(db.default_agent_id)
-        .await
-        .expect("session");
+    let session = fresh_session(&db).await;
     let prompt = Prompt::try_from("hello").expect("prompt");
     let reply = agent
-        .reply(session, vec![prompt], CancellationToken::new(), None)
+        .reply(
+            session,
+            Participant::agent(db.default_agent_id),
+            vec![prompt],
+            CancellationToken::new(),
+            None,
+        )
         .await
         .expect("reply");
 
-    assert_eq!(reply, "hi back");
+    assert_eq!(reply.final_text(), "hi back");
     assert_eq!(provider.calls(), 1);
 }
 
@@ -182,17 +194,20 @@ async fn runs_tool_then_returns_text() {
     let counter = Arc::new(CountingTool::new("counter"));
     let agent = build(&db, provider.clone(), vec![counter.clone()]);
 
-    let session = agent
-        .start_session(db.default_agent_id)
-        .await
-        .expect("session");
+    let session = fresh_session(&db).await;
     let prompt = Prompt::try_from("use the tool").expect("prompt");
     let reply = agent
-        .reply(session, vec![prompt], CancellationToken::new(), None)
+        .reply(
+            session,
+            Participant::agent(db.default_agent_id),
+            vec![prompt],
+            CancellationToken::new(),
+            None,
+        )
         .await
         .expect("reply");
 
-    assert_eq!(reply, "done");
+    assert_eq!(reply.final_text(), "done");
     assert_eq!(counter.count(), 1, "tool should have been invoked once");
     assert_eq!(provider.calls(), 2, "two turns: tool call, then final");
 }
@@ -206,17 +221,20 @@ async fn unknown_tool_does_not_loop_forever() {
     ]));
     let agent = build(&db, provider.clone(), vec![]);
 
-    let session = agent
-        .start_session(db.default_agent_id)
-        .await
-        .expect("session");
+    let session = fresh_session(&db).await;
     let prompt = Prompt::try_from("try the missing tool").expect("prompt");
     let reply = agent
-        .reply(session, vec![prompt], CancellationToken::new(), None)
+        .reply(
+            session,
+            Participant::agent(db.default_agent_id),
+            vec![prompt],
+            CancellationToken::new(),
+            None,
+        )
         .await
         .expect("reply");
 
-    assert_eq!(reply, "recovered");
+    assert_eq!(reply.final_text(), "recovered");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -228,16 +246,19 @@ async fn cancellation_short_circuits() {
     )]));
     let agent = build(&db, provider, vec![]);
 
-    let session = agent
-        .start_session(db.default_agent_id)
-        .await
-        .expect("session");
+    let session = fresh_session(&db).await;
     let prompt = Prompt::try_from("cancel me").expect("prompt");
     let cancel = CancellationToken::new();
     cancel.cancel();
 
     let err = agent
-        .reply(session, vec![prompt], cancel, None)
+        .reply(
+            session,
+            Participant::agent(db.default_agent_id),
+            vec![prompt],
+            cancel,
+            None,
+        )
         .await
         .expect_err("cancelled");
     matches!(err, relay_rs::AgentError::Cancelled);
@@ -253,13 +274,16 @@ async fn provider_specs_match_registered_tools() {
     let counter = Arc::new(CountingTool::new("counter"));
     let agent = build(&db, provider.clone(), vec![counter]);
 
-    let session = agent
-        .start_session(db.default_agent_id)
-        .await
-        .expect("session");
+    let session = fresh_session(&db).await;
     let prompt = Prompt::try_from("hi").expect("prompt");
     let _ = agent
-        .reply(session, vec![prompt], CancellationToken::new(), None)
+        .reply(
+            session,
+            Participant::agent(db.default_agent_id),
+            vec![prompt],
+            CancellationToken::new(),
+            None,
+        )
         .await
         .expect("reply");
 

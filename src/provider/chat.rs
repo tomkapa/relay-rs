@@ -178,17 +178,38 @@ pub struct ChatRequest {
     pub max_output_tokens: MaxOutputTokens,
 }
 
+/// Token-usage counts returned alongside a response.
+///
+/// Reported through the GenAI semantic-conventions attributes
+/// (`gen_ai.usage.*`); zero / `None` is the safe default when a provider omits
+/// a field.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// Tokens consumed creating a prompt-cache entry (Anthropic only).
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Tokens served from a prompt-cache entry (Anthropic only).
+    pub cache_read_input_tokens: Option<u32>,
+}
+
 /// A provider's reply for a single turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatResponse {
     pub content: Vec<AssistantContent>,
     pub stop_reason: StopReason,
+    pub usage: Usage,
+    /// Model id reported by the provider on the response — may differ from
+    /// `ChatRequest::model` when a provider routes to a specific snapshot.
+    /// `None` when the provider does not echo it (e.g. older OpenAI shapes).
+    pub model: Option<ModelId>,
 }
 
 /// Why the provider stopped generating. Mapped from provider-specific signals.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum StopReason {
     /// Model finished its turn naturally.
+    #[default]
     EndTurn,
     /// Model is requesting tool execution.
     ToolUse,

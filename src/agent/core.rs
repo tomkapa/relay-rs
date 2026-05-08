@@ -1,34 +1,42 @@
 use std::time::Duration;
 
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, instrument, warn};
+use tracing::{Instrument, debug};
 
-use crate::agents::AgentId;
 use crate::clock::SharedClock;
-use crate::hook::{HookChain, HookDecision, ToolContext, TurnContext};
+use crate::hook::{HookChain, TurnContext};
 use crate::memory::SharedMemory;
-use crate::provider::{
-    ChatMessage, ChatRequest, ChatResponse, SharedProvider, ToolCall, ToolCallId, ToolResult,
-    UserContent,
+use crate::provider::{ChatMessage, SharedProvider, UserContent};
+use crate::session::{SessionError, SessionId, SharedSessionStore};
+use crate::tools::ToolBox;
+use crate::types::{
+    AgentReply, MaxOutputTokens, MaxTurns, MessageSender, ModelId, Participant, Prompt,
 };
-use crate::session::{SessionId, SharedSessionStore};
-use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolBox, truncate_to_char_boundary};
-use crate::types::{MaxOutputTokens, MaxTurns, ModelId, Prompt, TurnIndex};
 
 use super::error::AgentError;
-use super::limits::MAX_TOOL_CALLS_PER_TURN;
 use super::observer::SharedTurnObserver;
+use super::outcome::{record_reply, record_turn};
+use super::turn::turn_index;
+
+const SEND_MESSAGE_TOOL_NAME: &str = "send_message";
+
+/// Stable name of the system tool that delivers messages — exposed to the
+/// turn loop's `send_message` counter via this accessor so the constant has
+/// one home.
+pub(super) const fn send_message_tool_name() -> &'static str {
+    SEND_MESSAGE_TOOL_NAME
+}
 
 /// The agent runtime. All collaborators live behind shared trait handles so the agent
-/// is end-to-end testable with no network and so any one of them can be swapped without
+/// is end-to-end testable with no network and any one of them can be swapped without
 /// touching this struct.
 #[derive(Debug, Clone)]
 pub struct Agent {
     provider: SharedProvider,
     sessions: SharedSessionStore,
     memory: SharedMemory,
-    #[allow(dead_code)] // wired through builder; consumed by future scheduling work.
+    // Threaded through the builder; future scheduling work consumes it.
+    #[allow(dead_code)]
     clock: SharedClock,
     tools: ToolBox,
     hooks: HookChain,
@@ -40,7 +48,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    #[allow(clippy::too_many_arguments)] // constructed via the builder; this is the seam.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         provider: SharedProvider,
         sessions: SharedSessionStore,
@@ -69,258 +77,205 @@ impl Agent {
         }
     }
 
-    /// Allocate a fresh session bound to `agent_id`. Returns the handle the caller
-    /// passes to [`reply`](Self::reply) for subsequent turns.
-    pub async fn start_session(&self, agent_id: AgentId) -> Result<SessionId, AgentError> {
-        Ok(self.sessions.create(agent_id).await?)
+    pub(super) fn provider(&self) -> &SharedProvider {
+        &self.provider
+    }
+    pub(super) fn sessions(&self) -> &SharedSessionStore {
+        &self.sessions
+    }
+    pub(super) fn memory(&self) -> &SharedMemory {
+        &self.memory
+    }
+    pub(super) fn tools(&self) -> &ToolBox {
+        &self.tools
+    }
+    pub(super) fn hooks(&self) -> &HookChain {
+        &self.hooks
+    }
+    pub(super) fn model(&self) -> &ModelId {
+        &self.model
+    }
+    pub(super) fn max_output_tokens(&self) -> MaxOutputTokens {
+        self.max_output_tokens
+    }
+    pub(super) fn provider_timeout(&self) -> Duration {
+        self.provider_timeout
+    }
+    pub(super) fn tool_timeout(&self) -> Duration {
+        self.tool_timeout
     }
 
-    /// Drive a batch of user prompts (a single user message with one text block per
-    /// prompt) to a final assistant text answer, running tool calls in between turns.
-    /// Honours `cancel`: returns [`AgentError::Cancelled`] at the next checkpoint.
-    ///
-    /// `observer` (if `Some`) is notified at every assistant content block and every
-    /// tool result so the SSE pipeline can stream chunks as the loop progresses
-    /// rather than at the very end.
-    #[instrument(
-        name = "agent.reply",
+    /// Drive a batch of user prompts to a final assistant text answer, running
+    /// tool calls in between turns. Honours `cancel` at the next checkpoint.
+    /// `observer` is notified at every assistant block and tool result so the
+    /// SSE pipeline streams chunks as the loop progresses.
+    #[tracing::instrument(
         skip_all,
+        name = "agent.reply",
         fields(
             relay.session.id = %session,
+            relay.viewer = %viewer,
             relay.provider = self.provider.name(),
             relay.model = %self.model,
             relay.batch_size = prompts.len(),
             relay.max_turns = self.max_turns.get(),
+            relay.dag.root = tracing::field::Empty,
+            relay.outcome = tracing::field::Empty,
         ),
     )]
     pub async fn reply(
         &self,
         session: SessionId,
+        viewer: Participant,
         prompts: Vec<Prompt>,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
-    ) -> Result<String, AgentError> {
-        // §6: a worker only calls this after draining at least one prompt.
+    ) -> Result<AgentReply, AgentError> {
+        let result = self
+            .reply_inner(session, viewer, prompts, cancel, observer)
+            .await;
+        record_reply(&result);
+        result
+    }
+
+    async fn reply_inner(
+        &self,
+        session: SessionId,
+        viewer: Participant,
+        prompts: Vec<Prompt>,
+        cancel: CancellationToken,
+        observer: Option<SharedTurnObserver>,
+    ) -> Result<AgentReply, AgentError> {
         assert!(!prompts.is_empty(), "reply requires at least one prompt");
+        let counterpart = self.counterpart(session, viewer).await?;
+
+        // Append once on the first call. The retry path (`resume`) re-enters
+        // the loop without re-appending the same prompt rows.
         let user_blocks: Vec<UserContent> = prompts
             .into_iter()
             .map(|p| UserContent::Text(p.into_string()))
             .collect();
         self.sessions
-            .append(session, ChatMessage::User(user_blocks))
+            .append(
+                session,
+                MessageSender::from_participant(counterpart),
+                viewer,
+                ChatMessage::User(user_blocks),
+            )
             .await?;
 
+        self.run_loop(session, viewer, counterpart, cancel, observer)
+            .await
+    }
+
+    /// Continue an existing reply from where it left off. Used by the worker's
+    /// ping-pong guard between retries — the prompt was already appended on
+    /// the first `reply` call.
+    #[tracing::instrument(
+        skip_all,
+        name = "agent.resume",
+        fields(
+            relay.session.id = %session,
+            relay.viewer = %viewer,
+            relay.provider = self.provider.name(),
+            relay.model = %self.model,
+            relay.max_turns = self.max_turns.get(),
+            relay.dag.root = tracing::field::Empty,
+            relay.outcome = tracing::field::Empty,
+        ),
+    )]
+    pub async fn resume(
+        &self,
+        session: SessionId,
+        viewer: Participant,
+        cancel: CancellationToken,
+        observer: Option<SharedTurnObserver>,
+    ) -> Result<AgentReply, AgentError> {
+        let counterpart = self.counterpart(session, viewer).await?;
+        let result = self
+            .run_loop(session, viewer, counterpart, cancel, observer)
+            .await;
+        record_reply(&result);
+        result
+    }
+
+    async fn run_loop(
+        &self,
+        session: SessionId,
+        viewer: Participant,
+        counterpart: Participant,
+        cancel: CancellationToken,
+        observer: Option<SharedTurnObserver>,
+    ) -> Result<AgentReply, AgentError> {
+        let viewer_as_sender = MessageSender::from_participant(viewer);
+        // Resolved once per loop — constant across turns, threaded into every
+        // tool call so `send_message` can bump the per-DAG budget without
+        // redundant lookups.
+        let root_request_id = self.sessions.root_request_id(session).await?;
+        tracing::Span::current().record("relay.dag.root", tracing::field::display(root_request_id));
+
         let observer = observer.as_ref();
+        let mut send_message_calls = 0usize;
         for turn in 0..self.max_turns.get() {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let turn_index = TurnIndex::try_from(turn)
-                .expect("invariant: max_turns is bounded so loop index is a valid TurnIndex");
             let ctx = TurnContext {
                 session_id: session,
-                turn_index,
+                turn_index: turn_index(turn),
             };
-            if let Some(text) = self.run_turn(ctx, &cancel, observer).await? {
-                info!(turn, "agent.turn.final");
-                return Ok(text);
+            let turn_span = tracing::info_span!(
+                "agent.turn",
+                relay.session.id = %session,
+                relay.dag.root = %root_request_id,
+                relay.turn_index = turn,
+                relay.viewer = %viewer,
+                relay.turn.outcome = tracing::field::Empty,
+                relay.tool_calls.count = tracing::field::Empty,
+            );
+            let outcome = async {
+                self.run_turn(
+                    ctx,
+                    viewer,
+                    counterpart,
+                    viewer_as_sender,
+                    root_request_id,
+                    &mut send_message_calls,
+                    &cancel,
+                    observer,
+                )
+                .await
+            }
+            .instrument(turn_span.clone())
+            .await;
+            record_turn(&turn_span, &outcome);
+            if let Some(text) = outcome? {
+                debug!(turn, "agent.turn.final");
+                return Ok(AgentReply::new(text, send_message_calls));
             }
         }
         Err(AgentError::MaxTurnsExceeded(self.max_turns.get()))
     }
 
-    /// Run one provider call + its tool-call follow-up. Returns `Some(text)` when the
-    /// turn ends with a final answer; `None` to continue the loop.
-    async fn run_turn(
-        &self,
-        ctx: TurnContext,
-        cancel: &CancellationToken,
-        observer: Option<&SharedTurnObserver>,
-    ) -> Result<Option<String>, AgentError> {
-        self.guard(self.hooks.before_turn(ctx).await?)?;
-        let response = self.send_one_turn(ctx.session_id, cancel).await?;
-        self.guard(self.hooks.after_turn(ctx, &response).await?)?;
-
-        // Stream every assistant content block (text, reasoning, tool call) before
-        // the tools run, so a UI sees the model's thinking and intent immediately.
-        if let Some(obs) = observer {
-            for block in &response.content {
-                obs.on_assistant(block).await;
-            }
-        }
-
-        self.sessions
-            .append(
-                ctx.session_id,
-                ChatMessage::Assistant(response.content.clone()),
-            )
-            .await?;
-
-        let tool_calls = response.tool_calls();
-        if tool_calls.is_empty() {
-            let text = response.text();
-            if text.is_empty() {
-                return Err(AgentError::EmptyReply);
-            }
-            return Ok(Some(text));
-        }
-        if tool_calls.len() > MAX_TOOL_CALLS_PER_TURN {
-            return Err(AgentError::TooManyToolCalls {
-                max: MAX_TOOL_CALLS_PER_TURN,
-            });
-        }
-
-        let results = self.run_tools(ctx, &tool_calls, cancel, observer).await?;
-        self.sessions
-            .append(
-                ctx.session_id,
-                ChatMessage::User(results.into_iter().map(UserContent::ToolResult).collect()),
-            )
-            .await?;
-        Ok(None)
-    }
-
-    /// Construct one provider request from current session state and run it under the
-    /// configured timeout / cancellation token.
-    async fn send_one_turn(
+    /// Look up the counterpart participant given the explicit viewer.
+    ///
+    /// Sessions are 2-party. The worker passes the receiver agent as `viewer` —
+    /// inferring from session ordering alone is ambiguous when both sides are
+    /// agents.
+    async fn counterpart(
         &self,
         session: SessionId,
-        cancel: &CancellationToken,
-    ) -> Result<ChatResponse, AgentError> {
-        let messages = self.sessions.snapshot(session).await?;
-        // §6: an empty history would mean the caller jumped straight into a turn loop
-        // without seeding the user prompt — unrepresentable, but cheap to assert.
-        assert!(
-            !messages.is_empty(),
-            "session must contain at least the user prompt"
-        );
-
-        let system = self.memory.system_prompt(session).await?;
-        let request = ChatRequest {
-            model: self.model.clone(),
-            system,
-            messages,
-            tools: self.tools.specs(),
-            max_output_tokens: self.max_output_tokens,
-        };
-
-        let send = self.provider.send(request);
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => Err(AgentError::Cancelled),
-            r = timeout(self.provider_timeout, send) => match r {
-                Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => Err(AgentError::Provider(e)),
-                Err(_) => Err(AgentError::ProviderTimeout),
-            },
+        viewer: Participant,
+    ) -> Result<Participant, AgentError> {
+        let (a, b) = self.sessions.participants(session).await?;
+        if a == viewer {
+            Ok(b)
+        } else if b == viewer {
+            Ok(a)
+        } else {
+            Err(AgentError::Session(SessionError::Backend(format!(
+                "agent {viewer} is not a participant of session {session}"
+            ))))
         }
-    }
-
-    /// Execute every tool call from the assistant turn, returning a `ToolResult` for
-    /// each — never short-circuits on the first error so the model receives a complete
-    /// picture of what happened. Each result is streamed through `observer` (if set)
-    /// the instant it lands, ahead of the next provider call.
-    async fn run_tools(
-        &self,
-        ctx: TurnContext,
-        calls: &[&ToolCall],
-        cancel: &CancellationToken,
-        observer: Option<&SharedTurnObserver>,
-    ) -> Result<Vec<ToolResult>, AgentError> {
-        let mut out = Vec::with_capacity(calls.len());
-        for call in calls {
-            if cancel.is_cancelled() {
-                return Err(AgentError::Cancelled);
-            }
-            let tool_ctx = ToolContext {
-                session_id: ctx.session_id,
-                turn_index: ctx.turn_index,
-                call,
-            };
-            self.guard(self.hooks.before_tool(tool_ctx).await?)?;
-            let result = self.run_one_tool(call, cancel).await;
-            self.guard(self.hooks.after_tool(tool_ctx, &result).await?)?;
-            if let Some(obs) = observer {
-                obs.on_tool_result(&result).await;
-            }
-            out.push(result);
-        }
-        Ok(out)
-    }
-
-    /// Resolve and run a single tool. All failure modes (unknown tool, timeout, tool
-    /// error) get folded into a `ToolResult { is_error: true }` so the model can reason
-    /// about them. Cancellation is the only condition that bubbles upward.
-    async fn run_one_tool(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolResult {
-        let id = call.id.clone();
-        let Some(tool) = self.tools.get(call.name.as_str()) else {
-            warn!(relay.tool = %call.name, "tool.unknown");
-            return error_result(id, format!("unknown tool: {}", call.name));
-        };
-
-        let exec = tool.execute(call.input.clone());
-        let outcome = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return error_result(id, "cancelled".into()),
-            r = timeout(self.tool_timeout, exec) => r,
-        };
-
-        match outcome {
-            Ok(Ok(output)) => {
-                if output.len() > TOOL_RESULT_MAX_BYTES {
-                    warn!(
-                        relay.tool = %call.name,
-                        bytes = output.len(),
-                        cap = TOOL_RESULT_MAX_BYTES,
-                        "tool.result.too_large",
-                    );
-                    return error_result(
-                        id,
-                        format!(
-                            "tool `{}` returned {} bytes; cap is {} bytes",
-                            call.name,
-                            output.len(),
-                            TOOL_RESULT_MAX_BYTES,
-                        ),
-                    );
-                }
-                debug!(relay.tool = %call.name, bytes = output.len(), "tool.result.ok");
-                ToolResult {
-                    call_id: id,
-                    output,
-                    is_error: false,
-                }
-            }
-            Ok(Err(e)) => {
-                warn!(relay.tool = %call.name, error = %e, "tool.result.err");
-                error_result(id, e.to_string())
-            }
-            Err(_) => {
-                warn!(relay.tool = %call.name, "tool.timeout");
-                error_result(id, format!("tool `{}` timed out", call.name))
-            }
-        }
-    }
-
-    fn guard(&self, decision: HookDecision) -> Result<(), AgentError> {
-        match decision {
-            HookDecision::Continue => Ok(()),
-            HookDecision::Deny { reason } => Err(AgentError::HookDenied(reason)),
-        }
-    }
-}
-
-fn error_result(call_id: ToolCallId, message: String) -> ToolResult {
-    // Defence in depth: the cap on tool output applies just as much to error messages.
-    // Tool authors who embed an upstream body in their error must respect this; we cap
-    // here as a final boundary so a bad implementation cannot blow the budget.
-    let mut output = message;
-    if output.len() > TOOL_RESULT_MAX_BYTES {
-        truncate_to_char_boundary(&mut output, TOOL_RESULT_MAX_BYTES);
-    }
-    ToolResult {
-        call_id,
-        output,
-        is_error: true,
     }
 }

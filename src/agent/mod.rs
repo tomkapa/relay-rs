@@ -9,7 +9,10 @@ mod builder;
 mod core;
 mod error;
 mod limits;
+mod log;
 mod observer;
+mod outcome;
+mod turn;
 
 pub use builder::AgentBuilder;
 pub use core::Agent;

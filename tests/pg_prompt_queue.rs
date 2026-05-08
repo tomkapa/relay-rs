@@ -8,32 +8,36 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use relay_rs::agents::AgentId;
 use relay_rs::clock::{SharedClock, TestClock};
 use relay_rs::runtime::queue::PromptQueue as _;
 use relay_rs::runtime::{
     IdempotencyKey, LeaseManager as _, LeaseTiming, NewPromptRequest, PgPromptQueue, PromptError,
     PromptRequestId, RequestStatus, WorkerId,
 };
-use relay_rs::session::{PgSessionStore, SessionId, SessionStore};
-use relay_rs::types::Prompt;
+use relay_rs::session::{PgSessionStore, SessionId};
+use relay_rs::types::{Participant, Prompt};
 
 mod common;
-use common::pg::TestDb;
+use common::pg::{TestDb, human_to_agent_session};
 
 const LEASE_TTL: Duration = Duration::from_secs(2);
 const HEARTBEAT: Duration = Duration::from_millis(500);
 
-/// The returned `TestDb` must be bound (e.g. `let (_db, ...)`) so its `Drop` runs
-/// at end-of-scope and reaps the schema; binding it to `_` would drop it immediately.
-async fn fresh() -> (TestDb, Arc<PgPromptQueue>, Arc<TestClock>, SessionId) {
+struct Fixture {
+    db: TestDb,
+    queue: Arc<PgPromptQueue>,
+    clock: Arc<TestClock>,
+    session: SessionId,
+    agent_id: AgentId,
+}
+
+async fn fresh() -> Fixture {
     let db = TestDb::fresh().await;
     let test_clock = Arc::new(TestClock::new());
     let clock: SharedClock = test_clock.clone();
     let session_store = PgSessionStore::new(db.pool.clone(), clock.clone());
-    let session = session_store
-        .create(db.default_agent_id)
-        .await
-        .expect("session");
+    let session = human_to_agent_session(&session_store, db.default_agent_id).await;
     let timing = LeaseTiming::try_new(LEASE_TTL, HEARTBEAT).expect("valid timing");
     let queue = Arc::new(PgPromptQueue::with_caps(
         db.pool.clone(),
@@ -42,12 +46,22 @@ async fn fresh() -> (TestDb, Arc<PgPromptQueue>, Arc<TestClock>, SessionId) {
         32,
         3,
     ));
-    (db, queue, test_clock, session)
+    let agent_id = db.default_agent_id;
+    Fixture {
+        db,
+        queue,
+        clock: test_clock,
+        session,
+        agent_id,
+    }
 }
 
-fn req(session: SessionId, content: &str, key: &str) -> NewPromptRequest {
+fn req(session: SessionId, agent_id: AgentId, content: &str, key: &str) -> NewPromptRequest {
     NewPromptRequest {
-        session,
+        session: Some(session),
+        sender: Participant::Human,
+        receiver_agent_id: agent_id,
+        parent_session: None,
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
     }
@@ -55,17 +69,33 @@ fn req(session: SessionId, content: &str, key: &str) -> NewPromptRequest {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn enqueue_is_idempotent_on_repeat_key() {
-    let (_db, q, _c, s) = fresh().await;
-    let first = q.enqueue(req(s, "hi", "k1")).await.expect("first");
-    let second = q.enqueue(req(s, "hi-again", "k1")).await.expect("second");
+    let f = fresh().await;
+    let (q, s, agent_id) = (&f.queue, f.session, f.agent_id);
+    let first = q
+        .enqueue(req(s, agent_id, "hi", "k1"))
+        .await
+        .expect("first");
+    let second = q
+        .enqueue(req(s, agent_id, "hi-again", "k1"))
+        .await
+        .expect("second");
     assert_eq!(first.request_id(), second.request_id());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_drains_all_pending_for_session() {
-    let (_db, q, _c, s) = fresh().await;
-    let r1 = q.enqueue(req(s, "a", "k1")).await.expect("ok").request_id();
-    let r2 = q.enqueue(req(s, "b", "k2")).await.expect("ok").request_id();
+    let f = fresh().await;
+    let (q, s, agent_id) = (&f.queue, f.session, f.agent_id);
+    let r1 = q
+        .enqueue(req(s, agent_id, "a", "k1"))
+        .await
+        .expect("ok")
+        .request_id();
+    let r2 = q
+        .enqueue(req(s, agent_id, "b", "k2"))
+        .await
+        .expect("ok")
+        .request_id();
     let claimed = q
         .claim_next_session(WorkerId::new())
         .await
@@ -79,8 +109,9 @@ async fn claim_drains_all_pending_for_session() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn second_claim_skips_leased_session() {
-    let (_db, q, _c, s) = fresh().await;
-    let _ = q.enqueue(req(s, "a", "k1")).await.expect("ok");
+    let f = fresh().await;
+    let (q, s, agent_id) = (&f.queue, f.session, f.agent_id);
+    let _ = q.enqueue(req(s, agent_id, "a", "k1")).await.expect("ok");
     let _first = q
         .claim_next_session(WorkerId::new())
         .await
@@ -92,8 +123,9 @@ async fn second_claim_skips_leased_session() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_expiry_returns_orphan_to_pending() {
-    let (_db, q, clock, s) = fresh().await;
-    let _ = q.enqueue(req(s, "a", "k1")).await.expect("ok");
+    let f = fresh().await;
+    let (q, clock, s, agent_id) = (&f.queue, &f.clock, f.session, f.agent_id);
+    let _ = q.enqueue(req(s, agent_id, "a", "k1")).await.expect("ok");
     let _ = q
         .claim_next_session(WorkerId::new())
         .await
@@ -112,8 +144,13 @@ async fn lease_expiry_returns_orphan_to_pending() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mark_done_with_stale_token_fails() {
-    let (_db, q, clock, s) = fresh().await;
-    let _ = q.enqueue(req(s, "a", "k1")).await.expect("ok").request_id();
+    let f = fresh().await;
+    let (q, clock, s, agent_id) = (&f.queue, &f.clock, f.session, f.agent_id);
+    let _ = q
+        .enqueue(req(s, agent_id, "a", "k1"))
+        .await
+        .expect("ok")
+        .request_id();
     let claim1 = q
         .claim_next_session(WorkerId::new())
         .await
@@ -139,10 +176,8 @@ async fn poisons_after_max_attempts_via_orphan_path() {
     let test_clock = Arc::new(TestClock::new());
     let clock: SharedClock = test_clock.clone();
     let session_store = PgSessionStore::new(db.pool.clone(), clock.clone());
-    let session = session_store
-        .create(db.default_agent_id)
-        .await
-        .expect("session");
+    let agent_id = db.default_agent_id;
+    let session = human_to_agent_session(&session_store, agent_id).await;
     let timing = LeaseTiming::try_new(LEASE_TTL, HEARTBEAT).expect("timing");
     let q = Arc::new(PgPromptQueue::with_caps(
         db.pool.clone(),
@@ -152,7 +187,7 @@ async fn poisons_after_max_attempts_via_orphan_path() {
         2,
     ));
     let r = q
-        .enqueue(req(session, "a", "k1"))
+        .enqueue(req(session, agent_id, "a", "k1"))
         .await
         .expect("ok")
         .request_id();
@@ -178,8 +213,9 @@ async fn poisons_after_max_attempts_via_orphan_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn heartbeat_extends_lease() {
-    let (_db, q, clock, s) = fresh().await;
-    let _ = q.enqueue(req(s, "a", "k1")).await.expect("ok");
+    let f = fresh().await;
+    let (q, clock, s, agent_id) = (&f.queue, &f.clock, f.session, f.agent_id);
+    let _ = q.enqueue(req(s, agent_id, "a", "k1")).await.expect("ok");
     let claim = q
         .claim_next_session(WorkerId::new())
         .await
@@ -196,8 +232,10 @@ async fn heartbeat_extends_lease() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn release_clears_lease_so_others_can_claim() {
-    let (db, q, _c, s) = fresh().await;
-    let _ = q.enqueue(req(s, "a", "k1")).await.expect("ok");
+    let f = fresh().await;
+    let (q, s, agent_id) = (&f.queue, f.session, f.agent_id);
+    let db = &f.db;
+    let _ = q.enqueue(req(s, agent_id, "a", "k1")).await.expect("ok");
     let claim = q
         .claim_next_session(WorkerId::new())
         .await
@@ -208,8 +246,8 @@ async fn release_clears_lease_so_others_can_claim() {
 
     let session_store =
         PgSessionStore::new(db.pool.clone(), relay_rs::clock::SystemClock::shared());
-    let s2 = session_store.create(db.default_agent_id).await.expect("s2");
-    let _ = q.enqueue(req(s2, "b", "k2")).await.expect("ok");
+    let s2 = human_to_agent_session(&session_store, db.default_agent_id).await;
+    let _ = q.enqueue(req(s2, agent_id, "b", "k2")).await.expect("ok");
     let again = q.claim_next_session(WorkerId::new()).await.expect("c2");
     assert!(again.is_some());
 }
@@ -220,10 +258,8 @@ async fn enqueue_caps_pending_per_session() {
     let test_clock = Arc::new(TestClock::new());
     let clock: SharedClock = test_clock;
     let session_store = PgSessionStore::new(db.pool.clone(), clock.clone());
-    let session = session_store
-        .create(db.default_agent_id)
-        .await
-        .expect("session");
+    let agent_id = db.default_agent_id;
+    let session = human_to_agent_session(&session_store, agent_id).await;
     let timing = LeaseTiming::try_new(LEASE_TTL, HEARTBEAT).expect("valid timing");
     let q = Arc::new(PgPromptQueue::with_caps(
         db.pool.clone(),
@@ -232,10 +268,14 @@ async fn enqueue_caps_pending_per_session() {
         2,
         3,
     ));
-    q.enqueue(req(session, "a", "k1")).await.expect("ok1");
-    q.enqueue(req(session, "b", "k2")).await.expect("ok2");
+    q.enqueue(req(session, agent_id, "a", "k1"))
+        .await
+        .expect("ok1");
+    q.enqueue(req(session, agent_id, "b", "k2"))
+        .await
+        .expect("ok2");
     let err = q
-        .enqueue(req(session, "c", "k3"))
+        .enqueue(req(session, agent_id, "c", "k3"))
         .await
         .expect_err("over cap");
     assert!(matches!(err, PromptError::PendingCapExceeded { .. }));

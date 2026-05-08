@@ -66,6 +66,26 @@ pub(super) enum WireMessage {
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatResponseBody {
     pub choices: Vec<WireChoice>,
+    /// Model id reported by the provider — may differ from the request when a
+    /// gateway routes to a specific snapshot. `default` because some
+    /// OpenAI-compatible endpoints omit it.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Token-usage counts. `default` because some endpoints omit the field on
+    /// streaming responses; we do not stream today, but the safety net is cheap.
+    #[serde(default)]
+    pub usage: Option<WireUsage>,
+}
+
+/// Token-usage counters returned by an OpenAI-Chat-Completions endpoint. Field
+/// names match the wire shape; we map to the provider-agnostic
+/// [`crate::provider::chat::Usage`] in [`super::client`].
+#[derive(Debug, Deserialize)]
+pub(super) struct WireUsage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]

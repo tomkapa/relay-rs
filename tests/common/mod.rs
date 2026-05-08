@@ -5,4 +5,5 @@
 
 #![allow(dead_code, unreachable_pub, clippy::expect_used, clippy::unwrap_used)]
 
+pub mod harness;
 pub mod pg;

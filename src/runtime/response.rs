@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::agents::AgentId;
 use crate::provider::{ToolCall, ToolResult};
 
 use super::error::ResponseError;
@@ -38,6 +39,14 @@ pub enum ResponseChunk {
     /// Tool finished. `output` is the bytes the tool returned (already capped by the
     /// agent at `TOOL_RESULT_MAX_BYTES`); `is_error` distinguishes failure from success.
     ToolResult(ToolResult),
+    /// An agent's outbound message addressed to the human end of the DAG.
+    ///
+    /// Published on the root request's stream by the `send_message` tool when
+    /// the receiver is `Participant::Human`. Multiple agent-to-human messages
+    /// in one DAG appear as multiple `AgentMessage` chunks on the same SSE
+    /// stream. Non-terminal — the `Done` chunk fires only on DAG quiescence.
+    /// `from` lets clients render which agent authored each message.
+    AgentMessage { from: AgentId, content: String },
     /// Turn completed normally. The full assistant text is included for late
     /// subscribers that don't want to reconstitute from `Text` chunks.
     Done { final_text: String },
@@ -62,6 +71,7 @@ impl ResponseChunk {
             Self::Reasoning { .. } => "reasoning",
             Self::ToolCall(_) => "tool_call",
             Self::ToolResult(_) => "tool_result",
+            Self::AgentMessage { .. } => "agent_message",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
             Self::Stalled => "stalled",
@@ -77,6 +87,7 @@ impl ResponseChunk {
             Self::Text { value } | Self::Reasoning { value } => value.len(),
             Self::Error { reason } => reason.len(),
             Self::Done { final_text } => final_text.len(),
+            Self::AgentMessage { content, .. } => content.len() + 36, // 36 = uuid str
             Self::ToolCall(c) => {
                 c.id.as_str().len() + c.name.as_str().len() + c.input.to_string().len()
             }

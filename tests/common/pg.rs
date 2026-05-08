@@ -18,6 +18,9 @@ use std::time::Duration;
 
 use relay_rs::agents::{AgentId, AgentName, AgentSystemPrompt, DefaultAgentSeed, PgAgentStore};
 use relay_rs::clock::SystemClock;
+use relay_rs::runtime::PromptRequestId;
+use relay_rs::session::{SessionId, SessionStore};
+use relay_rs::types::Participant;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
@@ -102,6 +105,22 @@ impl TestDb {
             admin,
         }
     }
+}
+
+/// Mint a fresh human-to-`agent_id` session via the new
+/// [`SessionStore::resolve_or_create_for_pair`] API. Tests use this to obtain
+/// a session without going through the queue.
+///
+/// The synthetic `root_request_id` is generated locally; nothing dereferences
+/// it (no FK from `sessions.root_request_id` to `prompt_requests.id`), but
+/// integration tests that also exercise `prompt_requests` should mint a real
+/// request id and pass it in instead.
+pub async fn human_to_agent_session(sessions: &dyn SessionStore, agent_id: AgentId) -> SessionId {
+    let root = PromptRequestId::new();
+    sessions
+        .resolve_or_create_for_pair(root, Participant::Human, Participant::agent(agent_id), None)
+        .await
+        .expect("create human-to-agent session")
 }
 
 impl Drop for TestDb {

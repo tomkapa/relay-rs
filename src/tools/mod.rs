@@ -5,20 +5,18 @@
 //! turns a `Value` input into a `String` output (success or error).
 //!
 //! The agent never imports concrete tools directly — it pulls a [`ToolRegistry`] off the
-//! composition root. Adding a tool is one new file plus one line in `app.rs`.
+//! composition root. Adding a system tool is one new file in `system/` plus one
+//! `.with(...)` line in [`system::register`].
 
 pub mod limits;
 mod registry;
+pub mod system;
 mod toolbox;
 mod traits;
 mod url;
-mod web_fetch;
-mod web_search;
 
 pub use limits::{TOOL_RESULT_MAX_BYTES, truncate_to_char_boundary};
 pub use registry::{ToolRegistry, ToolRegistryBuilder};
 pub use toolbox::{DynamicToolSource, ToolBox};
-pub use traits::{SharedTool, Tool, ToolError};
+pub use traits::{SharedTool, Tool, ToolCallContext, ToolError};
 pub use url::{FetchUrl, UrlError};
-pub use web_fetch::WebFetchTool;
-pub use web_search::WebSearchTool;

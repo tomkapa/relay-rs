@@ -1,0 +1,394 @@
+//! End-to-end scenario test for the full multi-agent communication stack.
+//!
+//! Plays out a realistic delegation: a human asks the **Coordinator** agent
+//! (the seeded default) to translate a phrase. The Coordinator does not know
+//! French, so it delegates to a **Translator** agent via `send_message`.
+//! The Translator replies with the translation via `send_message(Agent(coordinator))`.
+//! The Coordinator forwards the result to the human via `send_message(Human)`.
+//! When the DAG drains, the worker emits a terminal `Done` chunk on the root
+//! request's SSE stream.
+//!
+//! What this exercises end-to-end:
+//! - Step 1 — schema, `Participant`, viewer-mapped session storage.
+//! - Step 2 — `Agents` registry with a per-agent factory: each agent gets
+//!   its own scripted provider, picked by `AgentRecord::id` at build time.
+//! - Step 3 — DAG budget seeded on the human POST; bumped four times across
+//!   the conversation, well under cap.
+//! - Step 4 — `send_message` agent-receiver branch (Coordinator → Translator
+//!   and Translator → Coordinator).
+//! - Step 6 — `send_message(Human)` publishes `AgentMessage` on the root
+//!   stream.
+//! - Step 7 — every turn calls `send_message`, so the ping-pong guard
+//!   never trips.
+//! - Step 8 — once every `prompt_requests` row in the DAG flips to `done`,
+//!   the worker emits a terminal `Done` chunk on the root stream and
+//!   closes it.
+//!
+//! Scripted-provider scripts are short and explicit: each agent emits a
+//! `send_message` tool call followed by a benign closing text. The closing
+//! text is a private thought (per the system-prompt directive) and is not
+//! delivered anywhere; only `send_message` content lands.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use serde_json::json;
+
+use relay_rs::agent::AgentBuilder;
+use relay_rs::agents::{
+    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, AgentId, AgentName,
+    AgentSystemPrompt, CachedAgents, NewAgent, PgAgentStore, SharedAgentStore, SharedAgents,
+};
+use relay_rs::clock::SystemClock;
+use relay_rs::hook::HookChain;
+use relay_rs::memory::{SharedMemory, StaticMemory};
+use relay_rs::provider::{
+    AssistantContent, ChatRequest, ChatResponse, LlmProvider, ProviderError, SharedProvider,
+    StopReason, ToolCall, ToolCallId,
+};
+use relay_rs::runtime::queue::PromptQueue as _;
+use relay_rs::runtime::{
+    IdempotencyKey, LeaseTiming, NewPromptRequest, PgDagBudget, PgPromptQueue, PgResponseHub,
+    PromptRequestId, RequestStatus, ResponseChunk, SharedDagBudget, SharedResponseSource,
+    StreamEvent, WorkerConfig, WorkerPool, WorkerPoolHandle,
+};
+use relay_rs::session::{PgSessionStore, SharedSessionStore};
+use relay_rs::tools::system::SendMessageTool;
+use relay_rs::tools::{ToolBox, ToolRegistry};
+use relay_rs::types::{ModelId, Participant, Prompt, ToolName};
+
+mod common;
+use common::pg::TestDb;
+
+/// Provider that dispatches to a per-agent script keyed by [`AgentId`].
+///
+/// Each Agent built by the registry's factory closure holds its own
+/// [`AgentBoundProvider`] that internally points to a single agent's
+/// scripted responses; the agent's `send` calls advance only that script.
+#[derive(Debug)]
+struct AgentBoundProvider {
+    name: &'static str,
+    responses: Vec<ChatResponse>,
+    cursor: AtomicUsize,
+}
+
+impl AgentBoundProvider {
+    fn new(name: &'static str, responses: Vec<ChatResponse>) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            responses,
+            cursor: AtomicUsize::new(0),
+        })
+    }
+    fn calls(&self) -> usize {
+        self.cursor.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AgentBoundProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    async fn send(&self, _request: ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let i = self.cursor.fetch_add(1, Ordering::SeqCst);
+        self.responses
+            .get(i)
+            .cloned()
+            .ok_or_else(|| ProviderError::Transport(format!("script exhausted for {}", self.name)))
+    }
+}
+
+/// One scripted assistant response that calls `send_message` against the
+/// given receiver (`Human` or `Agent`).
+fn send_message_chunk(receiver: serde_json::Value, content: &str, call_id: &str) -> ChatResponse {
+    ChatResponse {
+        content: vec![AssistantContent::ToolCall(ToolCall {
+            id: ToolCallId::try_from(call_id).expect("id"),
+            name: ToolName::try_from("send_message").expect("name"),
+            input: json!({ "receiver": receiver, "content": content }),
+        })],
+        stop_reason: StopReason::ToolUse,
+        ..Default::default()
+    }
+}
+
+/// EndTurn text. Closing thoughts that the spec marks as private — not
+/// delivered. Must be non-empty so the agent loop doesn't treat the turn as
+/// `EmptyReply`.
+fn end_turn(text: &'static str) -> ChatResponse {
+    ChatResponse {
+        content: vec![AssistantContent::Text(text.into())],
+        stop_reason: StopReason::EndTurn,
+        ..Default::default()
+    }
+}
+
+#[allow(clippy::too_many_lines)] // single end-to-end scenario; splitting it would obscure the trace.
+#[tokio::test(flavor = "multi_thread")]
+async fn translator_delegation_round_trips_and_emits_root_done() {
+    let db = TestDb::fresh().await;
+    let clock = SystemClock::shared();
+
+    // ── Agents — Coordinator is the seeded default; Translator is a fresh
+    // row created against the live agents store. ─────────────────────────
+    let coordinator_id = db.default_agent_id;
+    let agent_store: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
+    let translator_record = agent_store
+        .create(NewAgent {
+            name: AgentName::try_from("translator").expect("name"),
+            system_prompt: AgentSystemPrompt::try_from(
+                "You translate phrases into French. Reply via send_message.",
+            )
+            .expect("prompt"),
+            is_default: false,
+        })
+        .await
+        .expect("create translator");
+    let translator_id = translator_record.id;
+
+    // ── Per-agent scripts ────────────────────────────────────────────────
+    // Coordinator runs twice across the conversation:
+    //   1) Initial: receives the human's prompt, delegates to Translator.
+    //   2) On the Translator's reply: forwards the answer to the human.
+    // Translator runs once:
+    //   1) Receives the request, sends the translation back to Coordinator.
+    //
+    // Each "run" consumes two ChatResponses: one ToolCall turn, one EndTurn.
+    let coordinator_provider = AgentBoundProvider::new(
+        "coordinator",
+        vec![
+            // Run 1: delegate.
+            send_message_chunk(
+                json!({ "kind": "agent", "agent_id": translator_id.as_uuid().to_string() }),
+                "translate 'hello' to French, reply with the single word",
+                "co-call-1",
+            ),
+            end_turn("(coordinator dispatched the request)"),
+            // Run 2: forward to human.
+            send_message_chunk(
+                json!({ "kind": "human" }),
+                "The translation is 'bonjour'.",
+                "co-call-2",
+            ),
+            end_turn("(coordinator delivered the answer)"),
+        ],
+    );
+    let translator_provider = AgentBoundProvider::new(
+        "translator",
+        vec![
+            send_message_chunk(
+                json!({ "kind": "agent", "agent_id": coordinator_id.as_uuid().to_string() }),
+                "bonjour",
+                "tr-call-1",
+            ),
+            end_turn("(translator wrote back to coordinator)"),
+        ],
+    );
+
+    // ── Pipeline collaborators ───────────────────────────────────────────
+    let queue_impl = Arc::new(PgPromptQueue::new(db.pool.clone(), clock.clone()));
+    let queue = queue_impl.clone();
+    let leases = queue_impl.clone();
+    let hub: Arc<PgResponseHub> = Arc::new(PgResponseHub::new(db.pool.clone(), clock.clone()));
+    let sink = hub.clone();
+    let sessions: SharedSessionStore =
+        Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
+    let dag: SharedDagBudget = Arc::new(PgDagBudget::new(db.pool.clone()));
+    let memory: SharedMemory = Arc::new(StaticMemory::new("test"));
+    let model = ModelId::try_from("test-model").expect("model");
+
+    let tool_registry = ToolRegistry::builder()
+        .with(Arc::new(SendMessageTool::new(
+            sessions.clone(),
+            queue.clone(),
+            dag.clone(),
+            agent_store.clone(),
+            sink.clone(),
+        )))
+        .build();
+    let toolbox = ToolBox::from_builtins(tool_registry);
+
+    // Per-agent factory: pick the right scripted provider when the registry
+    // builds an Agent for a given record. CachedAgents caches the result
+    // per id, so the same Arc<Agent> is handed back across claims and the
+    // provider's cursor advances across the agent's two runs.
+    let providers_by_id: Arc<HashMap<AgentId, Arc<AgentBoundProvider>>> =
+        Arc::new(HashMap::from([
+            (coordinator_id, coordinator_provider.clone()),
+            (translator_id, translator_provider.clone()),
+        ]));
+    let factory: AgentFactory = {
+        let providers = providers_by_id.clone();
+        let sessions = sessions.clone();
+        let memory = memory.clone();
+        let toolbox = toolbox.clone();
+        let model = model.clone();
+        let clock = clock.clone();
+        Arc::new(move |record| {
+            let provider: SharedProvider = providers
+                .get(&record.id)
+                .cloned()
+                .expect("test wired a provider for every seeded agent");
+            AgentBuilder::new(provider, sessions.clone(), memory.clone(), model.clone())
+                .expect("builder")
+                .with_clock(clock.clone())
+                .with_tools(toolbox.clone())
+                .with_hooks(HookChain::new())
+                .build()
+        })
+    };
+    let agents_registry: SharedAgents = Arc::new(CachedAgents::new(
+        agent_store,
+        factory,
+        AGENT_PROMPT_CACHE_CAP,
+        AGENT_PROMPT_CACHE_TTL,
+        clock,
+    ));
+
+    // Single worker — the scenario relies on serialised processing
+    // (Coordinator first-run → Translator → Coordinator second-run). With
+    // multiple workers the order is non-deterministic but the assertions
+    // below would still hold because the agents only communicate via
+    // `send_message`; a single worker just makes the trace easier to
+    // reason about during failure triage.
+    let cfg = WorkerConfig {
+        workers: 1,
+        lease_timing: LeaseTiming::try_new(Duration::from_secs(2), Duration::from_millis(100))
+            .expect("valid timing"),
+        max_turn_duration: Duration::from_secs(10),
+        idle_poll: Duration::from_millis(20),
+        cancel_poll: Duration::from_millis(50),
+    };
+    let workers: WorkerPoolHandle = WorkerPool::new(
+        queue.clone(),
+        leases,
+        sink,
+        agents_registry,
+        sessions.clone(),
+        dag.clone(),
+        cfg,
+    )
+    .spawn();
+
+    // ── The human kicks the conversation off ─────────────────────────────
+    let outcome = queue
+        .enqueue(NewPromptRequest {
+            session: None,
+            sender: Participant::Human,
+            receiver_agent_id: coordinator_id,
+            parent_session: None,
+            content: Prompt::try_from("translate 'hello' to French please").expect("prompt"),
+            idempotency_key: IdempotencyKey::try_from("a2a-root").expect("key"),
+        })
+        .await
+        .expect("enqueue root");
+    let root_id = outcome.request_id();
+
+    // Subscribe to the root SSE stream and drain until the worker emits a
+    // terminal chunk (the quiescence-Done from step 8). The Coordinator's
+    // human-bound `send_message` lands here as an `AgentMessage` chunk.
+    let chunks = drain_chunks(hub.clone(), root_id, Duration::from_secs(15)).await;
+
+    // Final root status should be Done — the human's request was the DAG
+    // root; it completed normally.
+    let view = queue.status(root_id).await.expect("status");
+    assert!(
+        matches!(view.status, RequestStatus::Done),
+        "expected root Done; got {:?} (failure_reason={:?})",
+        view.status,
+        view.failure_reason,
+    );
+
+    // Coordinator delivered exactly one AgentMessage to the human, and the
+    // content matches what its second run sent.
+    let agent_messages: Vec<&ResponseChunk> = chunks
+        .iter()
+        .filter(|c| matches!(c, ResponseChunk::AgentMessage { .. }))
+        .collect();
+    assert_eq!(
+        agent_messages.len(),
+        1,
+        "expected one AgentMessage on root; got {} (chunks={chunks:?})",
+        agent_messages.len(),
+    );
+    if let ResponseChunk::AgentMessage { from, content } = agent_messages[0] {
+        assert_eq!(*from, coordinator_id, "Coordinator authored the reply");
+        assert_eq!(content, "The translation is 'bonjour'.");
+    }
+
+    // Both providers consumed the full script — no script entries left
+    // unused (which would mean the conversation ended early) and no
+    // exhaustion (which would mean a turn ran an extra time).
+    assert_eq!(
+        coordinator_provider.calls(),
+        4,
+        "Coordinator should have run twice (2 ChatResponses each)",
+    );
+    assert_eq!(
+        translator_provider.calls(),
+        2,
+        "Translator should have run once",
+    );
+
+    // DAG budget bumped exactly four times — once per send_message call:
+    //   Coordinator → Translator
+    //   Translator → Coordinator
+    //   Coordinator → Human
+    let (turns_used, turns_cap): (i64, i64) = sqlx::query_as(
+        "SELECT turns_used, turns_cap FROM prompt_request_dags WHERE root_request_id = $1",
+    )
+    .bind(root_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("dag row");
+    assert_eq!(turns_used, 3, "three send_message bumps observed");
+    assert!(turns_cap > turns_used, "well under cap (cap={turns_cap})",);
+
+    // Three sessions exist for the DAG — one per pair: (Human, Coordinator),
+    // (Coordinator, Translator), and (Human, Translator) is NOT created
+    // because Translator only ever messages Coordinator.
+    let session_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE root_request_id = $1")
+            .bind(root_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("session count");
+    assert_eq!(
+        session_count, 2,
+        "expected exactly two sessions in the DAG (human↔coordinator, coordinator↔translator); got {session_count}",
+    );
+
+    // Wind the worker pool down before TestDb drops the schema.
+    workers.shutdown().await;
+}
+
+async fn drain_chunks(
+    hub: Arc<PgResponseHub>,
+    id: PromptRequestId,
+    deadline: Duration,
+) -> Vec<ResponseChunk> {
+    let source: SharedResponseSource = hub;
+    let mut stream = source.subscribe(id, None).await.expect("subscribe");
+    let mut got = Vec::new();
+    let until = std::time::Instant::now() + deadline;
+    while std::time::Instant::now() < until {
+        let next = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        let Ok(Some(item)) = next else { continue };
+        let ev = item.expect("ok");
+        if let StreamEvent::Chunk(env) = ev {
+            let terminal = env.chunk.is_terminal();
+            got.push(env.chunk);
+            if terminal {
+                return got;
+            }
+        }
+    }
+    got
+}

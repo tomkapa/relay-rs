@@ -2,12 +2,20 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use thiserror::Error;
 
 use crate::provider::{ChatResponse, ToolCall, ToolResult};
 use crate::session::SessionId;
 use crate::types::TurnIndex;
 
 use super::error::HookError;
+
+/// Error type produced by [`HookDecision::into_result`] when a hook denies
+/// the operation. Convertible to [`crate::agent::AgentError`] so callers can
+/// propagate with `?`.
+#[derive(Debug, Error)]
+#[error("hook denied: {0}")]
+pub struct HookDenied(pub String);
 
 /// What a hook decides about an operation it just observed.
 #[derive(Debug, Clone)]
@@ -22,6 +30,15 @@ impl HookDecision {
     #[must_use]
     pub const fn is_continue(&self) -> bool {
         matches!(self, Self::Continue)
+    }
+
+    /// Convert into a `Result` so callers can `?`-propagate denials. `Continue`
+    /// becomes `Ok(())`; `Deny` becomes `Err(HookDenied(reason))`.
+    pub fn into_result(self) -> Result<(), HookDenied> {
+        match self {
+            Self::Continue => Ok(()),
+            Self::Deny { reason } => Err(HookDenied(reason)),
+        }
     }
 }
 
