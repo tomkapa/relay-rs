@@ -55,13 +55,14 @@ use relay_rs::provider::{
 use relay_rs::runtime::queue::PromptQueue as _;
 use relay_rs::runtime::{
     IdempotencyKey, LeaseTiming, NewPromptRequest, PgDagBudget, PgPromptQueue, PgResponseHub,
-    PromptRequestId, RequestStatus, ResponseChunk, SharedDagBudget, SharedResponseSource,
-    StreamEvent, WorkerConfig, WorkerPool, WorkerPoolHandle,
+    PgThreadStream, PromptRequestId, RequestStatus, ResponseChunk, SharedDagBudget,
+    SharedThreadStream, ThreadStreamEvent, WorkerConfig, WorkerPool, WorkerPoolHandle,
 };
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::tools::system::SendMessageTool;
 use relay_rs::tools::{ToolBox, ToolRegistry};
 use relay_rs::types::{ModelId, Participant, Prompt, ToolName};
+use tokio_util::sync::CancellationToken;
 
 mod common;
 use common::pg::TestDb;
@@ -277,6 +278,16 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
     )
     .spawn();
 
+    // Subscribe to the DAG-wide thread stream **before** enqueuing so we
+    // don't race the worker writing the first chunks. Mirrors the production
+    // FE's `/threads/{root}/stream` consumer: chunks published anywhere in
+    // the DAG (root, sub-agent fan-outs, the Coordinator's second-run reply
+    // to the human) fan in here, routed by `prompt_requests.root_request_id`.
+    let thread_stream: SharedThreadStream =
+        PgThreadStream::spawn(db.pool.clone(), CancellationToken::new())
+            .await
+            .expect("spawn thread stream");
+
     // ── The human kicks the conversation off ─────────────────────────────
     let outcome = queue
         .enqueue(NewPromptRequest {
@@ -291,10 +302,12 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         .expect("enqueue root");
     let root_id = outcome.request_id();
 
-    // Subscribe to the root SSE stream and drain until the worker emits a
-    // terminal chunk (the quiescence-Done from step 8). The Coordinator's
-    // human-bound `send_message` lands here as an `AgentMessage` chunk.
-    let chunks = drain_chunks(hub.clone(), root_id, Duration::from_secs(15)).await;
+    // Drain the thread fan-in until the worker publishes the terminal `Done`
+    // on quiescence. AgentMessage chunks (Coordinator → Human, published
+    // mid-turn from the Coordinator's second run) and the terminal Done
+    // both arrive here regardless of which `prompt_request` they were
+    // published on — the fan-in routes by `root_request_id`.
+    let chunks = drain_thread_chunks(thread_stream, root_id, Duration::from_secs(15)).await;
 
     // Final root status should be Done — the human's request was the DAG
     // root; it completed normally.
@@ -369,22 +382,20 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
     workers.shutdown().await;
 }
 
-async fn drain_chunks(
-    hub: Arc<PgResponseHub>,
-    id: PromptRequestId,
+async fn drain_thread_chunks(
+    stream: SharedThreadStream,
+    root: PromptRequestId,
     deadline: Duration,
 ) -> Vec<ResponseChunk> {
-    let source: SharedResponseSource = hub;
-    let mut stream = source.subscribe(id, None).await.expect("subscribe");
+    let mut sub = stream.subscribe(root);
     let mut got = Vec::new();
     let until = std::time::Instant::now() + deadline;
     while std::time::Instant::now() < until {
-        let next = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+        let next = tokio::time::timeout(Duration::from_millis(200), sub.next()).await;
         let Ok(Some(item)) = next else { continue };
-        let ev = item.expect("ok");
-        if let StreamEvent::Chunk(env) = ev {
-            let terminal = env.chunk.is_terminal();
-            got.push(env.chunk);
+        if let Ok(ThreadStreamEvent::Item(envelope)) = item {
+            let terminal = envelope.chunk.is_terminal();
+            got.push(envelope.chunk);
             if terminal {
                 return got;
             }
@@ -392,3 +403,4 @@ async fn drain_chunks(
     }
     got
 }
+

@@ -123,6 +123,40 @@ pub async fn human_to_agent_session(sessions: &dyn SessionStore, agent_id: Agent
         .expect("create human-to-agent session")
 }
 
+/// Insert a stub `prompt_requests` row for a freshly minted session and
+/// return its id. `session_messages.request_id` is `NOT NULL REFERENCES
+/// prompt_requests(id)` — store-level tests that exercise `append` need a
+/// real request id to bind, even though they don't go through the queue.
+///
+/// All optional columns are filled with placeholders; the helper is for
+/// store contract tests, not queue tests.
+pub async fn seed_prompt_request(
+    pool: &PgPool,
+    session: SessionId,
+    agent_id: AgentId,
+) -> PromptRequestId {
+    let id = PromptRequestId::new();
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO prompt_requests
+             (id, session_id, content, idempotency_key, status,
+              sender_kind, receiver_kind, receiver_agent_id, root_request_id,
+              created_at, updated_at)
+         VALUES ($1, $2, 'test', $3, 'pending',
+                 'human', 'agent', $4, $1,
+                 $5, $5)",
+    )
+    .bind(id)
+    .bind(session)
+    .bind(format!("k-{id}"))
+    .bind(agent_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed prompt_request");
+    id
+}
+
 impl Drop for TestDb {
     fn drop(&mut self) {
         let schema = std::mem::take(&mut self.schema);

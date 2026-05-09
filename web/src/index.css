@@ -1,0 +1,130 @@
+@import "tailwindcss";
+
+/* "Field journal terminal" — cream parchment + deep moss + mono everything.
+ * Tokens mirror design.pen but warmed up for a paper-like surface.
+ */
+@theme {
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Funnel Sans", "Geist", ui-sans-serif, sans-serif;
+  --font-mono: "IBM Plex Mono", "Geist Mono", ui-monospace, monospace;
+
+  /* Surfaces */
+  --color-paper: #faf7ee;
+  --color-paper-2: #f4efde;
+  --color-paper-3: #ebe5cf;
+  --color-card: #ffffff;
+  --color-rail: #1a2b1e;
+  --color-rail-2: #2d4d34;
+
+  /* Ink */
+  --color-ink: #1a2b1e;
+  --color-ink-2: #2b4530;
+  --color-muted: #5d6a5d;
+  --color-muted-2: #8b9286;
+
+  /* Lines */
+  --color-line: #d8d2bc;
+  --color-line-2: #c8c2a8;
+  --color-line-strong: #1a2b1e;
+
+  /* Greens */
+  --color-moss: #2d6b3f;
+  --color-moss-deep: #1e4528;
+  --color-moss-soft: #d6e3cd;
+  --color-moss-tint: #e9efd9;
+
+  /* Accents */
+  --color-amber: #b97a2b;
+  --color-amber-soft: #f0e3c4;
+  --color-rose: #b54848;
+  --color-rose-soft: #ecd2c8;
+
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --radius-lg: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-feature-settings:
+    "ss01" on,
+    "cv11" on;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--color-moss-soft);
+  color: var(--color-moss-deep);
+}
+
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-2) transparent;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: var(--color-line-2);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--color-muted-2);
+  background-clip: content-box;
+  border: 2px solid transparent;
+}
+
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.bubble-in {
+  animation: bubble-in 220ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+.caret::after {
+  content: "▍";
+  display: inline-block;
+  margin-left: 2px;
+  animation: caret 1.05s steps(1) infinite;
+  color: var(--color-moss);
+  font-weight: 500;
+}
+
+/* Subtle paper grain overlay. */
+.grain-paper {
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(26, 43, 30, 0.035) 1px, transparent 0),
+    linear-gradient(180deg, transparent 0%, rgba(26, 43, 30, 0.012) 100%);
+  background-size:
+    4px 4px,
+    100% 100%;
+}

@@ -83,3 +83,52 @@ pub const MAX_GET_SESSION_LIMIT: u32 = 200;
 /// Honoured only on the first `send_message` to a new receiver inside a DAG;
 /// subsequent calls drop the field.
 pub const CONTEXT_SUMMARY_MAX_BYTES: usize = 4096;
+
+/// Per-thread broadcast channel buffer for the fan-in DAG stream.
+///
+/// Sized larger than [`MAX_CHUNK_BUFFER_PER_REQUEST`] because a thread fans in
+/// chunks from every request in the DAG; a chatty multi-agent conversation can
+/// quickly outpace a single client. A slow SSE subscriber that exhausts this
+/// buffer receives a `Stalled` event and must reconnect — same pattern the
+/// per-request hub already uses.
+pub const MAX_THREAD_CHUNK_BUFFER: usize = 1024;
+
+/// In-process bound on the directory of live thread broadcast slots.
+///
+/// Same rationale as [`MAX_RESPONSE_SLOTS`](super::pg_response::MAX_RESPONSE_SLOTS):
+/// caps memory growth across a long-lived process. Eviction prefers the
+/// oldest entry with no live receivers.
+pub const MAX_THREAD_SLOTS: usize = 1024;
+
+/// Server-side cap on `GET /threads?limit=`. The default is below this; clients
+/// that ask for more are clamped down. Bounded so a single page never serialises
+/// an unbounded join through the messages table.
+pub const MAX_THREAD_LIST_LIMIT: u32 = 100;
+
+/// Default page size for `GET /threads` when the caller omits `limit=`.
+pub const DEFAULT_THREAD_LIST_LIMIT: u32 = 50;
+
+/// Server-side cap on `GET /threads/{id}/messages?limit=`. The default matches.
+/// Per [doc/backend_plan.md](../../doc/backend_plan.md): "Page size cap: 1000".
+pub const MAX_THREAD_HISTORY_LIMIT: u32 = 1000;
+
+/// Default page size for `GET /threads/{id}/messages`.
+///
+/// Below the cap so a default fetch never serialises the full JSONB body of
+/// every message in a chatty DAG; clients that need more paginate
+/// explicitly.
+pub const DEFAULT_THREAD_HISTORY_LIMIT: u32 = 100;
+
+/// Characters reserved for the `preview` column on a thread list row.
+///
+/// Postgres `LEFT(text, n)` is character-bounded (not byte-bounded), so a
+/// multibyte prompt yields up to `n × 4` bytes; that's still tiny next to
+/// the 64KB prompt cap and matches the Discord-style UI contract.
+pub const THREAD_PREVIEW_MAX_CHARS: u32 = 280;
+
+/// Postgres `LISTEN` channel for the fan-in thread-stream subscriber.
+///
+/// The response hub publishes here on every chunk insert; the fan-in
+/// subscriber attaches once per process. Single shared name; the JSON
+/// payload carries `(request_id, root_request_id, chunk_seq)`.
+pub const THREAD_NOTIFY_CHANNEL: &str = "relay_thread_chunk";

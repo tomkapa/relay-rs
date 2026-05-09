@@ -32,9 +32,9 @@ use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::openai::OpenAiProvider;
 use crate::runtime::{
-    PgDagBudget, PgPromptQueue, PgResponseHub, SharedDagBudget, SharedLeaseManager,
-    SharedPromptQueue, SharedResponseSink, SharedResponseSource, WorkerConfig, WorkerPool,
-    WorkerPoolHandle,
+    PgDagBudget, PgPromptQueue, PgResponseHub, PgThreadStream, SharedDagBudget, SharedLeaseManager,
+    SharedPromptQueue, SharedResponseSink, SharedResponseSource, SharedThreadStream, WorkerConfig,
+    WorkerPool, WorkerPoolHandle,
 };
 use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::system::{self, SystemToolDeps};
@@ -306,6 +306,15 @@ pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
     );
     let workers = pool.spawn();
 
+    // Single-process fan-in subscriber for the chat-UI thread stream. Owns
+    // its own LISTEN connection on the shared pool; tied to the same cancel
+    // token so a top-level shutdown winds the listener task down with the
+    // rest of the runtime.
+    let thread_stream: SharedThreadStream =
+        PgThreadStream::spawn(pieces.pool.clone(), CancellationToken::new())
+            .await
+            .map_err(|source| AppError::DbConnect { source })?;
+
     let state = AppState {
         queue: pieces.queue,
         leases: pieces.leases,
@@ -315,6 +324,8 @@ pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
         dag: pieces.dag,
         mcp_store: pieces.mcp_store,
         mcp_refresh,
+        thread_stream,
+        pool: pieces.pool.clone(),
     };
 
     Ok(Server {

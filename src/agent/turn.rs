@@ -34,6 +34,7 @@ impl Agent {
         counterpart: Participant,
         viewer_as_sender: MessageSender,
         root_request_id: PromptRequestId,
+        request_id: PromptRequestId,
         send_message_calls: &mut usize,
         cancel: &CancellationToken,
         observer: Option<&SharedTurnObserver>,
@@ -60,6 +61,7 @@ impl Agent {
                 viewer_as_sender,
                 counterpart,
                 ChatMessage::Assistant(response.content.clone()),
+                request_id,
             )
             .await?;
 
@@ -82,6 +84,7 @@ impl Agent {
             session_id: ctx.session_id,
             viewer,
             root_request_id,
+            request_id,
         };
         // Counted regardless of tool error — the model already saw the failure
         // via the tool result; the worker's ping-pong guard cares only about
@@ -102,6 +105,7 @@ impl Agent {
                 MessageSender::System,
                 viewer,
                 ChatMessage::User(results.into_iter().map(UserContent::ToolResult).collect()),
+                request_id,
             )
             .await?;
         Ok(None)

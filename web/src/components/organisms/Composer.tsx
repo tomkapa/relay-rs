@@ -1,0 +1,190 @@
+import { useMemo, useRef, useState } from "react";
+import { AtSign, Code, Hash, Paperclip, Send, Smile } from "lucide-react";
+import { Spinner } from "../atoms/Spinner";
+import { TipBar } from "../molecules/TipBar";
+import {
+  MentionInput,
+  firstActiveMentionAgent,
+  type MentionMode,
+} from "../molecules/MentionInput";
+import { cn, insertAtCaret } from "../../lib/utils";
+import type { Agent } from "../../types/api";
+
+export type ComposerSubmit = {
+  content: string;
+  /** First @-tagged agent (channel mode only). Empty in dm/thread modes. */
+  agent_id?: string;
+};
+
+export function Composer({
+  agents,
+  mode,
+  dmAgent,
+  channel,
+  pending,
+  disabled,
+  onSubmit,
+}: {
+  agents: Agent[];
+  /** "channel" → must @-tag. "dm" → auto-route to dmAgent. "thread" → reply to existing session. */
+  mode: MentionMode;
+  /** Required when mode === "dm": the agent the DM targets. */
+  dmAgent?: Agent;
+  channel: string;
+  pending?: boolean;
+  disabled?: boolean;
+  onSubmit: (input: ComposerSubmit) => void;
+}) {
+  const [value, setValue] = useState("");
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const targeted = useMemo(
+    () =>
+      mode === "channel" ? firstActiveMentionAgent(value, agents) : undefined,
+    [mode, value, agents],
+  );
+  const tipExample =
+    agents.find((a) => a.is_default)?.name ?? agents[0]?.name ?? "agent";
+
+  const trimmed = value.trim();
+  const channelBlocked = mode === "channel" && !targeted && trimmed.length > 0;
+
+  const send = () => {
+    if (!trimmed || pending || disabled) return;
+    if (mode === "channel") {
+      if (!targeted) return; // must tag a known agent
+      onSubmit({ content: value.trim(), agent_id: targeted.id });
+    } else if (mode === "dm") {
+      onSubmit({ content: value.trim(), agent_id: dmAgent?.id });
+    } else {
+      // thread: agent_id ignored on existing sessions
+      onSubmit({ content: value.trim() });
+    }
+    setValue("");
+  };
+
+  const insertAt = () => insertAtCaret(taRef, value, setValue, "@");
+
+  const placeholder =
+    mode === "dm" && dmAgent
+      ? `Message ${dmAgent.name} — replies route directly to them`
+      : mode === "thread"
+        ? "Reply… your message stays in this thread"
+        : `Message #${channel} — type @agent-name to route`;
+
+  return (
+    <div className="border-t border-[var(--color-line)] bg-[var(--color-paper)] px-8 pt-3 pb-4">
+      <div className="space-y-2">
+        {mode === "channel" && (
+          <TipBar>
+            <span>
+              <span className="font-semibold">Tip</span> · type{" "}
+              <span className="bg-[var(--color-moss)] px-1 py-px text-white">
+                @{tipExample}
+              </span>{" "}
+              to invoke an agent. Only the first <code>@tag</code> is routed —
+              additional tags render as plain text.
+            </span>
+          </TipBar>
+        )}
+        {mode === "dm" && dmAgent && (
+          <TipBar>
+            <span>
+              <span className="font-semibold">DM</span> · messages here go to{" "}
+              <span className="bg-[var(--color-moss)] px-1 py-px text-white">
+                @{dmAgent.name}
+              </span>{" "}
+              automatically. <code>@tags</code> render as plain text.
+            </span>
+          </TipBar>
+        )}
+
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            send();
+          }}
+          className={cn(
+            "border border-[var(--color-line-strong)] bg-[var(--color-card)] focus-within:ring-2 focus-within:ring-[var(--color-moss)]/15 transition",
+            disabled && "opacity-60",
+          )}
+        >
+          <MentionInput
+            value={value}
+            onChange={setValue}
+            agents={agents}
+            mode={mode}
+            placeholder={placeholder}
+            onSubmit={send}
+            disabled={disabled}
+            textRef={taRef}
+          />
+          <div className="flex items-center gap-1 border-t border-[var(--color-line)] px-2 py-1.5">
+            <ToolBtn label="Attach">
+              <Paperclip className="h-3.5 w-3.5" />
+            </ToolBtn>
+            <ToolBtn label="Emoji">
+              <Smile className="h-3.5 w-3.5" />
+            </ToolBtn>
+            <ToolBtn label="Mention agent" onClick={insertAt}>
+              <AtSign className="h-3.5 w-3.5" />
+            </ToolBtn>
+            <ToolBtn label="Channel">
+              <Hash className="h-3.5 w-3.5" />
+            </ToolBtn>
+            <ToolBtn label="Code block">
+              <Code className="h-3.5 w-3.5" />
+            </ToolBtn>
+            {channelBlocked && (
+              <span className="ml-2 font-[var(--font-mono)] text-[10.5px] text-[var(--color-rose)]">
+                tag an agent (e.g. @{tipExample}) to send
+              </span>
+            )}
+            <button
+              type="submit"
+              disabled={
+                !trimmed ||
+                pending ||
+                disabled ||
+                channelBlocked ||
+                (mode === "dm" && !dmAgent)
+              }
+              className="ml-auto inline-flex h-8 items-center gap-1.5 bg-[var(--color-moss)] px-3 font-[var(--font-mono)] text-[12px] font-semibold text-white hover:bg-[var(--color-moss-deep)] disabled:cursor-not-allowed disabled:opacity-40 transition-colors"
+            >
+              {pending ? (
+                <>
+                  <Spinner size={11} className="text-white" /> sending
+                </>
+              ) : (
+                <>
+                  Send <Send className="h-3 w-3" strokeWidth={2.5} />
+                </>
+              )}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function ToolBtn({
+  label,
+  onClick,
+  children,
+}: {
+  label: string;
+  onClick?: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      onClick={onClick}
+      className="flex h-7 w-7 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)] hover:text-[var(--color-ink)]"
+    >
+      {children}
+    </button>
+  );
+}

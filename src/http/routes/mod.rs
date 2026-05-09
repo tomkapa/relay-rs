@@ -5,6 +5,7 @@
 mod agents;
 mod mcp;
 mod prompts;
+mod threads;
 
 use axum::Router;
 use tower_http::trace::TraceLayer;
@@ -16,6 +17,7 @@ pub fn router(state: AppState) -> Router {
         .merge(prompts::router())
         .merge(agents::router())
         .merge(mcp::router())
+        .merge(threads::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

@@ -13,7 +13,7 @@ use relay_rs::session::{PgSessionStore, SessionError, SessionId, SessionStore};
 use relay_rs::types::{MessageSender, Participant};
 
 mod common;
-use common::pg::{TestDb, human_to_agent_session};
+use common::pg::{TestDb, human_to_agent_session, seed_prompt_request};
 
 fn store(db: &TestDb) -> Arc<PgSessionStore> {
     Arc::new(PgSessionStore::new(db.pool.clone(), SystemClock::shared()))
@@ -26,12 +26,14 @@ async fn create_append_snapshot_roundtrip() {
 
     let agent = Participant::agent(db.default_agent_id);
     let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
     store
         .append(
             id,
             MessageSender::Human,
             agent,
             ChatMessage::User(vec![UserContent::Text("hi".into())]),
+            req,
         )
         .await
         .expect("append");
@@ -41,6 +43,7 @@ async fn create_append_snapshot_roundtrip() {
             MessageSender::Human,
             agent,
             ChatMessage::User(vec![UserContent::Text("again".into())]),
+            req,
         )
         .await
         .expect("append2");
@@ -71,6 +74,7 @@ async fn missing_session_is_not_found() {
             MessageSender::Human,
             viewer,
             ChatMessage::User(vec![UserContent::Text("hi".into())]),
+            PromptRequestId::new(),
         )
         .await
         .expect_err("absent append");
@@ -89,6 +93,7 @@ async fn enforces_message_cap() {
         2,
     ));
     let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
     let agent = Participant::agent(db.default_agent_id);
     for _ in 0..2 {
         store
@@ -97,6 +102,7 @@ async fn enforces_message_cap() {
                 MessageSender::Human,
                 agent,
                 ChatMessage::User(vec![UserContent::Text("x".into())]),
+                req,
             )
             .await
             .expect("under cap");
@@ -107,6 +113,7 @@ async fn enforces_message_cap() {
             MessageSender::Human,
             agent,
             ChatMessage::User(vec![UserContent::Text("over".into())]),
+            req,
         )
         .await
         .expect_err("at cap");
@@ -118,6 +125,7 @@ async fn delete_cascades_messages() {
     let db = TestDb::fresh().await;
     let store = store(&db);
     let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
     let agent = Participant::agent(db.default_agent_id);
     store
         .append(
@@ -125,6 +133,7 @@ async fn delete_cascades_messages() {
             MessageSender::Human,
             agent,
             ChatMessage::User(vec![UserContent::Text("hi".into())]),
+            req,
         )
         .await
         .expect("append");
@@ -172,6 +181,7 @@ async fn snapshot_renders_messages_from_viewer_perspective() {
     let agent = Participant::agent(db.default_agent_id);
 
     let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
     // Human → Agent: text prompt.
     store
         .append(
@@ -179,6 +189,7 @@ async fn snapshot_renders_messages_from_viewer_perspective() {
             MessageSender::Human,
             agent,
             ChatMessage::User(vec![UserContent::Text("ping".into())]),
+            req,
         )
         .await
         .expect("append");
@@ -191,6 +202,7 @@ async fn snapshot_renders_messages_from_viewer_perspective() {
             ChatMessage::Assistant(vec![relay_rs::provider::AssistantContent::Text(
                 "pong".into(),
             )]),
+            req,
         )
         .await
         .expect("append");

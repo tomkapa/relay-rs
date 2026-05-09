@@ -1,0 +1,245 @@
+//! Integration tests for `POST /prompts`.
+//!
+//! Specifically guards the receiver-resolution rule: when the request
+//! carries a `session_id`, the receiver agent must be derived from the
+//! session's existing agent participant — never from the caller-supplied
+//! `agent_id` and never from the seeded default. The previous behavior
+//! defaulted to `agents.default_id()`, which produced
+//! "agent X is not a participant of session Y" once the worker tried to
+//! load history with the wrong viewer (the bug that motivated this test).
+
+#![allow(clippy::expect_used)]
+
+use std::sync::Arc;
+
+use relay_rs::agents::{AgentName, AgentSystemPrompt, NewAgent, PgAgentStore, SharedAgentStore};
+use relay_rs::clock::{SharedClock, SystemClock};
+use relay_rs::http::{AppState, router};
+use relay_rs::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
+use relay_rs::runtime::{
+    IdempotencyKey, NewPromptRequest, PgDagBudget, PgPromptQueue, PgResponseHub, PgThreadStream,
+    SharedDagBudget, SharedLeaseManager, SharedPromptQueue, SharedResponseSink,
+    SharedResponseSource, SharedThreadStream,
+};
+use relay_rs::session::{PgSessionStore, SharedSessionStore};
+use relay_rs::types::{Participant, Prompt};
+use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+mod common;
+use common::pg::TestDb;
+
+struct PromptsHarness {
+    db: TestDb,
+    queue: SharedPromptQueue,
+    agents: SharedAgentStore,
+    state: AppState,
+    #[allow(dead_code)]
+    refresher: McpRefresher,
+}
+
+impl PromptsHarness {
+    async fn new() -> Self {
+        let db = TestDb::fresh().await;
+        let clock: SharedClock = SystemClock::shared();
+        let pool: PgPool = db.pool.clone();
+
+        let queue_impl = Arc::new(PgPromptQueue::new(pool.clone(), clock.clone()));
+        let queue: SharedPromptQueue = queue_impl.clone();
+        let leases: SharedLeaseManager = queue_impl;
+
+        let hub = Arc::new(PgResponseHub::new(pool.clone(), clock.clone()));
+        let _sink: SharedResponseSink = hub.clone();
+        let responses: SharedResponseSource = hub;
+
+        let sessions: SharedSessionStore =
+            Arc::new(PgSessionStore::new(pool.clone(), clock.clone()));
+        let agents: SharedAgentStore = Arc::new(PgAgentStore::new(pool.clone(), clock.clone()));
+        let dag: SharedDagBudget = Arc::new(PgDagBudget::new(pool.clone()));
+
+        let mcp_store: SharedMcpServerStore =
+            Arc::new(PgMcpServerStore::new(pool.clone(), clock.clone()));
+        let mcp_registry = McpRegistry::new(mcp_store.clone(), clock.clone());
+        let (refresher, mcp_refresh) = McpRefresher::spawn(mcp_registry);
+
+        let thread_stream: SharedThreadStream =
+            PgThreadStream::spawn(pool.clone(), CancellationToken::new())
+                .await
+                .expect("spawn thread stream");
+
+        let state = AppState {
+            queue: queue.clone(),
+            leases,
+            responses,
+            sessions,
+            agents: agents.clone(),
+            dag,
+            mcp_store,
+            mcp_refresh,
+            thread_stream,
+            pool,
+        };
+
+        Self {
+            db,
+            queue,
+            agents,
+            state,
+            refresher,
+        }
+    }
+
+    async fn create_agent(&self, name: &str) -> relay_rs::agents::AgentId {
+        self.agents
+            .create(NewAgent {
+                name: AgentName::try_from(name).expect("name"),
+                system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
+                is_default: false,
+            })
+            .await
+            .expect("create agent")
+            .id
+    }
+}
+
+async fn post_json(
+    state: AppState,
+    uri: &str,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    let app = router(state);
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("collect");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    (status, json)
+}
+
+/// Regression: posting a follow-up to an existing session must enqueue
+/// against the session's agent participant, not the system default.
+/// Previously the route blindly fell back to `agents.default_id()`, the
+/// worker rejected the prompt with
+/// `agent X is not a participant of session Y`, and the run errored out.
+#[tokio::test(flavor = "multi_thread")]
+async fn followup_with_session_id_routes_to_session_agent() {
+    let h = PromptsHarness::new().await;
+
+    // The session is bound to a non-default agent — exactly the DM scenario
+    // that exposed the bug ("when I reply thread in thread detail in direct
+    // message"). The default agent is the seeded one; `translator` is what
+    // the user is talking to.
+    let translator = h.create_agent("translator").await;
+
+    // Open the session with a Human → translator root prompt.
+    let root = h
+        .queue
+        .enqueue(NewPromptRequest {
+            session: None,
+            sender: Participant::Human,
+            receiver_agent_id: translator,
+            parent_session: None,
+            content: Prompt::try_from("hi").expect("prompt"),
+            idempotency_key: IdempotencyKey::try_from("k-root").expect("key"),
+        })
+        .await
+        .expect("enqueue root");
+    let session_id = root.session();
+
+    // Follow-up: no `agent_id`. Pre-fix, this defaulted to the seeded
+    // `test-default` agent — wrong receiver, wrong-participant error.
+    let (status, body) = post_json(
+        h.state.clone(),
+        "/prompts",
+        serde_json::json!({
+            "session_id": session_id.as_uuid(),
+            "content": "follow-up",
+            "idempotency_key": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let request_id_str = body["request_id"].as_str().expect("request_id");
+
+    // Confirm the persisted row has receiver = translator, NOT the default.
+    let row: (Uuid,) =
+        sqlx::query_as("SELECT receiver_agent_id FROM prompt_requests WHERE id = $1::uuid")
+            .bind(request_id_str)
+            .fetch_one(&h.db.pool)
+            .await
+            .expect("fetch new row");
+    assert_eq!(
+        row.0,
+        translator.as_uuid(),
+        "follow-up should route to the session's translator, not the seeded default {}",
+        h.db.default_agent_id.as_uuid(),
+    );
+
+    // Sanity: a follow-up that *also* names a different agent_id is still
+    // routed to the session's participant — the route must not honour a
+    // mismatched override.
+    let (status, body) = post_json(
+        h.state.clone(),
+        "/prompts",
+        serde_json::json!({
+            "session_id": session_id.as_uuid(),
+            "agent_id": h.db.default_agent_id.as_uuid(),
+            "content": "follow-up 2",
+            "idempotency_key": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let request_id_str = body["request_id"].as_str().expect("request_id");
+    let row: (Uuid,) =
+        sqlx::query_as("SELECT receiver_agent_id FROM prompt_requests WHERE id = $1::uuid")
+            .bind(request_id_str)
+            .fetch_one(&h.db.pool)
+            .await
+            .expect("fetch new row");
+    assert_eq!(
+        row.0,
+        translator.as_uuid(),
+        "client-supplied agent_id must be ignored when session_id is set",
+    );
+}
+
+/// New session with no `agent_id` falls back to the seeded default — the
+/// only path the legacy behavior is still correct on.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_session_without_agent_id_uses_default() {
+    let h = PromptsHarness::new().await;
+
+    let (status, body) = post_json(
+        h.state.clone(),
+        "/prompts",
+        serde_json::json!({
+            "content": "first hello",
+            "idempotency_key": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    let request_id_str = body["request_id"].as_str().expect("request_id");
+
+    let row: (Uuid,) =
+        sqlx::query_as("SELECT receiver_agent_id FROM prompt_requests WHERE id = $1::uuid")
+            .bind(request_id_str)
+            .fetch_one(&h.db.pool)
+            .await
+            .expect("fetch new row");
+    assert_eq!(row.0, h.db.default_agent_id.as_uuid());
+}

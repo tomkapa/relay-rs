@@ -10,6 +10,7 @@ pub mod error;
 pub mod limits;
 pub mod pg_queue;
 pub mod pg_response;
+pub mod pg_thread_stream;
 pub mod queue;
 pub mod response;
 pub mod types;
@@ -18,13 +19,19 @@ pub mod worker;
 pub use dag::{BudgetBumped, DagBudget, PgDagBudget, SharedDagBudget};
 pub use error::{LeaseTimingError, PromptError, ResponseError};
 pub use limits::{
-    CANCEL_POLL_INTERVAL, CONTEXT_SUMMARY_MAX_BYTES, LEASE_HEARTBEAT_INTERVAL, LEASE_TTL,
-    MAX_ATTEMPTS, MAX_CHUNK_BUFFER_PER_REQUEST, MAX_DAG_TURNS, MAX_GET_SESSION_LIMIT,
-    MAX_PENDING_PER_SESSION, MAX_PINGPONG_RETRIES, MAX_PROMPT_BYTES, MAX_TURN_DURATION,
-    MAX_WORKERS,
+    CANCEL_POLL_INTERVAL, CONTEXT_SUMMARY_MAX_BYTES, DEFAULT_THREAD_HISTORY_LIMIT,
+    DEFAULT_THREAD_LIST_LIMIT, LEASE_HEARTBEAT_INTERVAL, LEASE_TTL, MAX_ATTEMPTS,
+    MAX_CHUNK_BUFFER_PER_REQUEST, MAX_DAG_TURNS, MAX_GET_SESSION_LIMIT, MAX_PENDING_PER_SESSION,
+    MAX_PINGPONG_RETRIES, MAX_PROMPT_BYTES, MAX_THREAD_CHUNK_BUFFER, MAX_THREAD_HISTORY_LIMIT,
+    MAX_THREAD_LIST_LIMIT, MAX_THREAD_SLOTS, MAX_TURN_DURATION, MAX_WORKERS, THREAD_NOTIFY_CHANNEL,
+    THREAD_PREVIEW_MAX_CHARS,
 };
 pub use pg_queue::PgPromptQueue;
 pub use pg_response::PgResponseHub;
+pub use pg_thread_stream::{
+    PgThreadStream, SharedThreadStream, ThreadStream, ThreadStreamError, ThreadStreamEvent,
+    ThreadStreamItem,
+};
 pub use queue::{
     ClaimReceipt, ClaimedPrompt, ClaimedSession, EnqueueOutcome, LeaseManager, LeaseTiming,
     LeaseToken, NewPromptRequest, PromptQueue, RequestStatusView, SharedLeaseManager,

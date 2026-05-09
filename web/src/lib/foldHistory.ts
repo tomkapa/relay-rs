@@ -1,0 +1,255 @@
+// One bubble per `send_message` invocation plus one per follow-up human
+// row. Reasoning and non-`send_message` tool calls collapse under the
+// next agent delivery as meta. Plain assistant `text` and matching
+// tool_results are worker-internals and stay hidden.
+
+import { decodeBody } from "./chatBody";
+import type {
+  Agent,
+  ThreadMessage,
+  ToolCallEntry,
+  Participant,
+} from "../types/api";
+
+const SEND_MESSAGE = "send_message";
+
+type ReceiverInput =
+  | { kind: "human" }
+  | { kind: "agent"; agent_id: string };
+
+type SendMessageInput = {
+  content: string;
+  receiver?: ReceiverInput;
+  context_summary?: string;
+};
+
+/** Lifecycle phase of a bubble in the merged view. Persisted bubbles win
+ *  over streaming, which win over optimistic — see useThreadView. */
+export type BubblePhase = "persisted" | "streaming" | "optimistic";
+
+export type Bubble = {
+  kind: "agent" | "human";
+  /** React key — unique across the merged view. */
+  key: string;
+  /** Identity for cross-phase dedup. Persisted, streaming, and optimistic
+   *  bubbles that share a request_id refer to the same logical message. */
+  request_id: string;
+  agent_id: string | null;
+  /** Resolved at fold time so the renderer doesn't need to look up agents. */
+  agent_name: string | null;
+  /** Display name + id for human bubbles. */
+  human_name: string | null;
+  human_id: string | null;
+  ts: string;
+  text: string;
+  reasoning: string;
+  tool_calls: ToolCallEntry[];
+  phase: BubblePhase;
+};
+
+export type RootMessage = {
+  name: string;
+  id: string;
+  ts: string;
+  text: string;
+};
+
+export type FoldedHistory = {
+  /** Root post — the first human row in the thread, rendered above the
+   *  reply list. `undefined` until history loads. */
+  rootMessage: RootMessage | undefined;
+  /** Persisted bubbles in fold order (which is also row order). */
+  bubbles: Bubble[];
+};
+
+type Pending = {
+  reasoning: string;
+  tool_calls: ToolCallEntry[];
+};
+
+const newPending = (): Pending => ({ reasoning: "", tool_calls: [] });
+
+export function foldHistory(
+  history: ThreadMessage[],
+  agents: Agent[],
+  poster: { name: string; id: string },
+): FoldedHistory {
+  const agentsById = new Map(agents.map((a) => [a.id, a]));
+  const bubbles: Bubble[] = [];
+  // Per-(session, agent) accumulator — reasoning + non-send_message tool
+  // calls observed since this agent's last delivery in this session.
+  const pending = new Map<string, Pending>();
+  // Most recent agent bubble per (session, agent). Reasoning rows that land
+  // *after* a delivery but before the next one are post-delivery reflection
+  // — attach back to the bubble that just shipped.
+  const lastBubble = new Map<string, Bubble>();
+  // Per-session tool index for tool_result lookups; system rows carry the
+  // results but not the original caller's identity.
+  const indexBySession = new Map<string, Map<string, ToolCallEntry>>();
+  // send_message tool calls are conversation plumbing; their tool_results
+  // are private and never decorate a bubble.
+  const sendMessageCallIds = new Set<string>();
+
+  let rootMessage: RootMessage | undefined;
+
+  const sessionAgentKey = (session: string, agent: string | null) =>
+    `${session}|${agent ?? ""}`;
+  const getPending = (k: string): Pending => {
+    let p = pending.get(k);
+    if (!p) {
+      p = newPending();
+      pending.set(k, p);
+    }
+    return p;
+  };
+  const getIndex = (sid: string): Map<string, ToolCallEntry> => {
+    let i = indexBySession.get(sid);
+    if (!i) {
+      i = new Map();
+      indexBySession.set(sid, i);
+    }
+    return i;
+  };
+
+  for (const m of history) {
+    const decoded = decodeBody(m.body);
+
+    if (m.sender.kind === "agent") {
+      const aid = m.sender.agent_id ?? null;
+      const k = sessionAgentKey(m.session_id, aid);
+      const p = getPending(k);
+      const idx = getIndex(m.session_id);
+
+      const sendCalls = decoded.toolCalls.filter(
+        (tc) => tc.name === SEND_MESSAGE,
+      );
+      const realCalls = decoded.toolCalls.filter(
+        (tc) => tc.name !== SEND_MESSAGE,
+      );
+
+      for (const tc of realCalls) {
+        const entry: ToolCallEntry = {
+          call_id: tc.id,
+          name: tc.name,
+          input: tc.input,
+          status: "running",
+        };
+        p.tool_calls.push(entry);
+        idx.set(tc.id, entry);
+      }
+
+      if (sendCalls.length > 0) {
+        // This row delivers the agent's accumulated work. Its own reasoning
+        // belongs to the same turn that produced the send_message and joins
+        // pending.reasoning in the new bubble.
+        const reasoning = joinText(p.reasoning, decoded.reasoning);
+        const tools = p.tool_calls;
+        for (const tc of sendCalls) {
+          sendMessageCallIds.add(tc.id);
+          const input = (tc.input ?? {}) as SendMessageInput;
+          const recv = input.receiver ?? null;
+          const a = aid ? (agentsById.get(aid) ?? null) : null;
+          const bubble: Bubble = {
+            kind: "agent",
+            key: `h:${m.session_id}:${m.seq}:${tc.id}`,
+            request_id: m.request_id,
+            agent_id: aid,
+            agent_name: a?.name ?? null,
+            human_name: null,
+            human_id: null,
+            ts: m.created_at,
+            text: prefixWithReceiver(input.content ?? "", recv, agentsById),
+            reasoning,
+            tool_calls: tools,
+            phase: "persisted",
+          };
+          bubbles.push(bubble);
+          lastBubble.set(k, bubble);
+        }
+        pending.set(k, newPending());
+      } else if (decoded.reasoning) {
+        // No send in this row. If the agent already shipped a bubble in this
+        // session and pending has no in-flight tool calls, the reasoning is
+        // post-delivery reflection — attach back to that bubble. Otherwise it
+        // leads into the next send_message and stays in pending.
+        const lb = lastBubble.get(k);
+        if (lb && p.tool_calls.length === 0) {
+          lb.reasoning = joinText(lb.reasoning, decoded.reasoning);
+        } else {
+          p.reasoning = joinText(p.reasoning, decoded.reasoning);
+        }
+      }
+
+      // Inline tool_results (rare — results normally arrive via a system row).
+      attachResults(idx, decoded.toolResults, sendMessageCallIds);
+    } else if (m.sender.kind === "system") {
+      const idx = indexBySession.get(m.session_id);
+      if (idx) attachResults(idx, decoded.toolResults, sendMessageCallIds);
+    } else if (m.sender.kind === "human") {
+      // First human row is the thread root — rendered separately in the
+      // panel header. Subsequent human rows are follow-ups in the thread.
+      if (!rootMessage) {
+        rootMessage = {
+          name: poster.name,
+          id: poster.id,
+          ts: m.created_at,
+          text: prefixWithReceiver(decoded.text, receiverFrom(m.receiver), agentsById),
+        };
+      } else if (decoded.text) {
+        const recv = receiverFrom(m.receiver);
+        bubbles.push({
+          kind: "human",
+          key: `h:${m.session_id}:${m.seq}:user`,
+          request_id: m.request_id,
+          agent_id: null,
+          agent_name: null,
+          human_name: poster.name,
+          human_id: poster.id,
+          ts: m.created_at,
+          text: prefixWithReceiver(decoded.text, recv, agentsById),
+          reasoning: "",
+          tool_calls: [],
+          phase: "persisted",
+        });
+      }
+    }
+  }
+
+  return { rootMessage, bubbles };
+}
+
+function receiverFrom(p: Participant): ReceiverInput | null {
+  return p.kind === "agent" ? { kind: "agent", agent_id: p.agent_id } : null;
+}
+
+function attachResults(
+  idx: Map<string, ToolCallEntry>,
+  results: { call_id: string; output: string; is_error?: boolean }[],
+  drop: Set<string>,
+): void {
+  for (const tr of results) {
+    if (drop.has(tr.call_id)) continue;
+    const e = idx.get(tr.call_id);
+    if (!e) continue;
+    e.output = tr.output;
+    e.is_error = tr.is_error;
+    e.status = tr.is_error ? "error" : "ok";
+  }
+}
+
+function prefixWithReceiver(
+  content: string,
+  receiver: ReceiverInput | null,
+  agentsById: ReadonlyMap<string, Agent>,
+): string {
+  if (!receiver || receiver.kind === "human") return content;
+  const name = agentsById.get(receiver.agent_id)?.name;
+  if (!name || content.startsWith(`@${name}`)) return content;
+  return `@${name} ${content}`;
+}
+
+function joinText(a: string, b: string): string {
+  if (!a) return b;
+  if (!b) return a;
+  return `${a}\n${b}`;
+}

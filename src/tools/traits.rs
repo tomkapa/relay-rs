@@ -58,6 +58,14 @@ pub struct ToolCallContext {
     /// DAG anchor for the conversation tree this turn belongs to. Used by
     /// `send_message` to upsert sibling sessions and bump the budget.
     pub root_request_id: PromptRequestId,
+    /// The current claim's prompt request id — i.e. the row whose SSE sink
+    /// is open right now. Used by `send_message` to publish
+    /// `AgentMessage` chunks where the human is actually listening, instead
+    /// of `root_request_id` (which can point at a long-since-quiesced
+    /// prompt's closed sink on follow-up turns in a continuing thread).
+    /// Postgres `LISTEN/NOTIFY` then routes the chunk by
+    /// `prompt_requests.root_request_id` to the right thread fan-in.
+    pub request_id: PromptRequestId,
 }
 
 /// A side-effecting capability the model can request.

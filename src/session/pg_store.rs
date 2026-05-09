@@ -141,8 +141,9 @@ impl SessionStore for PgSessionStore {
         sender: MessageSender,
         receiver: Participant,
         message: ChatMessage,
+        request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
-        append_row(self, id, sender, receiver, message).await
+        append_row(self, id, sender, receiver, message, request_id).await
     }
 
     #[tracing::instrument(
@@ -158,13 +159,14 @@ impl SessionStore for PgSessionStore {
         id: SessionId,
         receiver: Participant,
         note: String,
+        request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
         // The system note is stored as a single-text user content block
         // so the viewer-mapped snapshot folds it into the receiver's
         // prompt as user-side context — exactly how a system reminder
         // renders to the model.
         let body = ChatMessage::User(vec![UserContent::Text(note)]);
-        append_row(self, id, MessageSender::System, receiver, body).await
+        append_row(self, id, MessageSender::System, receiver, body, request_id).await
     }
 
     // TODO: revisit when we need tuning prompt, currently we attach
@@ -434,6 +436,7 @@ async fn append_row(
     sender: MessageSender,
     receiver: Participant,
     message: ChatMessage,
+    request_id: PromptRequestId,
 ) -> Result<(), SessionError> {
     let now = store.now();
     let body = serde_json::to_value(&message).map_err(|e| {
@@ -459,8 +462,8 @@ async fn append_row(
                  (session_id, seq,
                   sender_kind, sender_agent_id,
                   receiver_kind, receiver_agent_id,
-                  body, created_at)
-             SELECT $1, stats.next_seq, $3, $4, $5, $6, $7, $8
+                  body, created_at, request_id)
+             SELECT $1, stats.next_seq, $3, $4, $5, $6, $7, $8, $9
              FROM stats
              WHERE stats.row_count < $2
                AND EXISTS (SELECT 1 FROM locked)
@@ -480,6 +483,7 @@ async fn append_row(
     .bind(receiver.agent_id())
     .bind(body)
     .bind(now)
+    .bind(request_id)
     .fetch_optional(&store.pool)
     .await
     .map_err(map_agent_fk)?;

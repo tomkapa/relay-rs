@@ -29,7 +29,7 @@ use tracing::warn;
 use crate::clock::SharedClock;
 
 use super::error::ResponseError;
-use super::limits::MAX_CHUNK_BUFFER_PER_REQUEST;
+use super::limits::{MAX_CHUNK_BUFFER_PER_REQUEST, THREAD_NOTIFY_CHANNEL};
 use super::response::{
     RequestStream, ResponseChunk, ResponseChunkEnvelope, ResponseSink, ResponseSource, StreamEvent,
 };
@@ -237,10 +237,28 @@ impl ResponseSink for PgResponseHub {
             .map(ChunkSeq::from)
             .expect("invariant: post-bump next_seq is at least 1");
 
+        // Fan-in NOTIFY for the DAG thread stream is folded into the chunk
+        // INSERT so each publish is one round-trip. The CTE inserts the row,
+        // joins through `prompt_requests` to resolve `root_request_id`, and
+        // emits `pg_notify` carrying only routing metadata — the chunk
+        // payload stays in `prompt_response_chunks` so subscribers can
+        // re-read it (and we don't bump up against the 8000-byte NOTIFY
+        // payload ceiling on large tool results).
         sqlx::query(
-            "INSERT INTO prompt_response_chunks
-                 (request_id, seq, payload, bytes, is_terminal, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "WITH ins AS (
+                INSERT INTO prompt_response_chunks
+                    (request_id, seq, payload, bytes, is_terminal, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING request_id, seq
+             )
+             SELECT pg_notify($7,
+                json_build_object(
+                    'request_id', pr.id,
+                    'root_request_id', pr.root_request_id,
+                    'chunk_seq', ins.seq
+                )::text)
+             FROM ins
+             JOIN prompt_requests pr ON pr.id = ins.request_id",
         )
         .bind(request_id)
         .bind(assigned)
@@ -248,6 +266,7 @@ impl ResponseSink for PgResponseHub {
         .bind(bytes)
         .bind(terminal)
         .bind(now)
+        .bind(THREAD_NOTIFY_CHANNEL)
         .execute(&mut *tx)
         .await?;
 

@@ -7,6 +7,7 @@ use crate::clock::SharedClock;
 use crate::hook::{HookChain, TurnContext};
 use crate::memory::SharedMemory;
 use crate::provider::{ChatMessage, SharedProvider, UserContent};
+use crate::runtime::PromptRequestId;
 use crate::session::{SessionError, SessionId, SharedSessionStore};
 use crate::tools::ToolBox;
 use crate::types::{
@@ -128,11 +129,12 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         prompts: Vec<Prompt>,
+        request_id: PromptRequestId,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
         let result = self
-            .reply_inner(session, viewer, prompts, cancel, observer)
+            .reply_inner(session, viewer, prompts, request_id, cancel, observer)
             .await;
         record_reply(&result);
         result
@@ -143,6 +145,7 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         prompts: Vec<Prompt>,
+        request_id: PromptRequestId,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
@@ -161,10 +164,11 @@ impl Agent {
                 MessageSender::from_participant(counterpart),
                 viewer,
                 ChatMessage::User(user_blocks),
+                request_id,
             )
             .await?;
 
-        self.run_loop(session, viewer, counterpart, cancel, observer)
+        self.run_loop(session, viewer, counterpart, request_id, cancel, observer)
             .await
     }
 
@@ -188,12 +192,13 @@ impl Agent {
         &self,
         session: SessionId,
         viewer: Participant,
+        request_id: PromptRequestId,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
         let counterpart = self.counterpart(session, viewer).await?;
         let result = self
-            .run_loop(session, viewer, counterpart, cancel, observer)
+            .run_loop(session, viewer, counterpart, request_id, cancel, observer)
             .await;
         record_reply(&result);
         result
@@ -204,6 +209,7 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         counterpart: Participant,
+        request_id: PromptRequestId,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
@@ -240,6 +246,7 @@ impl Agent {
                     counterpart,
                     viewer_as_sender,
                     root_request_id,
+                    request_id,
                     &mut send_message_calls,
                     &cancel,
                     observer,

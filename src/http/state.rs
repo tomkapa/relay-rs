@@ -1,7 +1,10 @@
+use sqlx::PgPool;
+
 use crate::agents::SharedAgentStore;
 use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore};
 use crate::runtime::{
     SharedDagBudget, SharedLeaseManager, SharedPromptQueue, SharedResponseSource,
+    SharedThreadStream,
 };
 use crate::session::SharedSessionStore;
 
@@ -23,4 +26,12 @@ pub struct AppState {
     /// Send-half of the MCP refresh signal. Cheap to clone; CRUD handlers fire it
     /// after every write. The owning coordinator task lives on [`Server`].
     pub mcp_refresh: McpRefreshTrigger,
+    /// Fan-in DAG stream — `GET /threads/{id}/stream` subscribes here. The
+    /// owning task is held by [`Server`]; this handle is cheap to clone.
+    pub thread_stream: SharedThreadStream,
+    /// Shared connection pool for threads-route SQL (channel feed + thread
+    /// history). The trait surface for those queries is small enough to keep
+    /// inline in the route module rather than spinning up another store
+    /// abstraction; this field is the seam.
+    pub pool: PgPool,
 }

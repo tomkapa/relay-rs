@@ -1,45 +1,38 @@
 //! Prompt and request endpoints:
 //! * `POST /prompts` — submit a prompt; creates a session lazily on first call
 //! * `POST /requests/{id}/cancel` — request cancellation
-//! * `GET  /requests/{id}/stream` — SSE stream of response chunks
 //!
 //! Sessions are created lazily by the queue: the first POST without a
 //! `session_id` mints a new conversation; subsequent POSTs pass the
 //! `session_id` returned from the response. There is no separate
 //! `POST /sessions` — that intermediate step is gone with the multi-agent
 //! schema (see `migrations/00000000000004_multi_agent_comm.up.sql`).
-
-use std::convert::Infallible;
-use std::time::Duration;
+//!
+//! Per-request SSE (`GET /requests/{id}/stream`) is gone — the chat UI uses
+//! the DAG-wide stream at `GET /threads/{root}/stream`. See
+//! `doc/backend_plan.md` for the rationale.
 
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{get, post};
-use futures::stream::{Stream, StreamExt};
+use axum::http::StatusCode;
+use axum::routing::post;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::agents::AgentId;
 use crate::runtime::{
-    ChunkSeq, EnqueueOutcome, IdempotencyKey, NewPromptRequest, PromptRequestId, RequestStatus,
-    ResponseChunk, StreamEvent,
+    EnqueueOutcome, IdempotencyKey, NewPromptRequest, PromptRequestId, RequestStatus,
 };
 use crate::session::SessionId;
-use crate::types::{Participant, Prompt};
+use crate::types::{Participant, ParticipantKind, Prompt};
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
 
-const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
-
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/prompts", post(submit_prompt))
-        .route("/requests/{id}/stream", get(stream_request))
         .route("/requests/{id}/cancel", post(cancel_request))
 }
 
@@ -73,9 +66,19 @@ async fn submit_prompt(
     let idempotency_key = IdempotencyKey::try_from(payload.idempotency_key)
         .map_err(|e| HttpError::BadRequest(e.to_string()))?;
 
-    let receiver_agent_id = match payload.agent_id {
-        Some(id) => id,
-        None => state.agents.default_id().await?,
+    // Resolve the receiver agent. Continuing an existing session must always
+    // route to that session's agent participant — the worker rejects a
+    // prompt whose receiver isn't a participant of the named session
+    // ("agent X is not a participant of session Y"). This keeps the comment
+    // on `SubmitPromptRequest::agent_id` honest: when `session_id` is set,
+    // any caller-supplied `agent_id` is ignored. Only fresh sessions consult
+    // the request payload (or fall back to the seeded default).
+    let receiver_agent_id = match payload.session_id {
+        Some(session_id) => session_agent_participant(&state, session_id).await?,
+        None => match payload.agent_id {
+            Some(id) => id,
+            None => state.agents.default_id().await?,
+        },
     };
 
     let outcome = state
@@ -104,6 +107,22 @@ async fn submit_prompt(
     ))
 }
 
+/// Read the agent participant of `session_id`. Human-rooted DAGs always
+/// have exactly one Human and one Agent participant; an unexpected pair
+/// (Agent-Agent or Human-Human) would be a backend invariant violation
+/// for a human-rooted thread, and surfaces as `Internal`.
+async fn session_agent_participant(
+    state: &AppState,
+    session_id: SessionId,
+) -> Result<AgentId, HttpError> {
+    let (a, b) = state.sessions.participants(session_id).await?;
+    match (a.kind(), b.kind()) {
+        (ParticipantKind::Agent, _) => Ok(a.agent_id().expect("invariant: agent kind has id")),
+        (_, ParticipantKind::Agent) => Ok(b.agent_id().expect("invariant: agent kind has id")),
+        _ => Err(HttpError::Internal),
+    }
+}
+
 async fn cancel_request(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -111,56 +130,4 @@ async fn cancel_request(
     let request_id = PromptRequestId::from(id);
     state.queue.request_cancellation(request_id).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-async fn stream_request(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, HttpError> {
-    let request_id = PromptRequestId::from(id);
-    let since = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(ChunkSeq::from);
-
-    let inner = state.responses.subscribe(request_id, since).await?;
-    let stream = inner.map(|item| {
-        let event = match item {
-            Ok(StreamEvent::Chunk(env)) => chunk_to_sse(env.seq, &env.chunk),
-            Ok(StreamEvent::Stalled) => stalled_event(),
-            Err(e) => {
-                warn!(error = %e, "sse.stream.error");
-                error_event(&e.to_string())
-            }
-        };
-        Ok::<_, Infallible>(event)
-    });
-
-    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL)))
-}
-
-fn chunk_to_sse(seq: ChunkSeq, chunk: &ResponseChunk) -> Event {
-    // Wire format and `event:` name both come from the chunk type itself — see
-    // `ResponseChunk` in `runtime/response.rs`.
-    let body = serde_json::to_string(chunk)
-        .expect("invariant: ResponseChunk's Serialize impl is total over closed enum");
-    Event::default()
-        .id(seq.get().to_string())
-        .event(chunk.event_kind())
-        .data(body)
-}
-
-fn stalled_event() -> Event {
-    chunk_to_sse(ChunkSeq::ZERO, &ResponseChunk::Stalled)
-}
-
-fn error_event(message: &str) -> Event {
-    chunk_to_sse(
-        ChunkSeq::ZERO,
-        &ResponseChunk::Error {
-            reason: message.into(),
-        },
-    )
 }

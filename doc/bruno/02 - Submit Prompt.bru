@@ -1,5 +1,5 @@
 meta {
-  name: POST /prompts — submit a prompt
+  name: POST /prompts — submit a prompt (lazily creates session)
   type: http
   seq: 2
 }
@@ -17,10 +17,25 @@ headers {
 
 body:json {
   {
-    "session_id": "{{session_id}}",
     "content": "Hello, who are you?",
     "idempotency_key": "{{idempotency_key}}"
   }
+}
+
+docs {
+  Sessions are created lazily by the queue. Omit `session_id` on the first
+  prompt — the server mints a fresh session bound to the default agent and
+  returns its id. Follow-ups on the same conversation pass that
+  `session_id` back in.
+
+  The `request_id` returned by the first prompt is also the DAG **root**:
+  the chat UI uses it as the path on `GET /threads/{id}/messages` and
+  `GET /threads/{id}/stream`. The post-response script saves it as
+  `root_request_id` so subsequent thread requests can pick it up.
+
+  To target a specific agent (instead of the default), add
+  `"agent_id": "<uuid>"` to the body — see "12 - Create Agent" for how to
+  mint one.
 }
 
 script:pre-request {
@@ -34,6 +49,9 @@ script:pre-request {
 script:post-response {
   const json = res.getBody();
   bru.setVar("request_id", json.request_id);
+  bru.setVar("session_id", json.session_id);
+  // First prompt's request_id is the DAG root that thread routes key off.
+  bru.setVar("root_request_id", json.request_id);
 }
 
 tests {
@@ -41,8 +59,9 @@ tests {
     expect([200, 202]).to.include(res.status);
   });
 
-  test("request_id present", function() {
+  test("request_id and session_id present", function() {
     const json = res.getBody();
     expect(json.request_id).to.be.a("string");
+    expect(json.session_id).to.be.a("string");
   });
 }

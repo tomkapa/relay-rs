@@ -55,16 +55,24 @@ docs {
   The seeded default agent serves as the coordinator. No mutation of
   the default; nothing else in this collection breaks.
 
-  ## What you'll see on `04 - SSE Stream.bru`
+  ## What you'll see on `04 - Thread Stream.bru`
 
-  Open it after this request returns and click Send to watch a single
-  SSE stream:
+  Open it after this request returns and click Send to watch the
+  DAG-wide SSE fan-in:
    - `tool_call` + `tool_result` chunks from the default agent's first
      turn (it calls `send_message` to delegate to the Translator),
+   - `text` / `tool_call` / `tool_result` chunks from the Translator's
+     own turn (a child request inside the same DAG — the fan-in
+     subscriber demuxes both onto one stream),
    - one `agent_message` chunk authored by the default agent carrying
      the translation back to the human (the `send_message(Human, ...)`
      delivery — step 6 of the design),
-   - terminal `done` chunk when the DAG drains (step 8).
+   - terminal `done` chunk when the DAG drains (step 8). The handler
+     closes the SSE connection after forwarding it.
+
+  See also `17 - List Threads.bru` (channel feed) and
+  `18 - Thread Messages.bru` (flat history of every session in this
+  DAG, useful for refetch-and-dedupe on reconnect).
 
   ## Failure modes
 
@@ -126,15 +134,15 @@ script:post-response {
   const json = res.getBody();
   bru.setVar("request_id", json.request_id);
   bru.setVar("session_id", json.session_id);
-  // Reset SSE replay cursor so '04 - SSE Stream' streams from chunk 0.
-  bru.setVar("last_event_id", "0");
+  // First prompt's request_id is the DAG root; thread routes key off it.
+  bru.setVar("root_request_id", json.request_id);
 
   console.log(
     "Multi-agent run kicked off:\n" +
       "  request_id (== DAG root) = " + json.request_id + "\n" +
       "  session_id (human↔agent) = " + json.session_id + "\n" +
       "  translator_id            = " + bru.getVar("translator_id") + "\n" +
-      "→ Open '04 - SSE Stream.bru' and click Send to watch the conversation."
+      "→ Open '04 - Thread Stream.bru' and click Send to watch the conversation."
   );
 }
 

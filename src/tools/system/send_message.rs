@@ -14,11 +14,15 @@
 //! 3. If the session was freshly minted *and* `context_summary` is set,
 //!    append a `system`-kind opening row recording the framing — this is
 //!    what the receiver sees as user-side context on its first turn.
-//! 4. For Human receivers, append the outbound message (sender = caller,
-//!    receiver = the addressee). For Agent receivers, skip this append:
-//!    the worker's `agent.reply` re-appends the prompt when it claims the
-//!    queued row, and a double-append would split the assistant
-//!    `tool_calls` from the matching `tool_result` on the wire payload.
+//! 4. For Human receivers in a *different* session (e.g. a descendant agent
+//!    first reaching the human), append the outbound message (sender =
+//!    caller, receiver = the addressee). Skip this append for Agent
+//!    receivers (the worker's `agent.reply` re-appends the prompt when it
+//!    claims the queued row) and for Human receivers in the *same* session
+//!    (the caller's `Assistant([…, ToolCall])` row already persisted by
+//!    `turn.rs` carries the message text). In both skip cases a double
+//!    append would split the assistant `tool_calls` from the matching
+//!    `tool_result` on the next turn's wire payload.
 //! 5. Atomically bump the DAG turn budget. On `DagBudgetExceeded` the tool
 //!    returns an error so the model sees the rejection; we do *not* roll
 //!    the appended rows back — the bump cap rejects future calls rather
@@ -245,6 +249,7 @@ impl SendMessageTool {
         receiver: Participant,
         viewer: Participant,
         summary: &str,
+        request_id: PromptRequestId,
     ) -> Result<(), ToolError> {
         let trimmed = summary.trim();
         if trimmed.is_empty() {
@@ -263,6 +268,7 @@ impl SendMessageTool {
                 receiver_session,
                 receiver,
                 format!("[context from {viewer}] {trimmed}"),
+                request_id,
             )
             .await
             .map_err(|e| {
@@ -317,29 +323,39 @@ impl SendMessageTool {
         );
 
         if let Some(s) = summary.as_deref() {
-            self.maybe_append_opening_note(receiver_session, receiver, ctx.viewer, s)
-                .await
-                .inspect_err(|_| set_outcome("opening_note_failed"))?;
+            self.maybe_append_opening_note(
+                receiver_session,
+                receiver,
+                ctx.viewer,
+                s,
+                ctx.request_id,
+            )
+            .await
+            .inspect_err(|_| set_outcome("opening_note_failed"))?;
         }
 
-        // Append the outbound message ONLY for human receivers. For agent
-        // receivers the worker's `agent.reply` will re-append the prompt
-        // when it claims the queued row — appending here creates a User
-        // block authored by the caller in the shared session, and the
-        // sender's own viewer mapping (`is_self=true`) flips it to
-        // `Assistant.text`, which lands between the caller's
-        // `Assistant.tool_calls` (the `send_message` invocation) and the
-        // matching `Tool` reply. OpenAI requires those adjacent and
-        // rejects the wire payload otherwise. Humans don't run a worker,
-        // so the row needs the explicit append for the SSE/get_session
-        // history.
-        if matches!(receiver, Participant::Human) {
+        // Append the outbound message ONLY for human receivers, and only
+        // when the receiver session is *different* from the caller's. For
+        // agent receivers the worker's `agent.reply` re-appends the prompt
+        // when it claims the queued row; for human receivers in the same
+        // session (the common human↔agent root case, where
+        // `resolve_or_create_for_pair` returns the existing session) the
+        // caller's own `Assistant([…, ToolCall])` row already persisted by
+        // `turn.rs` carries the message text. In both cases an extra append
+        // here creates a row whose viewer-mapped form (`is_self=true` ⇒
+        // `Assistant.text`) lands between the caller's `Assistant.tool_calls`
+        // and the matching `Tool` reply on the next turn's wire payload —
+        // which OpenAI rejects. The cross-session human path (e.g. a
+        // descendant agent first reaching the human) still needs the append
+        // because the caller's tool_call lives in a different session.
+        if matches!(receiver, Participant::Human) && receiver_session != ctx.session_id {
             self.sessions
                 .append(
                     receiver_session,
                     MessageSender::from_participant(ctx.viewer),
                     receiver,
                     outbound_chat_message(content.as_str()),
+                    ctx.request_id,
                 )
                 .await
                 .map_err(|e| {
@@ -400,10 +416,18 @@ impl SendMessageTool {
         }
     }
 
-    /// Publish an [`ResponseChunk::AgentMessage`] on the root request's
-    /// stream so the SSE client sees the agent's reply. Non-terminal — the
-    /// terminal `Done` chunk fires only on DAG quiescence
+    /// Publish an [`ResponseChunk::AgentMessage`] on the *current claim's*
+    /// request stream so the human SSE client sees the agent's reply.
+    /// Non-terminal — the terminal `Done` chunk fires only on DAG quiescence
     /// (`Worker::maybe_emit_quiescence`).
+    ///
+    /// The chunk is published on `ctx.request_id` (the row whose sink is
+    /// open right now) rather than `ctx.root_request_id` — the latter can
+    /// point at a long-quiesced first-prompt sink in a continuing thread,
+    /// where this publish would fail with "stream already closed". Postgres
+    /// `LISTEN/NOTIFY` then routes the chunk by `prompt_requests.root_request_id`
+    /// to the right `/threads/{root}/stream` fan-in, so the user's UI sees
+    /// the chunk regardless of which prompt it was published on.
     async fn publish_to_human(
         &self,
         ctx: &ToolCallContext,
@@ -420,12 +444,14 @@ impl SendMessageTool {
             from,
             content: content.to_string(),
         };
-        // Publish on the *root* request stream — the same stream the human
-        // is subscribed to since their POST. Multiple AgentMessage chunks
-        // accumulate across the conversation.
-        if let Err(e) = self.sink.publish(ctx.root_request_id, chunk).await {
+        if let Err(e) = self.sink.publish(ctx.request_id, chunk).await {
             set_outcome("publish_failed");
-            warn!(error = %e, relay.dag.root = %ctx.root_request_id, "send_message.publish.error");
+            warn!(
+                error = %e,
+                relay.request.id = %ctx.request_id,
+                relay.dag.root = %ctx.root_request_id,
+                "send_message.publish.error",
+            );
             return Err(ToolError::Backend(format!(
                 "send_message: publish to human failed: {e}"
             )));

@@ -20,18 +20,22 @@ use relay_rs::provider::{
     AssistantContent, ChatRequest, ChatResponse, LlmProvider, ProviderError, SharedProvider,
     StopReason, ToolCall, ToolCallId,
 };
+use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::tools::{SharedTool, Tool, ToolError, ToolRegistry};
 use relay_rs::types::{ModelId, Participant, Prompt, ToolName};
 
 mod common;
-use common::pg::{TestDb, human_to_agent_session};
+use common::pg::{TestDb, human_to_agent_session, seed_prompt_request};
 
-/// Create a fresh human-to-default-agent session for a test using its own
-/// session store (independent of the agent's internal collaborators).
-async fn fresh_session(db: &TestDb) -> relay_rs::session::SessionId {
+/// Create a fresh human-to-default-agent session and a stub `prompt_requests`
+/// row bound to it. Returns both ids — `agent.reply` needs the request_id and
+/// `session_messages.request_id` FK-references it on every append.
+async fn fresh_session(db: &TestDb) -> (relay_rs::session::SessionId, PromptRequestId) {
     let store = PgSessionStore::new(db.pool.clone(), SystemClock::shared());
-    human_to_agent_session(&store, db.default_agent_id).await
+    let session = human_to_agent_session(&store, db.default_agent_id).await;
+    let request = seed_prompt_request(&db.pool, session, db.default_agent_id).await;
+    (session, request)
 }
 
 /// Provider that returns a pre-scripted sequence of responses, one per turn. Records the
@@ -167,13 +171,14 @@ async fn returns_text_when_no_tool_call() {
     )]));
     let agent = build(&db, provider.clone(), vec![]);
 
-    let session = fresh_session(&db).await;
+    let (session, request_id) = fresh_session(&db).await;
     let prompt = Prompt::try_from("hello").expect("prompt");
     let reply = agent
         .reply(
             session,
             Participant::agent(db.default_agent_id),
             vec![prompt],
+            request_id,
             CancellationToken::new(),
             None,
         )
@@ -194,13 +199,14 @@ async fn runs_tool_then_returns_text() {
     let counter = Arc::new(CountingTool::new("counter"));
     let agent = build(&db, provider.clone(), vec![counter.clone()]);
 
-    let session = fresh_session(&db).await;
+    let (session, request_id) = fresh_session(&db).await;
     let prompt = Prompt::try_from("use the tool").expect("prompt");
     let reply = agent
         .reply(
             session,
             Participant::agent(db.default_agent_id),
             vec![prompt],
+            request_id,
             CancellationToken::new(),
             None,
         )
@@ -221,13 +227,14 @@ async fn unknown_tool_does_not_loop_forever() {
     ]));
     let agent = build(&db, provider.clone(), vec![]);
 
-    let session = fresh_session(&db).await;
+    let (session, request_id) = fresh_session(&db).await;
     let prompt = Prompt::try_from("try the missing tool").expect("prompt");
     let reply = agent
         .reply(
             session,
             Participant::agent(db.default_agent_id),
             vec![prompt],
+            request_id,
             CancellationToken::new(),
             None,
         )
@@ -246,7 +253,7 @@ async fn cancellation_short_circuits() {
     )]));
     let agent = build(&db, provider, vec![]);
 
-    let session = fresh_session(&db).await;
+    let (session, request_id) = fresh_session(&db).await;
     let prompt = Prompt::try_from("cancel me").expect("prompt");
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -256,6 +263,7 @@ async fn cancellation_short_circuits() {
             session,
             Participant::agent(db.default_agent_id),
             vec![prompt],
+            request_id,
             cancel,
             None,
         )
@@ -274,13 +282,14 @@ async fn provider_specs_match_registered_tools() {
     let counter = Arc::new(CountingTool::new("counter"));
     let agent = build(&db, provider.clone(), vec![counter]);
 
-    let session = fresh_session(&db).await;
+    let (session, request_id) = fresh_session(&db).await;
     let prompt = Prompt::try_from("hi").expect("prompt");
     let _ = agent
         .reply(
             session,
             Participant::agent(db.default_agent_id),
             vec![prompt],
+            request_id,
             CancellationToken::new(),
             None,
         )

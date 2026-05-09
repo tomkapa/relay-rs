@@ -281,6 +281,16 @@ impl Worker {
         // The session row alone can't disambiguate which side runs in an
         // agent↔agent session — `receiver_agent_id` is the queue's answer.
         let viewer = Participant::agent(claim.receiver_agent_id);
+        // The drained batch's first request is the SSE sink mid-turn writes
+        // (e.g. `send_message` AgentMessage chunks) target — its slot is open
+        // for the duration of this claim, unlike the session's stored
+        // `root_request_id` which can point at a long-quiesced sink in a
+        // continuing thread.
+        let request_id = claim
+            .prompts
+            .first()
+            .expect("invariant: claim drains at least one prompt")
+            .request_id;
         let mut retries: u8 = 0;
         let mut prompts_consumed = false;
         loop {
@@ -290,6 +300,7 @@ impl Worker {
                     claim.session,
                     viewer,
                     prompts.clone(),
+                    request_id,
                     cancel.clone(),
                     observer.clone(),
                     prompts_consumed,
@@ -317,7 +328,7 @@ impl Worker {
                         text.preview = %preview(reply.final_text()),
                         "worker.turn.no_egress.retried",
                     );
-                    if let Err(e) = self.inject_pingpong_nudge(claim).await {
+                    if let Err(e) = self.inject_pingpong_nudge(claim, request_id).await {
                         warn!(error = %e, "worker.pingpong.nudge.error");
                         let reason = FailureReason::Unrecoverable(format!("nudge append: {e}"));
                         self.publish_failure(receipt.ids(), &reason).await;
@@ -353,6 +364,7 @@ impl Worker {
         session: SessionId,
         viewer: Participant,
         prompts: Vec<Prompt>,
+        request_id: PromptRequestId,
         cancel: CancellationToken,
         observer: SharedTurnObserver,
         prompts_consumed: bool,
@@ -360,13 +372,13 @@ impl Worker {
         if prompts_consumed {
             timeout(
                 self.cfg.max_turn_duration,
-                agent.resume(session, viewer, cancel, Some(observer)),
+                agent.resume(session, viewer, request_id, cancel, Some(observer)),
             )
             .await
         } else {
             timeout(
                 self.cfg.max_turn_duration,
-                agent.reply(session, viewer, prompts, cancel, Some(observer)),
+                agent.reply(session, viewer, prompts, request_id, cancel, Some(observer)),
             )
             .await
         }
@@ -375,12 +387,14 @@ impl Worker {
     async fn inject_pingpong_nudge(
         &self,
         claim: &ClaimedSession,
+        request_id: PromptRequestId,
     ) -> Result<(), super::error::PromptError> {
         self.sessions
             .append_system_nudge(
                 claim.session,
                 Participant::agent(claim.receiver_agent_id),
                 PINGPONG_NUDGE.to_string(),
+                request_id,
             )
             .await
             .map_err(|e| super::error::PromptError::Backend(format!("nudge: {e}")))
@@ -463,10 +477,17 @@ impl Worker {
         self.maybe_emit_quiescence(receipt).await;
     }
 
-    /// Emit the terminal `Done` on the root stream when no `pending` /
-    /// `processing` rows remain in this session's DAG. The only path that
-    /// closes the SSE stream — per-receipt `Done` was dropped so the stream
-    /// stays open while sibling agents are still working.
+    /// Emit the terminal `Done` chunk on each claim request's sink when no
+    /// `pending` / `processing` rows remain in this session's DAG.
+    ///
+    /// Quiescence is detected against the session's stored DAG root (the
+    /// original first-prompt id). The `Done` chunk itself is published to the
+    /// **claim's** request ids — those sinks are guaranteed open for the
+    /// duration of the worker's claim, whereas the session's stored root may
+    /// already be closed from a prior turn in a continuing thread. Postgres
+    /// `LISTEN/NOTIFY` then routes the chunk by `prompt_requests.root_request_id`
+    /// to the correct `/threads/{root}/stream` fan-in, so the user's UI sees
+    /// the terminal chunk regardless of which prompt it was published on.
     async fn maybe_emit_quiescence(&self, receipt: &ClaimReceipt) {
         let session = receipt.lease().session();
         let root = match self.sessions.root_request_id(session).await {
@@ -478,23 +499,25 @@ impl Worker {
         };
         match self.dag.quiescent(root).await {
             Ok(true) => {
-                if let Err(e) = self
-                    .sink
-                    .publish(
-                        root,
-                        ResponseChunk::Done {
-                            final_text: String::new(),
-                        },
-                    )
-                    .await
-                {
-                    // Synthetic roots that never opened a stream surface as
-                    // NotFound; benign no-op for the test harness.
-                    debug!(error = %e, relay.dag.root = %root, "worker.quiescence.publish.skipped");
-                    return;
-                }
-                if let Err(e) = self.sink.close(root).await {
-                    debug!(error = %e, relay.dag.root = %root, "worker.quiescence.close.skipped");
+                for id in receipt.ids() {
+                    if let Err(e) = self
+                        .sink
+                        .publish(
+                            *id,
+                            ResponseChunk::Done {
+                                final_text: String::new(),
+                            },
+                        )
+                        .await
+                    {
+                        // Synthetic ids that never opened a stream (test
+                        // harness) surface as NotFound; benign no-op.
+                        debug!(error = %e, relay.request.id = %id, "worker.quiescence.publish.skipped");
+                        continue;
+                    }
+                    if let Err(e) = self.sink.close(*id).await {
+                        debug!(error = %e, relay.request.id = %id, "worker.quiescence.close.skipped");
+                    }
                 }
                 info!(relay.dag.root = %root, "worker.quiescence.done");
             }

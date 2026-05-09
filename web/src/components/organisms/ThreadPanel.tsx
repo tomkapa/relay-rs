@@ -1,0 +1,406 @@
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  AtSign,
+  Bell,
+  ChevronDown,
+  ChevronRight,
+  Paperclip,
+  Send,
+  Smile,
+  X,
+} from "lucide-react";
+import { Monogram } from "../atoms/Monogram";
+import { Spinner } from "../atoms/Spinner";
+import { Markdown } from "../molecules/Markdown";
+import { ToolCallLine } from "../molecules/ToolCallLine";
+import { MentionInput } from "../molecules/MentionInput";
+import { clockTime, formatMs } from "../../lib/time";
+import { cn, insertAtCaret } from "../../lib/utils";
+import type { Agent, ThreadSummary, ToolCallEntry } from "../../types/api";
+import type { Bubble, RootMessage } from "../../lib/foldHistory";
+import { DEMO_REPLY_META } from "../../lib/demo";
+import { renderMentions } from "../../lib/mentions";
+
+/**
+ * Pure renderer. Takes the merged `Bubble[]` from `useThreadView` and the
+ * `rootMessage` for the panel header. Holds no merge logic, no dedup, no
+ * reconciliation — that all lives in the selector.
+ */
+export function ThreadPanel({
+  channel,
+  thread,
+  agents,
+  bubbles,
+  rootMessage,
+  showThinking,
+  pending,
+  onReply,
+  onClose,
+}: {
+  channel: string;
+  thread: ThreadSummary | null;
+  agents: Agent[];
+  bubbles: Bubble[];
+  rootMessage?: RootMessage;
+  /** Whether to render the "thinking…" placeholder. The selector decides;
+   *  this component just paints. */
+  showThinking?: boolean;
+  /** Composer "Send" spinner — `/prompts` mutation in flight. */
+  pending?: boolean;
+  onReply?: (input: { content: string }) => void;
+  onClose?: () => void;
+}) {
+  const [reply, setReply] = useState("");
+  const replyRef = useRef<HTMLTextAreaElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const trimmed = reply.trim();
+  const sendReply = () => {
+    if (!trimmed || pending || !thread) return;
+    onReply?.({ content: trimmed });
+    setReply("");
+    // Pin to bottom after the optimistic bubble has had a chance to render.
+    // Two RAFs cover both React commit and the bubble's measured layout.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const el = scrollRef.current;
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+    });
+  };
+  const insertAt = () => insertAtCaret(replyRef, reply, setReply, "@");
+
+  // Follow the tail only if the reader is already near the bottom — never
+  // yank a user who scrolled up to re-read older replies.
+  const lastSignature = useRef<string>("");
+  const signature = useMemo(() => {
+    const tail = bubbles[bubbles.length - 1];
+    return `${bubbles.length}|${tail?.key ?? ""}|${tail?.text.length ?? 0}|${
+      showThinking ? 1 : 0
+    }`;
+  }, [bubbles, showThinking]);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (signature === lastSignature.current) return;
+    const distanceFromBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight;
+    const wasAtBottom = distanceFromBottom < 120;
+    lastSignature.current = signature;
+    if (wasAtBottom) el.scrollTop = el.scrollHeight;
+  }, [signature]);
+
+  return (
+    <aside
+      className="flex h-full w-[360px] shrink-0 flex-col border-l border-[var(--color-line)] bg-[var(--color-paper)]"
+      aria-label="Thread side panel"
+    >
+      <header className="flex items-center justify-between gap-2 border-b border-[var(--color-line)] px-5 py-3">
+        <div>
+          <div className="font-[var(--font-mono)] text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
+            Thread
+          </div>
+          <div className="mt-0.5 font-[var(--font-display)] text-[16px] font-bold text-[var(--color-ink)]">
+            Replies in <span className="font-[var(--font-mono)]">#{channel}</span>
+          </div>
+        </div>
+        <button
+          aria-label="Close"
+          onClick={onClose}
+          className="flex h-7 w-7 items-center justify-center text-[var(--color-muted)] hover:text-[var(--color-ink)]"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </header>
+
+      <div ref={scrollRef} className="flex-1 overflow-y-auto scroll-thin">
+        {/* Root post */}
+        {rootMessage && (
+          <article className="flex gap-3 border-b border-[var(--color-line)] px-5 py-4">
+            <Monogram name={rootMessage.name} id={rootMessage.id} size={28} />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-baseline gap-2">
+                <span className="font-[var(--font-display)] text-[13.5px] font-bold text-[var(--color-ink)]">
+                  {rootMessage.name}
+                </span>
+                <span className="font-[var(--font-mono)] text-[11px] text-[var(--color-muted-2)]">
+                  {clockTime(rootMessage.ts)}
+                </span>
+              </div>
+              <p className="mt-0.5 text-[13.5px] leading-[1.5] text-[var(--color-ink)]">
+                {renderMentions(rootMessage.text)}
+              </p>
+            </div>
+          </article>
+        )}
+
+        {/* Replies count bar */}
+        <div className="flex items-center justify-between border-b border-[var(--color-line)] bg-[var(--color-paper-2)] px-5 py-1.5">
+          <span className="font-[var(--font-mono)] text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
+            {bubbles.length} {bubbles.length === 1 ? "reply" : "replies"}
+          </span>
+          <button
+            aria-label="Notifications"
+            className="text-[var(--color-muted)] hover:text-[var(--color-ink)]"
+          >
+            <Bell className="h-3.5 w-3.5" />
+          </button>
+        </div>
+
+        <div className="flex flex-col">
+          {bubbles.length === 0 && !showThinking && (
+            <p className="px-5 py-6 font-[var(--font-mono)] text-[12px] text-[var(--color-muted-2)]">
+              No replies yet.
+            </p>
+          )}
+          {bubbles.map((b) =>
+            b.kind === "human" ? (
+              <HumanReplyCard key={b.key} bubble={b} />
+            ) : (
+              <AgentReplyCard key={b.key} bubble={b} agents={agents} />
+            ),
+          )}
+          {showThinking && <ThinkingCard />}
+        </div>
+      </div>
+
+      {/* Reply composer */}
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          sendReply();
+        }}
+        className="border-t border-[var(--color-line)] bg-[var(--color-paper)] p-3"
+      >
+        <div
+          className={cn(
+            "border border-[var(--color-line-strong)] bg-[var(--color-card)] focus-within:ring-2 focus-within:ring-[var(--color-moss)]/15",
+            !thread && "opacity-60",
+          )}
+        >
+          <MentionInput
+            value={reply}
+            onChange={setReply}
+            agents={agents}
+            mode="thread"
+            placeholder="Reply… (use @ to mention an agent)"
+            onSubmit={sendReply}
+            disabled={!thread || pending}
+            textRef={replyRef}
+            rows={1}
+            maxHeight={140}
+          />
+          <div className="flex items-center gap-1 border-t border-[var(--color-line)] px-2 py-1">
+            <button
+              type="button"
+              aria-label="Mention"
+              onClick={insertAt}
+              className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)]"
+            >
+              <AtSign className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              aria-label="Attach"
+              className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)]"
+            >
+              <Paperclip className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              aria-label="Emoji"
+              className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)]"
+            >
+              <Smile className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="submit"
+              disabled={!trimmed || pending || !thread}
+              className="ml-auto inline-flex h-7 items-center gap-1 bg-[var(--color-moss)] px-2.5 font-[var(--font-mono)] text-[11.5px] font-semibold text-white hover:bg-[var(--color-moss-deep)] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {pending ? (
+                <>
+                  <Spinner size={10} className="text-white" /> sending
+                </>
+              ) : (
+                <>
+                  Send <Send className="h-3 w-3" strokeWidth={2.5} />
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </form>
+    </aside>
+  );
+}
+
+function HumanReplyCard({ bubble }: { bubble: Bubble }) {
+  const name = bubble.human_name ?? "you";
+  return (
+    <article className="flex gap-3 border-b border-[var(--color-line)] px-5 py-4">
+      <Monogram name={name} id={bubble.human_id ?? name} size={22} tone="user" />
+      <div className="min-w-0 flex-1">
+        <header className="flex items-baseline gap-2">
+          <span className="font-[var(--font-display)] text-[13px] font-bold text-[var(--color-ink)]">
+            {name}
+          </span>
+          <span className="ml-auto font-[var(--font-mono)] text-[11px] text-[var(--color-muted-2)]">
+            {clockTime(bubble.ts)}
+          </span>
+        </header>
+        <p className="mt-0.5 text-[13.5px] leading-[1.5] text-[var(--color-ink)]">
+          {renderMentions(bubble.text)}
+        </p>
+      </div>
+    </article>
+  );
+}
+
+function AgentReplyCard({
+  bubble,
+  agents,
+}: {
+  bubble: Bubble;
+  agents: Agent[];
+}) {
+  // Demo metas pre-populate reasoning + tool calls when the bubble doesn't
+  // yet carry them — keeps the design-reference panel honest without
+  // coupling demo fixtures to live wire data.
+  const meta = DEMO_REPLY_META[bubble.key];
+  const tools: (ToolCallEntry & { durationMs?: number })[] =
+    bubble.tool_calls.length > 0
+      ? bubble.tool_calls
+      : meta?.tools.map((t, i) => ({
+          call_id: `${bubble.key}:${i}`,
+          name: t.name,
+          input: t.args,
+          output: undefined,
+          status: "ok" as const,
+          durationMs: t.durationMs,
+        })) ?? [];
+  const reasoning = bubble.reasoning || meta?.reasoning || "";
+  const tokens = meta?.tokens ?? 0;
+  const durationMs = meta?.durationMs ?? 0;
+  const hasMeta = tools.length > 0 || reasoning.length > 0 || tokens > 0;
+
+  const [open, setOpen] = useState(meta?.expanded ?? false);
+  const isLive = bubble.phase !== "persisted";
+  const agent = bubble.agent_id
+    ? (agents.find((a) => a.id === bubble.agent_id) ?? null)
+    : null;
+  const agentName = agent?.name ?? bubble.agent_name ?? "agent";
+  const agentMonogramId = agent?.id ?? bubble.agent_id ?? "agent";
+
+  return (
+    <article className="border-b border-[var(--color-line)] px-5 py-4">
+      <header className="flex items-center gap-2">
+        <Monogram name={agentName} id={agentMonogramId} size={22} tone="moss" />
+        <span className="font-[var(--font-display)] text-[13px] font-bold text-[var(--color-ink)]">
+          {agentName}
+        </span>
+        <span className="border border-[var(--color-moss)] px-1 font-[var(--font-mono)] text-[9.5px] font-bold uppercase tracking-[0.14em] text-[var(--color-moss)]">
+          AGENT
+        </span>
+        <span className="ml-auto font-[var(--font-mono)] text-[11px] text-[var(--color-muted-2)]">
+          {clockTime(bubble.ts)}
+        </span>
+      </header>
+
+      <div className="mt-1.5 text-[13px] leading-[1.5] text-[var(--color-ink)]">
+        {bubble.text ? (
+          <Markdown text={bubble.text} className="text-[13px]" />
+        ) : isLive ? (
+          <ThinkingIndicator />
+        ) : null}
+      </div>
+
+      {hasMeta && (
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="mt-2.5 flex w-full items-center gap-2 border border-[var(--color-line)] bg-[var(--color-paper-2)] px-2.5 py-1 font-[var(--font-mono)] text-[11px] text-[var(--color-muted)] hover:text-[var(--color-ink)] transition-colors"
+        >
+          {open ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronRight className="h-3 w-3" />
+          )}
+          <span className="font-medium">reasoning</span>
+          <span className="text-[var(--color-line-2)]">|</span>
+          <span>{tools.length} tools</span>
+          <span className="text-[var(--color-line-2)]">|</span>
+          <span>
+            {tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : tokens} tok
+          </span>
+          <span className="text-[var(--color-line-2)]">|</span>
+          <span className="ml-auto">{formatMs(durationMs)}</span>
+        </button>
+      )}
+
+      {open && (
+        <div className="mt-2 space-y-3 border border-[var(--color-moss-soft)] bg-[var(--color-moss-tint)] p-3">
+          {reasoning && (
+            <div>
+              <div className="mb-1.5 font-[var(--font-mono)] text-[10px] uppercase tracking-[0.16em] text-[var(--color-moss-deep)]">
+                Reasoning
+              </div>
+              <p className="font-[var(--font-sans)] text-[12px] italic leading-[1.55] text-[var(--color-ink-2)] whitespace-pre-wrap">
+                {reasoning}
+              </p>
+            </div>
+          )}
+          {tools.length > 0 && (
+            <div>
+              <div
+                className={cn(
+                  "mb-1.5 font-[var(--font-mono)] text-[10px] uppercase tracking-[0.16em] text-[var(--color-moss-deep)]",
+                  reasoning && "border-t border-[var(--color-moss-soft)] pt-2",
+                )}
+              >
+                Tool Calls
+              </div>
+              <div className="space-y-1">
+                {tools.map((t) => (
+                  <ToolCallLine
+                    key={t.call_id}
+                    call={{
+                      call_id: t.call_id,
+                      name: t.name,
+                      input: t.input,
+                      output: t.output,
+                      status: t.status,
+                    }}
+                    durationMs={(t as { durationMs?: number }).durationMs}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
+function ThinkingCard() {
+  return (
+    <article className="border-b border-[var(--color-line)] px-5 py-4">
+      <ThinkingIndicator />
+    </article>
+  );
+}
+
+function ThinkingIndicator() {
+  return (
+    <div
+      className="inline-flex items-center gap-1.5 font-[var(--font-mono)] text-[11.5px] text-[var(--color-muted)]"
+      aria-label="Agent is thinking"
+    >
+      <span className="flex gap-0.5">
+        <span className="h-1 w-1 animate-pulse rounded-full bg-[var(--color-moss)] [animation-delay:0ms]" />
+        <span className="h-1 w-1 animate-pulse rounded-full bg-[var(--color-moss)] [animation-delay:150ms]" />
+        <span className="h-1 w-1 animate-pulse rounded-full bg-[var(--color-moss)] [animation-delay:300ms]" />
+      </span>
+      <span>thinking…</span>
+    </div>
+  );
+}

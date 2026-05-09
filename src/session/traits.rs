@@ -49,22 +49,32 @@ pub trait SessionStore: fmt::Debug + Send + Sync {
     /// invalid). The store does not check that `sender`/`receiver` are members
     /// of the session — the type-system invariant on `send_message` enforces
     /// that at the call site.
+    ///
+    /// `request_id` is the prompt request that produced this row, persisted on
+    /// `session_messages.request_id` so downstream readers (the FE thread
+    /// panel) can join history rows to live-stream bubbles by identity. The
+    /// type-system invariant is that every production appender has a
+    /// request_id in scope (turn execution, prompt append, send_message
+    /// delivery, ping-pong nudges).
     async fn append(
         &self,
         id: SessionId,
         sender: MessageSender,
         receiver: Participant,
         message: ChatMessage,
+        request_id: PromptRequestId,
     ) -> Result<(), SessionError>;
 
     /// Append a worker-injected `system`-kind nudge addressed to `receiver`.
     /// The body is wrapped as `ChatMessage::User(vec![Text(note)])` on the
     /// way in so the receiving agent renders it as user-side context.
+    /// `request_id` follows the same contract as [`Self::append`].
     async fn append_system_nudge(
         &self,
         id: SessionId,
         receiver: Participant,
         note: String,
+        request_id: PromptRequestId,
     ) -> Result<(), SessionError>;
 
     /// Render every message in `id` from `viewer`'s perspective:
