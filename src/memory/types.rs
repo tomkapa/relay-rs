@@ -54,6 +54,22 @@ crate::str_enum! {
     }
 }
 
+impl MemoryKind {
+    /// Capitalised label used as the section header in the rendered
+    /// system prompt (`### Self`, `### Other`, …). Distinct from the
+    /// lowercase wire label returned by `as_str` so the storage format
+    /// can stay snake-case while the model-facing prompt reads as prose.
+    #[must_use]
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Identity => "Self",
+            Self::Other => "Other",
+            Self::Procedure => "Procedure",
+            Self::Open => "Open",
+        }
+    }
+}
+
 crate::str_enum! {
     /// Confidence/lifecycle bucket (doc/memory.md §1.2). The agent only
     /// reasons about these qualitative states; the underlying numeric

@@ -36,3 +36,44 @@ pub const MAX_MEMORIES_PER_AGENT: usize = 1024;
 /// over it needs an upper bound. Operator audit (Phase 8) will paginate
 /// through this cap with a cursor.
 pub const MAX_EVENTS_PER_PAGE: usize = 1024;
+
+/// Byte budget for the rendered stable layer (pinned + Self) inside the
+/// system prompt.
+///
+/// Sized so a few dozen one-or-two-sentence memories fit without crowding
+/// the model's context window. Matches the order of magnitude of an
+/// agent's role prompt, so doubling memory does not overwhelm role.
+pub const STABLE_LAYER_MAX_BYTES: usize = 4096;
+
+/// Byte budget for the rendered contextual layer (Other / Procedure /
+/// Open).
+///
+/// The contextual layer is per-session, retrieved against the opener;
+/// sized smaller than the stable layer because retrieval already narrows
+/// the set.
+pub const CONTEXTUAL_LAYER_MAX_BYTES: usize = 4096;
+
+/// Top-K cap on the contextual retrieval. Phase 9 will rank by similarity
+/// × recency × state and stop here.
+pub const CONTEXTUAL_TOP_K: usize = 16;
+
+/// Per-line overhead added to a memory's content when estimating render
+/// size for the byte budget — covers `- [M-NN, validated] ` plus the
+/// trailing newline. A worst-case estimate (handle up to four digits,
+/// state label up to nine chars) so trimming never overshoots.
+pub(super) const RENDER_LINE_OVERHEAD_BYTES: usize = 32;
+
+/// In-process bound on the per-session memory composition cache.
+///
+/// Same rationale as `MAX_THREAD_SLOTS` in `runtime::limits`: caps memory
+/// growth across a long-lived process. Eviction prefers the oldest
+/// expired entry, falling back to the absolute oldest.
+pub const SESSION_MEMORY_CACHE_CAP: usize = 1024;
+
+/// TTL on the per-session memory composition cache.
+///
+/// Long enough that within an active session burst the assembled prompt
+/// stays cached (frozen-for-session, doc/memory.md §1.3). Short enough
+/// that a session resumed after a long idle picks up new memories
+/// written in between.
+pub const SESSION_MEMORY_CACHE_TTL_SECS: u64 = 60 * 60;

@@ -27,7 +27,10 @@ use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
 use crate::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
-use crate::memory::{AgentMemory, SharedMemory};
+use crate::memory::{
+    AgentMemory, PgMemoryStore, SESSION_MEMORY_CACHE_CAP, SESSION_MEMORY_CACHE_TTL_SECS,
+    SessionMemoryCache, SharedMemory, SharedMemoryStore,
+};
 use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::openai::OpenAiProvider;
@@ -187,8 +190,20 @@ impl Collaborators {
             AGENT_PROMPT_CACHE_TTL,
             clock.clone(),
         ));
-        let memory: SharedMemory =
-            Arc::new(AgentMemory::new(agents.clone(), cache, CORE_SYSTEM_PROMPT));
+        let memory_store: SharedMemoryStore =
+            Arc::new(PgMemoryStore::new(pool.clone(), clock.clone()));
+        let session_memory_cache = Arc::new(SessionMemoryCache::new(
+            SESSION_MEMORY_CACHE_CAP,
+            Duration::from_secs(SESSION_MEMORY_CACHE_TTL_SECS),
+            clock.clone(),
+        ));
+        let memory: SharedMemory = Arc::new(AgentMemory::new(
+            agents.clone(),
+            cache,
+            memory_store,
+            session_memory_cache,
+            CORE_SYSTEM_PROMPT,
+        ));
 
         let mcp_store: SharedMcpServerStore =
             Arc::new(PgMcpServerStore::new(pool.clone(), clock.clone()));
