@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use relay_rs::agent::AgentBuilder;
+use relay_rs::agent_core::AgentBuilder;
 use relay_rs::agents::{
     AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, CachedAgents, PgAgentStore,
     SharedAgentStore, SharedAgents,

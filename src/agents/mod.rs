@@ -9,7 +9,7 @@
 //! `<core>...</core>\n<role>{prompt}</role>` — see
 //! [`crate::memory::AgentMemory`] for the assembly seam.
 //!
-//! Distinct from [`crate::agent`]: that module owns the runtime orchestrator
+//! Distinct from [`crate::agent_core`]: that module owns the runtime orchestrator
 //! (`Agent`, the chat loop). This one owns the *registry* of agent definitions.
 
 mod cache;

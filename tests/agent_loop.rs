@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use relay_rs::agent::AgentBuilder;
+use relay_rs::agent_core::AgentBuilder;
 use relay_rs::clock::SystemClock;
 use relay_rs::hook::HookChain;
 use relay_rs::memory::{SharedMemory, StaticMemory};

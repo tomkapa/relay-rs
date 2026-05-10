@@ -25,7 +25,7 @@ use tracing::{Instrument, debug, info, warn};
 
 use async_trait::async_trait;
 
-use crate::agent::{Agent, AgentError, SharedTurnObserver, TurnObserver};
+use crate::agent_core::{Agent, AgentError, SharedTurnObserver, TurnObserver};
 use crate::agents::SharedAgents;
 use crate::observability::log::preview;
 use crate::provider::{AssistantContent, ToolResult};

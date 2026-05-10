@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::agent::Agent;
+use crate::agent_core::Agent;
 use crate::clock::SharedClock;
 
 use super::error::AgentStoreError;

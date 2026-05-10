@@ -15,7 +15,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::agent::{Agent, AgentBuilder};
+use crate::agent_core::{Agent, AgentBuilder};
 use crate::agents::{
     AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, AgentName, AgentPromptCache,
     AgentSystemPrompt, CachedAgents, DefaultAgentSeed, PgAgentStore, SharedAgentStore,

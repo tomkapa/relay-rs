@@ -11,7 +11,7 @@ use crate::types::TurnIndex;
 use super::error::HookError;
 
 /// Error type produced by [`HookDecision::into_result`] when a hook denies
-/// the operation. Convertible to [`crate::agent::AgentError`] so callers can
+/// the operation. Convertible to [`crate::agent_core::AgentError`] so callers can
 /// propagate with `?`.
 #[derive(Debug, Error)]
 #[error("hook denied: {0}")]

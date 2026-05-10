@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::json;
 
-use relay_rs::agent::AgentBuilder;
+use relay_rs::agent_core::AgentBuilder;
 use relay_rs::agents::{
     AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, AgentId, AgentName,
     AgentSystemPrompt, CachedAgents, NewAgent, PgAgentStore, SharedAgentStore, SharedAgents,
