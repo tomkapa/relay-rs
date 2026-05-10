@@ -83,14 +83,14 @@ async fn submit_prompt(
 
     let outcome = state
         .queue
-        .enqueue(NewPromptRequest {
-            session: payload.session_id,
-            sender: Participant::Human,
+        .enqueue(NewPromptRequest::normal(
+            payload.session_id,
+            Participant::Human,
             receiver_agent_id,
-            parent_session: None,
+            None,
             content,
             idempotency_key,
-        })
+        ))
         .await?;
 
     let status_code = match outcome {

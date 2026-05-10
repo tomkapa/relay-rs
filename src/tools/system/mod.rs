@@ -25,11 +25,13 @@ use crate::types::SecretString;
 use super::registry::ToolRegistryBuilder;
 
 mod get_session;
+mod memory_mutations;
 mod send_message;
 mod web_fetch;
 mod web_search;
 
 pub use get_session::GetSessionTool;
+pub use memory_mutations::{MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool};
 pub use send_message::SendMessageTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
@@ -45,6 +47,7 @@ pub struct SystemToolDeps {
     pub dag: SharedDagBudget,
     pub agents: SharedAgentStore,
     pub sink: SharedResponseSink,
+    pub memory: MemoryToolDeps,
 }
 
 /// Register every system tool onto `builder`.
@@ -68,6 +71,7 @@ pub fn register(
         dag,
         agents,
         sink,
+        memory,
     } = deps;
 
     Ok(builder
@@ -80,5 +84,8 @@ pub fn register(
             agents,
             sink,
         )))
-        .with(Arc::new(GetSessionTool::new(sessions))))
+        .with(Arc::new(GetSessionTool::new(sessions)))
+        .with(Arc::new(MemoryWriteTool::new(memory.clone())))
+        .with(Arc::new(MemoryUpdateTool::new(memory.clone())))
+        .with(Arc::new(MemoryForgetTool::new(memory))))
 }

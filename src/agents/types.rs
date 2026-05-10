@@ -138,11 +138,17 @@ impl fmt::Debug for AgentSystemPrompt {
 }
 
 /// Snapshot of a single row in the `agents` table.
+///
+/// `reflection_role` is the optional, role-specific guidance the
+/// reflection composer (Phase 4) splices into the reflection turn's
+/// system prompt. `None` means "use the default reflection-core prompt
+/// alone".
 #[derive(Debug, Clone)]
 pub struct AgentRecord {
     pub id: AgentId,
     pub name: AgentName,
     pub system_prompt: AgentSystemPrompt,
+    pub reflection_role: Option<AgentSystemPrompt>,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

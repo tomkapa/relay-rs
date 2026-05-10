@@ -148,6 +148,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
                 "You translate phrases into French. Reply via send_message.",
             )
             .expect("prompt"),
+            reflection_role: None,
             is_default: false,
         })
         .await
@@ -274,6 +275,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         agents_registry,
         sessions.clone(),
         dag.clone(),
+        db.pool.clone(),
         cfg,
     )
     .spawn();
@@ -297,6 +299,8 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
             parent_session: None,
             content: Prompt::try_from("translate 'hello' to French please").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("a2a-root").expect("key"),
+            kind: relay_rs::runtime::RequestKind::Normal,
+            kind_payload: None,
         })
         .await
         .expect("enqueue root");

@@ -27,7 +27,10 @@ use super::queue::{
     ClaimReceipt, ClaimedPrompt, ClaimedSession, EnqueueOutcome, LeaseManager, LeaseTiming,
     LeaseToken, NewPromptRequest, PromptQueue, RequestStatusView,
 };
-use super::types::{FailureReason, PromptRequestId, RequestStatus, TurnSeq, WorkerId};
+use super::types::{
+    FailureReason, PromptRequestId, RequestKind, RequestKindPayload, RequestStatus, TurnSeq,
+    WorkerId,
+};
 
 /// Postgres-backed queue + lease manager.
 ///
@@ -161,9 +164,12 @@ impl PromptQueue for PgPromptQueue {
     async fn enqueue(&self, req: NewPromptRequest) -> Result<EnqueueOutcome, PromptError> {
         let now = self.now();
         let receiver = Participant::agent(req.receiver_agent_id);
-        // §1: parse, don't validate. Sessions cannot host equal participants;
-        // catch the violation before we hit Postgres.
-        if req.sender == receiver {
+        // §1: parse, don't validate. Normal sessions cannot host equal
+        // participants; catch the violation before we hit Postgres.
+        // Reflection / Resolution rows reuse the agent on both sides
+        // because the job is the agent's own self-curation, so the
+        // self-session check only applies to Normal kinds.
+        if req.kind == RequestKind::Normal && req.sender == receiver {
             return Err(PromptError::SelfSession);
         }
 
@@ -261,9 +267,21 @@ impl PromptQueue for PgPromptQueue {
 
         let mut tx = self.pool.begin().await?;
 
-        // Find the oldest pending request whose session has no live lease. The
-        // partial index `prompt_requests_pending_idx (session_id, created_at) WHERE
-        // status = 'pending'` is the relevant access path.
+        // Find the oldest pending request whose session has no live lease.
+        //
+        // Two scoping rules per doc/memory.md §2.4:
+        //
+        // 1. The session itself must have no live lease (existing rule).
+        // 2. If the candidate row is `kind != 'normal'` (a memory-mutating
+        //    Reflection or Resolution job), the agent must not already have
+        //    *any* in-flight memory-mutating job. This serialises reflection
+        //    and resolution per agent so two of them cannot race against
+        //    the journal.
+        //
+        // The partial index `prompt_requests_pending_idx (session_id,
+        // created_at) WHERE status = 'pending'` is the primary access path;
+        // the per-agent NOT EXISTS does a small lookup against the live
+        // leases table.
         let candidate: Option<(SessionId,)> = sqlx::query_as(
             "SELECT pr.session_id
              FROM prompt_requests pr
@@ -272,6 +290,18 @@ impl PromptQueue for PgPromptQueue {
                    SELECT 1 FROM session_leases sl
                    WHERE sl.session_id = pr.session_id
                      AND sl.leased_until > $2
+               )
+               AND (
+                   pr.kind = 'normal'
+                   OR NOT EXISTS (
+                       SELECT 1 FROM prompt_requests pr2
+                       JOIN session_leases sl2
+                            ON sl2.session_id = pr2.session_id
+                           AND sl2.leased_until > $2
+                       WHERE pr2.receiver_agent_id = pr.receiver_agent_id
+                         AND pr2.status = 'processing'
+                         AND pr2.kind IN ('reflection', 'resolution')
+                   )
                )
              ORDER BY pr.created_at ASC
              LIMIT 1",
@@ -327,15 +357,17 @@ impl PromptQueue for PgPromptQueue {
         }
 
         // Drain pending rows for the session: flip them to processing, stamp the
-        // turn_seq, bump attempts. `receiver_agent_id` and `traceparent` are
-        // returned so the worker can resolve the right Agent from the
-        // registry and attach its `handle_claim` span to the producer's
-        // trace.
+        // turn_seq, bump attempts. `receiver_agent_id`, `traceparent`, `kind`
+        // and `kind_payload` are returned so the worker can resolve the right
+        // Agent from the registry, attach its `handle_claim` span to the
+        // producer's trace, and dispatch on job kind.
         let drained: Vec<(
             PromptRequestId,
             String,
             crate::agents::AgentId,
             Option<String>,
+            RequestKind,
+            Option<sqlx::types::Json<RequestKindPayload>>,
         )> = sqlx::query_as(
             "UPDATE prompt_requests
              SET status = $1,
@@ -343,7 +375,7 @@ impl PromptQueue for PgPromptQueue {
                  attempts = attempts + 1,
                  updated_at = $3
              WHERE session_id = $4 AND status = $5
-             RETURNING id, content, receiver_agent_id, traceparent",
+             RETURNING id, content, receiver_agent_id, traceparent, kind, kind_payload",
         )
         .bind(RequestStatus::Processing)
         .bind(next_seq)
@@ -363,14 +395,21 @@ impl PromptQueue for PgPromptQueue {
             return Ok(None);
         }
 
-        // §6: every drained row should target the same receiver — sessions are
-        // strictly 2-party, so prompts on one session cannot address different
-        // agents. A divergence means schema corruption.
+        // §6: every drained row should target the same receiver and share
+        // the same job kind. Sessions are strictly 2-party (one
+        // receiver), and a session never mixes Normal with Reflection or
+        // Resolution rows in the same drain (the per-agent serialization
+        // predicate above forbids it).
         let receiver_agent_id = drained[0].2;
-        for (_, _, rcv, _) in &drained[1..] {
+        let kind = drained[0].4;
+        for (_, _, rcv, _, k, _) in &drained[1..] {
             assert_eq!(
                 *rcv, receiver_agent_id,
                 "invariant: drained prompts for one session must share receiver_agent_id"
+            );
+            assert_eq!(
+                *k, kind,
+                "invariant: drained prompts for one session must share kind"
             );
         }
 
@@ -381,10 +420,13 @@ impl PromptQueue for PgPromptQueue {
         // producers we still anchor to the first one rather than spawning
         // an orphan span; the divergence shows up as multiple inbound
         // links in Honeycomb, which is the right way to surface it.
-        let traceparent = drained.iter().find_map(|(_, _, _, tp)| tp.clone());
+        let traceparent = drained.iter().find_map(|(_, _, _, tp, _, _)| tp.clone());
+        let kind_payload = drained
+            .iter()
+            .find_map(|(_, _, _, _, _, p)| p.as_ref().map(|j| j.0.clone()));
 
         let mut prompts = Vec::with_capacity(drained.len());
-        for (request_id, content, _, _) in drained {
+        for (request_id, content, _, _, _, _) in drained {
             let parsed = Prompt::try_from(content)?;
             prompts.push(ClaimedPrompt {
                 request_id,
@@ -400,6 +442,8 @@ impl PromptQueue for PgPromptQueue {
             prompts,
             lease,
             traceparent,
+            kind,
+            kind_payload,
         }))
     }
 
@@ -558,6 +602,18 @@ async fn insert_prompt_request(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), PromptError> {
     let traceparent = propagation::current_traceparent();
+    // §6: kind and payload must agree if a payload was supplied.
+    if let Some(payload) = req.kind_payload.as_ref() {
+        assert_eq!(
+            payload.kind(),
+            req.kind,
+            "invariant: NewPromptRequest.kind_payload variant must match kind"
+        );
+    }
+    let payload_json = req.kind_payload.as_ref().map(|p| {
+        serde_json::to_value(p)
+            .expect("invariant: RequestKindPayload serialises infallibly via serde_json")
+    });
 
     sqlx::query(
         "INSERT INTO prompt_requests
@@ -566,11 +622,13 @@ async fn insert_prompt_request(
               sender_kind, sender_agent_id,
               receiver_kind, receiver_agent_id, root_request_id,
               traceparent,
+              kind, kind_payload,
               created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, 0, 0, FALSE, NULL,
                  $6, $7, 'agent', $8, $9,
                  $10,
-                 $11, $11)",
+                 $11, $12,
+                 $13, $13)",
     )
     .bind(request_id)
     .bind(session)
@@ -582,6 +640,8 @@ async fn insert_prompt_request(
     .bind(req.receiver_agent_id)
     .bind(root_request_id)
     .bind(traceparent)
+    .bind(req.kind)
+    .bind(payload_json)
     .bind(now)
     .execute(&mut **tx)
     .await?;

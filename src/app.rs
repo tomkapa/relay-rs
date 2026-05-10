@@ -28,8 +28,8 @@ use crate::hook::HookChain;
 use crate::http::{AppState, router};
 use crate::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
 use crate::memory::{
-    AgentMemory, PgMemoryStore, SESSION_MEMORY_CACHE_CAP, SESSION_MEMORY_CACHE_TTL_SECS,
-    SessionMemoryCache, SharedMemory, SharedMemoryStore,
+    AgentMemory, PgMemoryStore, ReflectionScheduler, SESSION_MEMORY_CACHE_CAP,
+    SESSION_MEMORY_CACHE_TTL_SECS, SessionMemoryCache, SharedMemory, SharedMemoryStore,
 };
 use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
@@ -40,7 +40,7 @@ use crate::runtime::{
     WorkerPool, WorkerPoolHandle,
 };
 use crate::session::{PgSessionStore, SharedSessionStore};
-use crate::tools::system::{self, SystemToolDeps};
+use crate::tools::system::{self, MemoryToolDeps, SystemToolDeps};
 use crate::tools::{ToolBox, ToolRegistry};
 
 const HTTP_USER_AGENT: &str = concat!("relay-rs/", env!("CARGO_PKG_VERSION"));
@@ -141,6 +141,7 @@ pub struct Server {
     pub state: AppState,
     pub workers: WorkerPoolHandle,
     pub mcp_refresher: McpRefresher,
+    pub reflection_scheduler: ReflectionScheduler,
     pub http_addr: SocketAddr,
 }
 
@@ -148,13 +149,22 @@ pub struct Server {
 #[derive(Debug)]
 struct Collaborators {
     provider: SharedProvider,
-    // Held to keep the pool alive for the server's lifetime. Concrete impls
-    // (PgSessionStore, PgPromptQueue, …) each carry their own clone.
-    #[allow(dead_code)]
+    // The shared pool. Threaded into the worker pool for the reflection
+    // dispatch path (`agent.reflect` reads `session_messages` and writes
+    // `reflection_checkpoints`); concrete impls
+    // (PgSessionStore, PgPromptQueue, …) carry their own clones.
     pool: PgPool,
     sessions: SharedSessionStore,
     agents: SharedAgentStore,
     memory: SharedMemory,
+    // Held to keep clones alive next to the rest of the trait stack;
+    // both are also threaded into the system tools and the reflection
+    // scheduler at construction time so the duplicates here are not
+    // load-bearing reads.
+    #[allow(dead_code)]
+    memory_store: SharedMemoryStore,
+    #[allow(dead_code)]
+    session_memory_cache: Arc<SessionMemoryCache>,
     clock: SharedClock,
     builtin_tools: ToolRegistry,
     queue: SharedPromptQueue,
@@ -200,8 +210,8 @@ impl Collaborators {
         let memory: SharedMemory = Arc::new(AgentMemory::new(
             agents.clone(),
             cache,
-            memory_store,
-            session_memory_cache,
+            memory_store.clone(),
+            session_memory_cache.clone(),
             CORE_SYSTEM_PROMPT,
         ));
 
@@ -232,6 +242,7 @@ impl Collaborators {
                 dag: dag.clone(),
                 agents: agents.clone(),
                 sink: sink.clone(),
+                memory: MemoryToolDeps::new(memory_store.clone(), session_memory_cache.clone()),
             },
         )?
         .build();
@@ -242,6 +253,8 @@ impl Collaborators {
             sessions,
             agents,
             memory,
+            memory_store,
+            session_memory_cache,
             clock,
             builtin_tools,
             queue,
@@ -317,9 +330,19 @@ pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
         agents_registry,
         pieces.sessions.clone(),
         pieces.dag.clone(),
+        pieces.pool.clone(),
         WorkerConfig::default(),
     );
     let workers = pool.spawn();
+
+    // Background scheduler that periodically enqueues reflection turns
+    // (doc/memory.md §1.6 — Phase 4). Polls Postgres on a fixed cadence;
+    // the actual reflection runs through the worker pool above.
+    let reflection_scheduler = ReflectionScheduler::spawn(
+        pieces.pool.clone(),
+        pieces.queue.clone(),
+        pieces.clock.clone(),
+    );
 
     // Single-process fan-in subscriber for the chat-UI thread stream. Owns
     // its own LISTEN connection on the shared pool; tied to the same cancel
@@ -347,6 +370,7 @@ pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
         state,
         workers,
         mcp_refresher,
+        reflection_scheduler,
         http_addr: settings.http_addr,
     })
 }
@@ -359,6 +383,7 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
         state,
         workers,
         mcp_refresher,
+        reflection_scheduler,
         http_addr,
     } = server;
     let app = router(state);
@@ -376,7 +401,9 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
         warn!(error = %e, "http.serve.error");
     }
     info!("http.shutdown.complete");
-    // HTTP first, then refresher (no in-flight upstream MCP calls), then workers.
+    // HTTP first, then schedulers (no new enqueues), then workers.
+    reflection_scheduler.shutdown().await;
+    info!("reflection_scheduler.shutdown.complete");
     mcp_refresher.shutdown().await;
     info!("mcp.refresher.shutdown.complete");
     workers.shutdown().await;

@@ -18,6 +18,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
+use sqlx::PgPool;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -40,7 +42,7 @@ use super::queue::{
     ClaimReceipt, ClaimedSession, LeaseTiming, SharedLeaseManager, SharedPromptQueue,
 };
 use super::response::{ResponseChunk, SharedResponseSink};
-use super::types::{FailureReason, PromptRequestId, WorkerId};
+use super::types::{FailureReason, PromptRequestId, RequestKind, RequestKindPayload, WorkerId};
 
 /// System nudge appended to the receiver's history when the agent emitted a
 /// turn without calling `send_message`.
@@ -101,6 +103,11 @@ pub struct WorkerPool {
     agents: SharedAgents,
     sessions: SharedSessionStore,
     dag: SharedDagBudget,
+    /// Direct pool handle used by the reflection dispatch path
+    /// ([`Agent::reflect`] reads `session_messages` and writes to
+    /// `reflection_checkpoints`). The normal-turn path goes through the
+    /// trait surfaces and never touches this.
+    pool: PgPool,
     cfg: WorkerConfig,
 }
 
@@ -114,6 +121,7 @@ impl WorkerPool {
         agents: SharedAgents,
         sessions: SharedSessionStore,
         dag: SharedDagBudget,
+        pool: PgPool,
         cfg: WorkerConfig,
     ) -> Self {
         Self {
@@ -123,6 +131,7 @@ impl WorkerPool {
             agents,
             sessions,
             dag,
+            pool,
             cfg,
         }
     }
@@ -145,6 +154,7 @@ impl WorkerPool {
                 agents: self.agents.clone(),
                 sessions: self.sessions.clone(),
                 dag: self.dag.clone(),
+                pool: self.pool.clone(),
                 cfg: cfg.clone(),
                 shutdown: shutdown.clone(),
             };
@@ -167,6 +177,7 @@ struct Worker {
     agents: SharedAgents,
     sessions: SharedSessionStore,
     dag: SharedDagBudget,
+    pool: PgPool,
     cfg: WorkerConfig,
     shutdown: CancellationToken,
 }
@@ -251,13 +262,36 @@ impl Worker {
 
         let heartbeat = self.spawn_heartbeat(receipt.clone());
         let cancel_watcher = self.spawn_cancel_watcher(receipt.clone(), cancel.clone());
-        let observer: SharedTurnObserver = Arc::new(FanOutObserver {
-            sink: self.sink.clone(),
-            receipt: receipt.clone(),
-        });
 
-        self.run_with_pingpong_guard(&agent, &claim, prompts, cancel.clone(), observer, &receipt)
-            .await;
+        match claim.kind {
+            RequestKind::Normal => {
+                let observer: SharedTurnObserver = Arc::new(FanOutObserver {
+                    sink: self.sink.clone(),
+                    receipt: receipt.clone(),
+                });
+                self.run_with_pingpong_guard(
+                    &agent,
+                    &claim,
+                    prompts,
+                    cancel.clone(),
+                    observer,
+                    &receipt,
+                )
+                .await;
+            }
+            RequestKind::Reflection => {
+                self.run_reflection(&agent, &claim, cancel.clone(), &receipt)
+                    .await;
+            }
+            RequestKind::Resolution => {
+                // Phase 7 wires the librarian-resolution dispatch. Until
+                // then, mark the row failed so an accidentally-enqueued
+                // resolution does not pin the lease.
+                let reason =
+                    FailureReason::Unrecoverable("resolution dispatch not implemented".into());
+                self.finalise(&receipt, reason).await;
+            }
+        }
 
         cancel_watcher.abort();
         let _ = cancel_watcher.await;
@@ -267,6 +301,137 @@ impl Worker {
         if let Err(e) = self.leases.release(receipt.lease()).await {
             warn!(error = %e, "worker.lease.release.error");
         }
+    }
+
+    /// Reflection turn — invoked when the queue hands us a
+    /// `RequestKind::Reflection` row. No SSE, no DAG quiescence, no
+    /// ping-pong guard; success/failure is recorded on the prompt
+    /// request just like a normal turn so the scheduler can advance.
+    async fn run_reflection(
+        &self,
+        agent: &Agent,
+        claim: &ClaimedSession,
+        cancel: CancellationToken,
+        receipt: &Arc<ClaimReceipt>,
+    ) {
+        // §6: the queue's payload variant must agree with the row's kind
+        // (asserted at insert time too); a missing payload here is a
+        // schema corruption signal.
+        let (session_id, since_turn_id) = match claim.kind_payload.as_ref() {
+            Some(RequestKindPayload::Reflection {
+                session_id,
+                since_turn_id,
+            }) => (*session_id, Some(*since_turn_id)),
+            other => {
+                warn!(
+                    relay.session.id = %claim.session,
+                    payload = ?other,
+                    "worker.reflect.bad_payload",
+                );
+                self.finalise(
+                    receipt,
+                    FailureReason::Unrecoverable(
+                        "reflection payload missing or wrong shape".into(),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        // The claim's session is the row's session — the scheduler
+        // enqueues against the same session it found turns for, so the
+        // payload's session must match.
+        if session_id != claim.session {
+            warn!(
+                relay.session.id = %claim.session,
+                relay.payload.session.id = %session_id,
+                "worker.reflect.payload_session_mismatch",
+            );
+        }
+
+        let request_id = claim
+            .prompts
+            .first()
+            .expect("invariant: claim drains at least one prompt")
+            .request_id;
+
+        let outcome = timeout(
+            self.cfg.max_turn_duration,
+            agent.reflect(
+                &self.pool,
+                claim.receiver_agent_id,
+                claim.session,
+                request_id,
+                since_turn_id,
+                cancel,
+            ),
+        )
+        .await;
+
+        match outcome {
+            Ok(Ok(reflection)) => {
+                if let Err(e) = self
+                    .write_reflection_checkpoint(
+                        claim.receiver_agent_id,
+                        claim.session,
+                        &reflection,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "worker.reflect.checkpoint.error");
+                    let reason = FailureReason::Unrecoverable(format!("checkpoint: {e}"));
+                    self.finalise(receipt, reason).await;
+                    return;
+                }
+                if let Err(e) = self.queue.mark_done(receipt).await {
+                    warn!(error = %e, "worker.reflect.mark_done.error");
+                }
+                info!(
+                    relay.session.id = %claim.session,
+                    relay.agent.id = %claim.receiver_agent_id,
+                    relay.reflection.mutations = reflection.mutations,
+                    "worker.reflect.ok",
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "worker.reflect.error");
+                self.finalise(receipt, FailureReason::Provider(e.to_string()))
+                    .await;
+            }
+            Err(_elapsed) => {
+                warn!(relay.session.id = %claim.session, "worker.reflect.timeout");
+                self.finalise(receipt, FailureReason::Timeout).await;
+            }
+        }
+    }
+
+    /// Upsert the `(agent, session)` row in `reflection_checkpoints`.
+    /// `reflection_event_id` is left NULL — the schema allows it
+    /// (migration 8) and Phase 5 will wire it through once the
+    /// individual mutation events are linked.
+    async fn write_reflection_checkpoint(
+        &self,
+        agent: crate::agents::AgentId,
+        session: SessionId,
+        reflection: &crate::agent_core::ReflectionOutcome,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO reflection_checkpoints
+                 (agent_id, session_id, last_turn_id, reflection_event_id, created_at)
+             VALUES ($1, $2, $3, NULL, $4)
+             ON CONFLICT (agent_id, session_id) DO UPDATE
+                 SET last_turn_id = EXCLUDED.last_turn_id,
+                     reflection_event_id = EXCLUDED.reflection_event_id,
+                     created_at = EXCLUDED.created_at",
+        )
+        .bind(agent)
+        .bind(session)
+        .bind(reflection.last_processed_turn_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn run_with_pingpong_guard(

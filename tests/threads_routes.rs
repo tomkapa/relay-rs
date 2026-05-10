@@ -113,6 +113,8 @@ async fn enqueue_human_root(harness: &ThreadsHarness, content: &str, key: &str) 
             parent_session: None,
             content: Prompt::try_from(content).expect("prompt"),
             idempotency_key: IdempotencyKey::try_from(key).expect("key"),
+            kind: relay_rs::runtime::RequestKind::Normal,
+            kind_payload: None,
         })
         .await
         .expect("enqueue")

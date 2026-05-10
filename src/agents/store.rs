@@ -14,6 +14,9 @@ use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt};
 pub struct NewAgent {
     pub name: AgentName,
     pub system_prompt: AgentSystemPrompt,
+    /// Optional reflection-turn guidance (doc/memory.md §1.6). `None`
+    /// uses the default reflection-core prompt alone.
+    pub reflection_role: Option<AgentSystemPrompt>,
     /// When `true`, the new row becomes the default; the previously-default row
     /// is demoted in the same transaction so the partial unique index is
     /// satisfied.
@@ -27,10 +30,15 @@ pub struct NewAgent {
 /// demote-then-promote; `is_default = Some(false)` is rejected when applied to
 /// the current default row (the system requires a default to exist at all
 /// times).
+///
+/// `reflection_role` uses a doubly-wrapped `Option` so PATCH can express
+/// "leave alone" (`None`), "set to value" (`Some(Some(prompt))`), and
+/// "clear back to default" (`Some(None)`).
 #[derive(Debug, Clone, Default)]
 pub struct AgentUpdate {
     pub name: Option<AgentName>,
     pub system_prompt: Option<AgentSystemPrompt>,
+    pub reflection_role: Option<Option<AgentSystemPrompt>>,
     pub is_default: Option<bool>,
 }
 

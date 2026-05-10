@@ -14,6 +14,7 @@ mod agent;
 mod composer;
 mod limits;
 mod pg_store;
+mod reflection_scheduler;
 mod session_cache;
 mod r#static;
 mod store;
@@ -26,10 +27,13 @@ pub use composer::{
 };
 pub use limits::{
     CONTEXTUAL_LAYER_MAX_BYTES, CONTEXTUAL_TOP_K, CONTRADICTION_REASON_MAX_BYTES,
-    MAX_EVENTS_PER_PAGE, MAX_MEMORIES_PER_AGENT, MEMORY_CONTENT_MAX_BYTES,
-    SESSION_MEMORY_CACHE_CAP, SESSION_MEMORY_CACHE_TTL_SECS, STABLE_LAYER_MAX_BYTES,
+    MAX_EVENTS_PER_PAGE, MAX_MEMORIES_PER_AGENT, MAX_MEMORY_MUTATIONS_PER_REFLECTION,
+    MAX_MEMORY_MUTATIONS_PER_TURN, MEMORY_CONTENT_MAX_BYTES, REFLECTION_IDLE_TIMEOUT_SECS,
+    REFLECTION_SCHEDULER_BATCH_LIMIT, REFLECTION_SCHEDULER_POLL_SECS, SESSION_MEMORY_CACHE_CAP,
+    SESSION_MEMORY_CACHE_TTL_SECS, STABLE_LAYER_MAX_BYTES,
 };
 pub use pg_store::PgMemoryStore;
+pub use reflection_scheduler::ReflectionScheduler;
 pub use session_cache::SessionMemoryCache;
 pub use r#static::StaticMemory;
 pub use store::{

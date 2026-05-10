@@ -44,6 +44,10 @@ struct AgentResponse {
     id: AgentId,
     name: String,
     system_prompt: String,
+    /// `null` when the agent has no role-specific reflection guidance —
+    /// reflection turns then run with the default reflection-core prompt
+    /// alone.
+    reflection_role: Option<String>,
     is_default: bool,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -55,6 +59,7 @@ impl From<AgentRecord> for AgentResponse {
             id: r.id,
             name: r.name.as_str().to_owned(),
             system_prompt: r.system_prompt.as_str().to_owned(),
+            reflection_role: r.reflection_role.as_ref().map(|p| p.as_str().to_owned()),
             is_default: r.is_default,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -66,6 +71,11 @@ impl From<AgentRecord> for AgentResponse {
 struct CreateAgentRequest {
     name: String,
     system_prompt: String,
+    /// Optional per-agent reflection guidance (doc/memory.md §1.6).
+    /// Omit (or send `null` / empty string) to leave reflection on the
+    /// default core prompt alone.
+    #[serde(default)]
+    reflection_role: Option<String>,
     /// When `true`, the new agent becomes the default. The previously-default
     /// row is demoted in the same transaction.
     #[serde(default)]
@@ -78,6 +88,12 @@ struct UpdateAgentRequest {
     name: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
+    /// PATCH semantics: omit to leave alone, send a non-empty string to
+    /// set, send an empty string to clear back to `null`. Wire shape
+    /// trade-off — JSON does not distinguish "missing" from "null"
+    /// without a custom deserializer.
+    #[serde(default)]
+    reflection_role: Option<String>,
     /// `Some(true)` promotes this row to default (atomically demotes the
     /// previous default). `Some(false)` is rejected when applied to the
     /// current default — the system requires exactly one default at all times.
@@ -92,11 +108,18 @@ async fn create_agent(
     let name = AgentName::try_from(payload.name).map_err(HttpError::Parse)?;
     let system_prompt =
         AgentSystemPrompt::try_from(payload.system_prompt).map_err(HttpError::Parse)?;
+    let reflection_role = payload
+        .reflection_role
+        .filter(|s| !s.is_empty())
+        .map(AgentSystemPrompt::try_from)
+        .transpose()
+        .map_err(HttpError::Parse)?;
     let record = state
         .agents
         .create(NewAgent {
             name,
             system_prompt,
+            reflection_role,
             is_default: payload.is_default,
         })
         .await?;
@@ -133,6 +156,14 @@ async fn update_agent(
         .map(AgentSystemPrompt::try_from)
         .transpose()
         .map_err(HttpError::Parse)?;
+    // Empty string means "clear back to NULL"; absent means "leave alone".
+    let reflection_role = match payload.reflection_role {
+        None => None,
+        Some(s) if s.is_empty() => Some(None),
+        Some(s) => Some(Some(
+            AgentSystemPrompt::try_from(s).map_err(HttpError::Parse)?,
+        )),
+    };
     let row = state
         .agents
         .update(
@@ -140,6 +171,7 @@ async fn update_agent(
             AgentUpdate {
                 name,
                 system_prompt,
+                reflection_role,
                 is_default: payload.is_default,
             },
         )

@@ -77,3 +77,36 @@ pub const SESSION_MEMORY_CACHE_CAP: usize = 1024;
 /// that a session resumed after a long idle picks up new memories
 /// written in between.
 pub const SESSION_MEMORY_CACHE_TTL_SECS: u64 = 60 * 60;
+
+/// Per-turn cap on memory mutations (write + update + forget combined).
+///
+/// CLAUDE.md §5: every batch capped. A single normal turn that produces
+/// more than this many memory mutations is almost certainly a model
+/// runaway — we reject the overflowing call and let the model continue.
+/// Reflection turns share the same per-turn cap.
+pub const MAX_MEMORY_MUTATIONS_PER_TURN: usize = 8;
+
+/// Per-reflection cap on total mutations.
+///
+/// doc/memory.md §1.6 — "dreams cannot produce 30 writes a night and
+/// bloat the journal with noise". Higher than the per-turn cap because
+/// reflection looks at a longer span of conversation, but still bounded.
+pub const MAX_MEMORY_MUTATIONS_PER_REFLECTION: usize = 16;
+
+/// Idle timeout after which a session qualifies for a reflection sweep
+/// (doc/memory.md §1.6 — "the time since the last turn exceeds a
+/// configurable idle timeout").
+///
+/// Long enough that an active conversation does not get reflected mid-
+/// burst; short enough that overnight idleness produces consolidation
+/// before the user resumes.
+pub const REFLECTION_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Polling cadence for the reflection scheduler. Bounded so a tight
+/// loop cannot pin the database under quiescence.
+pub const REFLECTION_SCHEDULER_POLL_SECS: u64 = 60;
+
+/// Cap on how many `(agent, session)` pairs the reflection scheduler
+/// enqueues per poll. Bounded so a sudden burst of idle sessions cannot
+/// overwhelm the queue.
+pub const REFLECTION_SCHEDULER_BATCH_LIMIT: usize = 32;

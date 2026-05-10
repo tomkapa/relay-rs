@@ -493,14 +493,14 @@ impl SendMessageTool {
             .expect("invariant: validate() rejects non-agent callers");
         let outcome = self
             .queue
-            .enqueue(NewPromptRequest {
-                session: Some(receiver_session),
-                sender: ctx.viewer,
+            .enqueue(NewPromptRequest::normal(
+                Some(receiver_session),
+                ctx.viewer,
                 receiver_agent_id,
-                parent_session: Some(ctx.session_id),
+                Some(ctx.session_id),
                 content,
-                idempotency_key: key,
-            })
+                key,
+            ))
             .await
             .map_err(|e| {
                 set_outcome("enqueue_failed");

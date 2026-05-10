@@ -18,7 +18,8 @@ use crate::types::{Participant, Prompt};
 use super::error::{LeaseTimingError, PromptError};
 use super::limits::{LEASE_HEARTBEAT_INTERVAL, LEASE_TTL};
 use super::types::{
-    FailureReason, IdempotencyKey, PromptRequestId, RequestStatus, TurnSeq, WorkerId,
+    FailureReason, IdempotencyKey, PromptRequestId, RequestKind, RequestKindPayload, RequestStatus,
+    TurnSeq, WorkerId,
 };
 
 /// Co-validated lease timing.
@@ -155,6 +156,40 @@ pub struct NewPromptRequest {
     pub parent_session: Option<SessionId>,
     pub content: Prompt,
     pub idempotency_key: IdempotencyKey,
+    /// Job kind (doc/memory.md §2.1). Defaults to [`RequestKind::Normal`]
+    /// for HTTP-triggered prompts; the reflection scheduler enqueues with
+    /// [`RequestKind::Reflection`] and the librarian enqueues with
+    /// [`RequestKind::Resolution`].
+    pub kind: RequestKind,
+    /// Kind-specific payload — must agree with `kind`. `Normal` carries
+    /// no payload; `Reflection` and `Resolution` carry their respective
+    /// variants from [`RequestKindPayload`].
+    pub kind_payload: Option<RequestKindPayload>,
+}
+
+impl NewPromptRequest {
+    /// Build a normal user-facing prompt with no kind payload — the
+    /// shape every HTTP-triggered enqueue takes.
+    #[must_use]
+    pub fn normal(
+        session: Option<SessionId>,
+        sender: Participant,
+        receiver_agent_id: AgentId,
+        parent_session: Option<SessionId>,
+        content: Prompt,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            session,
+            sender,
+            receiver_agent_id,
+            parent_session,
+            content,
+            idempotency_key,
+            kind: RequestKind::Normal,
+            kind_payload: None,
+        }
+    }
 }
 
 /// Outcome of an enqueue. Idempotent retries return [`EnqueueOutcome::Existing`] so the
@@ -222,6 +257,15 @@ pub struct ClaimedSession {
     pub prompts: Vec<ClaimedPrompt>,
     pub lease: LeaseToken,
     pub traceparent: Option<String>,
+    /// The job kind for this batch — every drained row in `prompts`
+    /// shares it because the queue groups by `(session, kind)` per claim.
+    /// Drives worker dispatch (Normal → `agent.reply_batch`, Reflection
+    /// → `agent.reflect`).
+    pub kind: RequestKind,
+    /// Kind-specific payload from the first drained row. `Normal` rows
+    /// carry `None`; the worker pulls the metadata it needs out of the
+    /// variant for `Reflection` / `Resolution`.
+    pub kind_payload: Option<RequestKindPayload>,
 }
 
 impl ClaimedSession {

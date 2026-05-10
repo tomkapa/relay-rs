@@ -153,6 +153,7 @@ pub async fn build_harness(provider: Arc<ScriptedProvider>) -> WorkerHarness {
         agents_registry,
         sessions.clone(),
         dag.clone(),
+        db.pool.clone(),
         cfg,
     )
     .spawn();

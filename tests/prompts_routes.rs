@@ -96,6 +96,7 @@ impl PromptsHarness {
             .create(NewAgent {
                 name: AgentName::try_from(name).expect("name"),
                 system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
+                reflection_role: None,
                 is_default: false,
             })
             .await
@@ -154,6 +155,8 @@ async fn followup_with_session_id_routes_to_session_agent() {
             parent_session: None,
             content: Prompt::try_from("hi").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-root").expect("key"),
+            kind: relay_rs::runtime::RequestKind::Normal,
+            kind_payload: None,
         })
         .await
         .expect("enqueue root");
