@@ -8,6 +8,9 @@
 //! expire after [`crate::agents::limits::AGENT_PROMPT_CACHE_TTL`] so an
 //! admin's edit to an agent row becomes visible to live workers within
 //! the TTL window.
+//!
+//! Cheap-clone — sharing the cache between subsystems does not need an
+//! external `Arc<...>` wrapper.
 
 use std::time::Duration;
 
@@ -18,10 +21,10 @@ use super::error::AgentStoreError;
 use super::store::SharedAgentStore;
 use super::types::{AgentId, AgentSystemPrompt};
 
-/// Bounded TTL cache keyed by [`AgentId`]. Cheap-clone is not supported
-/// on purpose — share via `Arc<AgentPromptCache>` if multiple owners
-/// are needed.
-#[derive(Debug)]
+/// Bounded TTL cache keyed by [`AgentId`]. Cheap-clone — the inner
+/// [`BoundedTtlCache`] is itself an `Arc`, so cloning shares the
+/// underlying state.
+#[derive(Debug, Clone)]
 pub struct AgentPromptCache {
     inner: BoundedTtlCache<AgentId, AgentSystemPrompt>,
 }

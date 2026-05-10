@@ -1,5 +1,10 @@
 //! Generic bounded-TTL cache.
 //!
+//! Cheap-clone by construction — the cache holds an internal `Arc`, so
+//! cloning the handle costs one atomic increment and every clone shares
+//! the same underlying state. Callers no longer need to wrap it in an
+//! external `Arc<...>`.
+//!
 //! Hot path: one mutex round-trip + one HashMap lookup. On miss the lock
 //! is released, the supplied loader runs without contention, then the
 //! lock is re-acquired to insert. Cache size is bounded; eviction
@@ -18,7 +23,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::clock::SharedClock;
@@ -29,17 +34,34 @@ struct Entry<V> {
     fetched_at: Instant,
 }
 
-/// Bounded TTL cache. Cheap-clone is not supported on purpose — share
-/// via `Arc<BoundedTtlCache<...>>` if multiple owners are needed.
-///
-/// The value type must be `Clone`-cheap (typically an `Arc<T>` or a
-/// reference-counted newtype) since `get_or_load` returns owned values.
-pub struct BoundedTtlCache<K, V> {
-    inner: Mutex<HashMap<K, Entry<V>>>,
+/// Internal state held behind the [`BoundedTtlCache`]'s `Arc`. The
+/// outer struct exists so we can derive `Clone` cheaply and so the
+/// label / cap / ttl fields stay accessible without taking the lock.
+#[derive(Debug)]
+struct Inner<K, V> {
+    state: Mutex<HashMap<K, Entry<V>>>,
     cap: usize,
     ttl: Duration,
     clock: SharedClock,
     label: &'static str,
+}
+
+/// Bounded TTL cache.
+///
+/// Cheap-clone — the handle itself is an `Arc<...>` so cloning shares
+/// the underlying state. The value type must be `Clone`-cheap
+/// (typically an `Arc<T>` or a reference-counted newtype) since
+/// `get_or_load` returns owned values.
+pub struct BoundedTtlCache<K, V> {
+    inner: Arc<Inner<K, V>>,
+}
+
+impl<K, V> Clone for BoundedTtlCache<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<K, V> BoundedTtlCache<K, V>
@@ -56,11 +78,13 @@ where
         assert!(cap > 0, "invariant: {label} cap must be > 0");
         assert!(!ttl.is_zero(), "invariant: {label} ttl must be > 0");
         Self {
-            inner: Mutex::new(HashMap::new()),
-            cap,
-            ttl,
-            clock,
-            label,
+            inner: Arc::new(Inner {
+                state: Mutex::new(HashMap::new()),
+                cap,
+                ttl,
+                clock,
+                label,
+            }),
         }
     }
 
@@ -72,7 +96,7 @@ where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
     {
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
         if let Some(value) = self.lookup_fresh(key, now) {
             return Ok(value);
         }
@@ -84,7 +108,7 @@ where
     fn lookup_fresh(&self, key: K, now: Instant) -> Option<V> {
         let cache = self.lock();
         let entry = cache.get(&key)?;
-        if now.saturating_duration_since(entry.fetched_at) >= self.ttl {
+        if now.saturating_duration_since(entry.fetched_at) >= self.inner.ttl {
             return None;
         }
         Some(entry.value.clone())
@@ -92,12 +116,12 @@ where
 
     fn insert(&self, key: K, value: V, now: Instant) {
         let mut cache = self.lock();
-        if cache.len() >= self.cap && !cache.contains_key(&key) {
-            evict_one(&mut cache, now, self.ttl);
+        if cache.len() >= self.inner.cap && !cache.contains_key(&key) {
+            evict_one(&mut cache, now, self.inner.ttl);
             assert!(
-                cache.len() < self.cap,
+                cache.len() < self.inner.cap,
                 "invariant: {} eviction made room",
-                self.label
+                self.inner.label
             );
         }
         cache.insert(
@@ -111,8 +135,9 @@ where
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<K, Entry<V>>> {
         self.inner
+            .state
             .lock()
-            .unwrap_or_else(|_| panic!("invariant: {} mutex never poisoned", self.label))
+            .unwrap_or_else(|_| panic!("invariant: {} mutex never poisoned", self.inner.label))
     }
 
     /// Test/inspection: number of entries currently held.
@@ -130,9 +155,9 @@ where
 impl<K, V> fmt::Debug for BoundedTtlCache<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BoundedTtlCache")
-            .field("label", &self.label)
-            .field("cap", &self.cap)
-            .field("ttl", &self.ttl)
+            .field("label", &self.inner.label)
+            .field("cap", &self.inner.cap)
+            .field("ttl", &self.inner.ttl)
             .finish_non_exhaustive()
     }
 }
@@ -174,15 +199,10 @@ mod tests {
 
     use super::*;
 
-    fn cache(cap: usize, ttl_secs: u64) -> (Arc<BoundedTtlCache<u64, u64>>, Arc<TestClock>) {
+    fn cache(cap: usize, ttl_secs: u64) -> (BoundedTtlCache<u64, u64>, Arc<TestClock>) {
         let clock = Arc::new(TestClock::new());
         let shared: SharedClock = clock.clone();
-        let c = Arc::new(BoundedTtlCache::new(
-            cap,
-            Duration::from_secs(ttl_secs),
-            shared,
-            "test",
-        ));
+        let c = BoundedTtlCache::new(cap, Duration::from_secs(ttl_secs), shared, "test");
         (c, clock)
     }
 
@@ -245,5 +265,22 @@ mod tests {
         let second: Result<u64, Boom> =
             c.get_or_load(1u64, || async { Ok::<_, Boom>(99u64) }).await;
         assert_eq!(second, Ok(99u64));
+    }
+
+    #[tokio::test]
+    async fn clones_share_state() {
+        let (c, _clock) = cache(8, 60);
+        let _: u64 = c
+            .get_or_load(1u64, || async { Ok::<_, Infallible>(11u64) })
+            .await
+            .expect("ok");
+        let cloned = c.clone();
+        let v: u64 = cloned
+            .get_or_load(1u64, || async { Ok::<_, Infallible>(22u64) })
+            .await
+            .expect("ok");
+        // Same key resolved through the clone returns the original value
+        // — proves the inner Arc state is shared.
+        assert_eq!(v, 11u64);
     }
 }

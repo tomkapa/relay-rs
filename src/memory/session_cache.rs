@@ -4,6 +4,9 @@
 //! `(SessionId, AgentId)` key and the `Arc<MemorySection>` value
 //! together with the loader closure the agent layer hands in.
 //!
+//! Cheap-clone — sharing the cache between subsystems does not need an
+//! external `Arc<...>` wrapper.
+//!
 //! ## Divergence from `doc/memory.md` §1.3 — revisit
 //!
 //! The doc says memory is "assembled at session start and frozen for
@@ -37,10 +40,10 @@ use crate::session::SessionId;
 
 use super::composer::MemorySection;
 
-/// Per (session, agent) cache of composed sections. Cheap-clone is not
-/// supported on purpose — share via `Arc<SessionMemoryCache>` if
-/// multiple owners are needed.
-#[derive(Debug)]
+/// Per (session, agent) cache of composed sections. Cheap-clone — the
+/// inner [`BoundedTtlCache`] is itself an `Arc`, so cloning shares the
+/// underlying state.
+#[derive(Debug, Clone)]
 pub struct SessionMemoryCache {
     inner: BoundedTtlCache<(SessionId, AgentId), Arc<MemorySection>>,
 }

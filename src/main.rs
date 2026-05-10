@@ -12,9 +12,6 @@ async fn main() -> Result<()> {
     let _otel = observability::init();
 
     let settings = Settings::load().context("load settings")?;
-    let server = app::build_server(settings)
-        .await
-        .context("compose server")?;
 
     // First Ctrl-C asks for graceful shutdown; second Ctrl-C aborts. axum's
     // `with_graceful_shutdown` waits for every in-flight connection to close,
@@ -22,7 +19,16 @@ async fn main() -> Result<()> {
     // operator stuck. The escape hatch belongs in `main` because by the time
     // the second signal lands the runtime cannot be trusted to drive a clean
     // exit (CLAUDE.md §6 — assertion-shaped: cannot continue).
+    //
+    // `cancel` is created up-front so subsystems built inside
+    // `build_server` (e.g. the reflection scheduler) can subscribe to
+    // the same token and react to Ctrl+C in lockstep.
     let cancel = CancellationToken::new();
+
+    let server = app::build_server(settings, cancel.clone())
+        .await
+        .context("compose server")?;
+
     let watch = cancel.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {

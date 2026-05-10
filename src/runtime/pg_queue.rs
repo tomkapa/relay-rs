@@ -272,16 +272,16 @@ impl PromptQueue for PgPromptQueue {
         // Two scoping rules per doc/memory.md §2.4:
         //
         // 1. The session itself must have no live lease (existing rule).
-        // 2. If the candidate row is `kind != 'normal'` (a memory-mutating
-        //    Reflection or Resolution job), the agent must not already have
-        //    *any* in-flight memory-mutating job. This serialises reflection
-        //    and resolution per agent so two of them cannot race against
-        //    the journal.
+        // 2. If the candidate row is non-normal (a memory-mutating
+        //    Reflection or Resolution job), the agent must not already
+        //    have *any* in-flight memory-mutating job. This serialises
+        //    reflection and resolution per agent so two of them cannot
+        //    race against the journal.
         //
         // The partial index `prompt_requests_pending_idx (session_id,
-        // created_at) WHERE status = 'pending'` is the primary access path;
-        // the per-agent NOT EXISTS does a small lookup against the live
-        // leases table.
+        // created_at) WHERE status = 'pending'` is the primary access
+        // path; the per-agent NOT EXISTS does a small lookup against
+        // the live leases table.
         let candidate: Option<(SessionId,)> = sqlx::query_as(
             "SELECT pr.session_id
              FROM prompt_requests pr
@@ -292,15 +292,15 @@ impl PromptQueue for PgPromptQueue {
                      AND sl.leased_until > $2
                )
                AND (
-                   pr.kind = 'normal'
+                   pr.kind = $3
                    OR NOT EXISTS (
                        SELECT 1 FROM prompt_requests pr2
                        JOIN session_leases sl2
                             ON sl2.session_id = pr2.session_id
                            AND sl2.leased_until > $2
                        WHERE pr2.receiver_agent_id = pr.receiver_agent_id
-                         AND pr2.status = 'processing'
-                         AND pr2.kind IN ('reflection', 'resolution')
+                         AND pr2.status = $4
+                         AND pr2.kind <> $3
                    )
                )
              ORDER BY pr.created_at ASC
@@ -308,6 +308,8 @@ impl PromptQueue for PgPromptQueue {
         )
         .bind(RequestStatus::Pending)
         .bind(now)
+        .bind(RequestKind::Normal)
+        .bind(RequestStatus::Processing)
         .fetch_optional(&mut *tx)
         .await?;
 

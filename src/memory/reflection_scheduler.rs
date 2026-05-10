@@ -28,7 +28,7 @@ use crate::agents::AgentId;
 use crate::clock::SharedClock;
 use crate::runtime::{
     IdempotencyKey, NewPromptRequest, PromptRequestId, RequestKind, RequestKindPayload,
-    SharedPromptQueue,
+    RequestStatus, SharedPromptQueue,
 };
 use crate::session::SessionId;
 use crate::types::{Participant, Prompt};
@@ -37,8 +37,18 @@ use super::limits::{
     REFLECTION_IDLE_TIMEOUT_SECS, REFLECTION_SCHEDULER_BATCH_LIMIT, REFLECTION_SCHEDULER_POLL_SECS,
 };
 
-/// Owned wrapper around the scheduler task. Drop or call
-/// [`Self::shutdown`] to wind it down.
+/// Owned wrapper around the scheduler task.
+///
+/// Cancellation has two paths that fire together:
+///
+/// - The owned [`DropGuard`] cancels an internal child token, so
+///   dropping or calling [`Self::shutdown`] always winds the loop down
+///   even when no parent token was supplied.
+/// - When a parent token is passed to [`Self::spawn_with_cadence`] the
+///   internal child also reacts to the parent's cancellation, so a
+///   process-wide Ctrl+C signal (delivered through the main
+///   `CancellationToken`) propagates here in lockstep with the rest of
+///   the runtime.
 pub struct ReflectionScheduler {
     shutdown: DropGuard,
     handle: JoinHandle<()>,
@@ -53,29 +63,45 @@ impl std::fmt::Debug for ReflectionScheduler {
 
 impl ReflectionScheduler {
     /// Spawn the background loop with the production poll cadence
-    /// ([`REFLECTION_SCHEDULER_POLL_SECS`]).
+    /// ([`REFLECTION_SCHEDULER_POLL_SECS`]) and the supplied parent
+    /// token. The composition root (`src/app.rs`) passes its main
+    /// runtime cancel token here so Ctrl+C cancels the scheduler in
+    /// lockstep with HTTP / workers / MCP refresher.
     #[must_use]
-    pub fn spawn(pool: PgPool, queue: SharedPromptQueue, clock: SharedClock) -> Self {
+    pub fn spawn(
+        pool: PgPool,
+        queue: SharedPromptQueue,
+        clock: SharedClock,
+        parent: CancellationToken,
+    ) -> Self {
         Self::spawn_with_cadence(
             pool,
             queue,
             clock,
             Duration::from_secs(REFLECTION_SCHEDULER_POLL_SECS),
+            Some(parent),
         )
     }
 
-    /// Spawn with an explicit poll cadence. Used by tests so they don't
-    /// have to wait the production 60-second tick; callers in
+    /// Spawn with an explicit poll cadence. Used by tests so they
+    /// don't have to wait the production 60-second tick; callers in
     /// composition roots use [`Self::spawn`].
+    ///
+    /// `parent` is the optional outer cancellation token. When `Some`,
+    /// the loop also exits when the parent is cancelled — this is how
+    /// the production runtime threads its main Ctrl+C signal in.
+    /// Tests typically pass `None` and rely on
+    /// [`Self::shutdown`] / drop.
     #[must_use]
     pub fn spawn_with_cadence(
         pool: PgPool,
         queue: SharedPromptQueue,
         clock: SharedClock,
         poll_interval: Duration,
+        parent: Option<CancellationToken>,
     ) -> Self {
-        let cancel = CancellationToken::new();
-        let token = cancel.clone();
+        let owned = CancellationToken::new();
+        let local_for_loop = owned.clone();
         let inner = SchedulerLoop {
             pool,
             queue,
@@ -87,9 +113,9 @@ impl ReflectionScheduler {
             ),
             batch_limit: REFLECTION_SCHEDULER_BATCH_LIMIT,
         };
-        let handle = tokio::spawn(async move { inner.run(token).await });
+        let handle = tokio::spawn(async move { inner.run(local_for_loop, parent).await });
         Self {
-            shutdown: cancel.drop_guard(),
+            shutdown: owned.drop_guard(),
             handle,
         }
     }
@@ -114,11 +140,18 @@ struct SchedulerLoop {
 }
 
 impl SchedulerLoop {
-    async fn run(self, cancel: CancellationToken) {
+    /// Drive the loop until either the owned `local` token cancels
+    /// (drop / explicit shutdown) or the optional `parent` cancels
+    /// (process-wide Ctrl+C).
+    async fn run(self, local: CancellationToken, parent: Option<CancellationToken>) {
         loop {
+            // `parent.is_none()` collapses to the same shape as
+            // having a never-cancelled token without an extra arm —
+            // build a future that resolves on either.
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => return,
+                () = local.cancelled() => return,
+                () = parent_cancelled(parent.as_ref()) => return,
                 () = tokio::time::sleep(self.poll_interval) => {},
             }
             if let Err(e) = self.tick().await {
@@ -191,8 +224,8 @@ impl SchedulerLoop {
                AND NOT EXISTS (
                    SELECT 1 FROM prompt_requests pr
                    WHERE pr.session_id = s.id
-                     AND pr.kind = 'reflection'
-                     AND pr.status IN ('pending', 'processing')
+                     AND pr.kind = $3
+                     AND pr.status IN ($4, $5)
                )
              UNION ALL
              SELECT s.participant_b_agent_id AS agent_id,
@@ -214,14 +247,17 @@ impl SchedulerLoop {
                AND NOT EXISTS (
                    SELECT 1 FROM prompt_requests pr
                    WHERE pr.session_id = s.id
-                     AND pr.kind = 'reflection'
-                     AND pr.status IN ('pending', 'processing')
+                     AND pr.kind = $3
+                     AND pr.status IN ($4, $5)
                )
              ORDER BY latest_at ASC
              LIMIT $2",
         )
         .bind(cutoff)
         .bind(i64::try_from(self.batch_limit).expect("invariant: batch limit fits in i64"))
+        .bind(RequestKind::Reflection)
+        .bind(RequestStatus::Pending)
+        .bind(RequestStatus::Processing)
         .fetch_all(&self.pool)
         .await?;
 
@@ -279,6 +315,16 @@ impl SchedulerLoop {
             "reflection_scheduler.enqueued.row",
         );
         Ok(())
+    }
+}
+
+/// Helper for the dual-token select arm: resolves only when `parent`
+/// exists and is cancelled. When `parent` is `None`, the future never
+/// resolves, so the loop only watches the local token.
+async fn parent_cancelled(parent: Option<&CancellationToken>) {
+    match parent {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending::<()>().await,
     }
 }
 

@@ -42,13 +42,9 @@ async fn fixture(db: &TestDb) -> Fixture {
     let agents: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
-    let prompt_cache = Arc::new(AgentPromptCache::new(
-        8,
-        Duration::from_secs(60),
-        clock.clone(),
-    ));
+    let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
     let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(db.pool.clone(), clock.clone()));
-    let session_cache = Arc::new(SessionMemoryCache::new(8, Duration::from_secs(60), clock));
+    let session_cache = SessionMemoryCache::new(8, Duration::from_secs(60), clock);
     let _memory = AgentMemory::new(
         agents,
         prompt_cache,
@@ -286,11 +282,7 @@ async fn handle_round_trips_through_session_cache() {
         Arc::new(PgAgentStore::new(db.pool.clone(), SystemClock::shared()));
     let memory = AgentMemory::new(
         agents,
-        Arc::new(AgentPromptCache::new(
-            2,
-            Duration::from_secs(60),
-            SystemClock::shared(),
-        )),
+        AgentPromptCache::new(2, Duration::from_secs(60), SystemClock::shared()),
         store,
         f.deps.session_cache.clone(),
         "core",

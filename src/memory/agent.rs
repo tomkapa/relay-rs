@@ -38,11 +38,15 @@ pub const ROLE_TAG_CLOSE: &str = "\n</role>";
 /// Composite memory that assembles the system prompt from a constant
 /// core, a per-agent role string fetched on demand, and a per-session
 /// composed memory section.
+///
+/// `prompt_cache` and `session_cache` are cheap-clone handles — both
+/// caches hold their own `Arc` internally, so sharing across subsystems
+/// is just a clone.
 pub struct AgentMemory {
     agents: SharedAgentStore,
-    prompt_cache: Arc<AgentPromptCache>,
+    prompt_cache: AgentPromptCache,
     memory_store: SharedMemoryStore,
-    session_cache: Arc<SessionMemoryCache>,
+    session_cache: SessionMemoryCache,
     core: Arc<str>,
 }
 
@@ -50,9 +54,9 @@ impl AgentMemory {
     #[must_use]
     pub fn new(
         agents: SharedAgentStore,
-        prompt_cache: Arc<AgentPromptCache>,
+        prompt_cache: AgentPromptCache,
         memory_store: SharedMemoryStore,
-        session_cache: Arc<SessionMemoryCache>,
+        session_cache: SessionMemoryCache,
         core: impl Into<Arc<str>>,
     ) -> Self {
         Self {

@@ -37,17 +37,9 @@ fn build_memory(db: &TestDb, clock: SharedClock) -> Fixture {
     let agents: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
-    let prompt_cache = Arc::new(AgentPromptCache::new(
-        8,
-        Duration::from_secs(60),
-        clock.clone(),
-    ));
+    let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
     let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(db.pool.clone(), clock.clone()));
-    let session_cache = Arc::new(SessionMemoryCache::new(
-        16,
-        Duration::from_secs(60),
-        clock.clone(),
-    ));
+    let session_cache = SessionMemoryCache::new(16, Duration::from_secs(60), clock.clone());
     let memory = AgentMemory::new(
         agents.clone(),
         prompt_cache,
@@ -251,11 +243,7 @@ async fn cache_serves_within_ttl_then_refreshes_after_expiry() {
     let shared: SharedClock = clock.clone();
 
     let agents: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), shared.clone()));
-    let cache = Arc::new(AgentPromptCache::new(
-        8,
-        Duration::from_secs(60),
-        shared.clone(),
-    ));
+    let cache = AgentPromptCache::new(8, Duration::from_secs(60), shared.clone());
 
     let first = cache
         .get_or_load(db.default_agent_id, &agents)
@@ -293,5 +281,5 @@ async fn pg_memory_store_underlying_constructs() {
     let db = TestDb::fresh().await;
     let clock: SharedClock = SystemClock::shared();
     let _store: SharedMemoryStore = Arc::new(PgMemoryStore::new(db.pool.clone(), clock.clone()));
-    let _cache = Arc::new(SessionMemoryCache::new(4, Duration::from_secs(1), clock));
+    let _cache = SessionMemoryCache::new(4, Duration::from_secs(1), clock);
 }

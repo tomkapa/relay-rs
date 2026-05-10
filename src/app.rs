@@ -40,7 +40,10 @@ use crate::runtime::{
     WorkerPool, WorkerPoolHandle,
 };
 use crate::session::{PgSessionStore, SharedSessionStore};
-use crate::tools::system::{self, MemoryToolDeps, SystemToolDeps};
+use crate::tools::system::{
+    GetSessionTool, MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool,
+    SendMessageTool, WebFetchTool, WebSearchTool,
+};
 use crate::tools::{ToolBox, ToolRegistry};
 
 const HTTP_USER_AGENT: &str = concat!("relay-rs/", env!("CARGO_PKG_VERSION"));
@@ -157,14 +160,6 @@ struct Collaborators {
     sessions: SharedSessionStore,
     agents: SharedAgentStore,
     memory: SharedMemory,
-    // Held to keep clones alive next to the rest of the trait stack;
-    // both are also threaded into the system tools and the reflection
-    // scheduler at construction time so the duplicates here are not
-    // load-bearing reads.
-    #[allow(dead_code)]
-    memory_store: SharedMemoryStore,
-    #[allow(dead_code)]
-    session_memory_cache: Arc<SessionMemoryCache>,
     clock: SharedClock,
     builtin_tools: ToolRegistry,
     queue: SharedPromptQueue,
@@ -195,18 +190,18 @@ impl Collaborators {
         let sessions: SharedSessionStore =
             Arc::new(PgSessionStore::new(pool.clone(), clock.clone()));
 
-        let cache = Arc::new(AgentPromptCache::new(
+        let cache = AgentPromptCache::new(
             AGENT_PROMPT_CACHE_CAP,
             AGENT_PROMPT_CACHE_TTL,
             clock.clone(),
-        ));
+        );
         let memory_store: SharedMemoryStore =
             Arc::new(PgMemoryStore::new(pool.clone(), clock.clone()));
-        let session_memory_cache = Arc::new(SessionMemoryCache::new(
+        let session_memory_cache = SessionMemoryCache::new(
             SESSION_MEMORY_CACHE_CAP,
             Duration::from_secs(SESSION_MEMORY_CACHE_TTL_SECS),
             clock.clone(),
-        ));
+        );
         let memory: SharedMemory = Arc::new(AgentMemory::new(
             agents.clone(),
             cache,
@@ -232,29 +227,42 @@ impl Collaborators {
         let sink: SharedResponseSink = hub.clone();
         let responses: SharedResponseSource = hub;
 
-        let builtin_tools = system::register(
-            ToolRegistry::builder(),
-            SystemToolDeps {
+        // Built-in tool registration. Each tool's constructor is
+        // straightforward; keeping the registration in the composition
+        // root avoids a register-helper that just ferries a deps
+        // struct in from this same call site. Adding a tool is one new
+        // file in `tools/system/` + one `.with(...)` line here.
+        let memory_tools = MemoryToolDeps::new(memory_store.clone(), session_memory_cache.clone());
+        let builtin_tools = ToolRegistry::builder()
+            .with(Arc::new(WebFetchTool::new()?))
+            .with(Arc::new(WebSearchTool::new(
                 http,
-                brave_search_api_key: settings.brave_search_api_key.clone(),
-                sessions: sessions.clone(),
-                queue: queue.clone(),
-                dag: dag.clone(),
-                agents: agents.clone(),
-                sink: sink.clone(),
-                memory: MemoryToolDeps::new(memory_store.clone(), session_memory_cache.clone()),
-            },
-        )?
-        .build();
+                settings.brave_search_api_key.clone(),
+            )))
+            .with(Arc::new(SendMessageTool::new(
+                sessions.clone(),
+                queue.clone(),
+                dag.clone(),
+                agents.clone(),
+                sink.clone(),
+            )))
+            .with(Arc::new(GetSessionTool::new(sessions.clone())))
+            .with(Arc::new(MemoryWriteTool::new(memory_tools.clone())))
+            .with(Arc::new(MemoryUpdateTool::new(memory_tools.clone())))
+            .with(Arc::new(MemoryForgetTool::new(memory_tools)))
+            .build();
 
+        // `memory_store` and `session_memory_cache` are not held on
+        // `Collaborators`: they're cheap-clone handles already
+        // distributed to every consumer (AgentMemory and the memory
+        // tools) by the clones above. The reflection scheduler builds
+        // its own handles from `pieces.pool` / `pieces.queue` later.
         Ok(Self {
             provider: build_provider(settings)?,
             pool,
             sessions,
             agents,
             memory,
-            memory_store,
-            session_memory_cache,
             clock,
             builtin_tools,
             queue,
@@ -301,7 +309,10 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
 
 /// Build the full HTTP + worker pool composition. The returned [`Server`] is ready to
 /// hand to `axum::serve` and a graceful-shutdown loop.
-pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
+pub async fn build_server(
+    settings: Settings,
+    cancel: CancellationToken,
+) -> Result<Server, AppError> {
     let pieces = Collaborators::new(&settings).await?;
     // Every agent shares the same collaborators today; the factory seam is
     // here so a future change can specialise per-agent (model, tool subset).
@@ -342,6 +353,7 @@ pub async fn build_server(settings: Settings) -> Result<Server, AppError> {
         pieces.pool.clone(),
         pieces.queue.clone(),
         pieces.clock.clone(),
+        cancel.clone(),
     );
 
     // Single-process fan-in subscriber for the chat-UI thread stream. Owns

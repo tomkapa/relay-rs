@@ -196,6 +196,7 @@ async fn scheduler_tick_enqueues_for_idle_session_with_unprocessed_turns() {
         queue.clone(),
         clock,
         Duration::from_millis(100),
+        None,
     );
     // Give the scheduler a chance to tick at least once. Production
     // cadence is `REFLECTION_SCHEDULER_POLL_SECS`; tests cannot wait
@@ -276,6 +277,7 @@ async fn scheduler_does_not_duplicate_pending_reflection() {
         queue,
         SystemClock::shared(),
         Duration::from_millis(100),
+        None,
     );
     tokio::time::sleep(Duration::from_secs(2)).await;
     scheduler.shutdown().await;
