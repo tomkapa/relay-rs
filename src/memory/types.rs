@@ -1,43 +1,41 @@
-//! Domain primitives for the memory subsystem (doc/memory.md §2.1).
+//! Domain primitives for the memory subsystem (doc/memory.md §1.2).
 //!
 //! CLAUDE.md §1: every value carrying an invariant is a newtype with a
-//! `TryFrom` smart constructor. The storage layer (PgMemoryStore) and the
-//! tools layer (Phase 3) both bind these types directly through the sqlx
-//! `Type` / `Encode` / `Decode` impls; raw `String`/`Uuid` does not cross the
-//! module boundary.
+//! `TryFrom` smart constructor. The storage layer and the tool layer bind
+//! these types directly through the sqlx `Type` / `Encode` / `Decode`
+//! impls; raw `String`/`Uuid` does not cross the module boundary.
 
 use std::fmt;
 use std::sync::Arc;
 
 use crate::types::ParseError;
 
-use super::limits::MEMORY_CONTENT_MAX_BYTES;
+use super::limits::{MEMORY_CONTENT_MAX_BYTES, RECALL_DEFAULT_RESULTS, RECALL_MAX_RESULTS};
 
 crate::uuid_newtype! {
-    /// Opaque identifier for a row in `agent_memories`. Wire format is the
-    /// raw UUID; the operator UI surfaces a short [`MemoryHandle`] derived
-    /// from a per-session map.
+    /// Opaque identifier for a row in `agent_memories`. The operator UI
+    /// surfaces a short [`MemoryHandle`] derived from a per-session map.
     pub MemoryId
 }
 
 crate::uuid_newtype! {
     /// Opaque identifier for a row in `memory_events` — every mutation
-    /// produces one. Reverts (Phase 8) reference these ids to undo a past
-    /// change by appending the inverse event.
+    /// produces one. The operator revert path references these ids to undo
+    /// a past change by appending the inverse event.
     pub MemoryEventId
 }
 
 crate::uuid_newtype! {
     /// Opaque identifier for a row in `contradiction_events`. Carried on
-    /// `prompt_requests.kind_payload` for resolution jobs (Phase 7).
+    /// `prompt_requests.kind_payload` for resolution-turn dispatch.
     pub ContradictionEventId
 }
 
 crate::str_enum! {
     /// What the memory is about (doc/memory.md §1.2). The label list below
     /// is the single source of truth — the column `CHECK` constraint, the
-    /// JSON wire format, and the system-prompt rendering (Phase 2) all key
-    /// off these strings.
+    /// JSON wire format, and the system-prompt rendering all key off these
+    /// strings.
     ///
     /// Variant names diverge from the doc's "Self" because `Self` is a
     /// reserved Rust keyword; the wire label stays `"self"` so the column
@@ -191,20 +189,17 @@ impl fmt::Display for MemoryContent {
 ///
 /// Renders as `M-NN`. Round-trips through [`fmt::Display`] /
 /// [`TryFrom<&str>`] so a tool-call argument that came back through the
-/// model can be parsed without ambiguity.
-///
-/// The (handle ↔ UUID) map is built per session at prompt assembly time
-/// (Phase 2). Phase 1 only owns the type — the map lives next to the
+/// model can be parsed without ambiguity. The (handle ↔ UUID) map is
+/// built per session at prompt assembly time and lives next to the
 /// renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MemoryHandle(u32);
 
 impl MemoryHandle {
-    /// Hard ceiling on the stable + contextual layer (doc/memory.md §1.3
-    /// budgets are token-driven, but the per-session map needs an absolute
-    /// numeric cap so handle parsing cannot accept arbitrarily large
-    /// integers). Comfortably above any plausible per-session memory
-    /// count; raise via Phase 2 limits when the renderer's budget grows.
+    /// Hard ceiling on per-session handles. Token-driven budgets cap the
+    /// rendered section bytes; this is the numeric ceiling so handle
+    /// parsing cannot accept arbitrarily large integers. Comfortably
+    /// above any plausible per-session memory count.
     pub const MAX: Self = Self(9_999);
 
     #[must_use]
@@ -249,6 +244,49 @@ impl TryFrom<&str> for MemoryHandle {
 impl fmt::Display for MemoryHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "M-{}", self.0)
+    }
+}
+
+/// Bounded top-K for the `recall` tool. Parsed at the JSON boundary —
+/// holding a `RecallLimit` proves the value is in `1..=RECALL_MAX_RESULTS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecallLimit(u8);
+
+impl RecallLimit {
+    /// Default top-K used when the tool input omits `limit`. Encoded as
+    /// the const so `serde(default)` can supply it without an `unwrap_or`
+    /// at the call site.
+    pub const DEFAULT: Self = Self(RECALL_DEFAULT_RESULTS);
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for RecallLimit {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl TryFrom<u8> for RecallLimit {
+    type Error = ParseError;
+    fn try_from(n: u8) -> Result<Self, Self::Error> {
+        if n == 0 || n > RECALL_MAX_RESULTS {
+            return Err(ParseError::OutOfRange {
+                field: "recall_limit",
+                detail: "1..=RECALL_MAX_RESULTS",
+            });
+        }
+        Ok(Self(n))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RecallLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let n = u8::deserialize(d)?;
+        Self::try_from(n).map_err(serde::de::Error::custom)
     }
 }
 
@@ -299,8 +337,8 @@ mod tests {
             assert_eq!(MemoryKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(MemoryKind::parse("nope"), None);
-        // Wire label sanity — the renderer (Phase 2) and the column CHECK
-        // both depend on `"self"` being the Identity label.
+        // Wire label sanity — the renderer and the column CHECK both
+        // depend on `"self"` being the Identity label.
         assert_eq!(MemoryKind::Identity.as_str(), "self");
     }
 

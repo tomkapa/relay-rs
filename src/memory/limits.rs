@@ -1,9 +1,7 @@
-//! Memory subsystem caps. CLAUDE.md §5 — every value is documented with *why
-//! this number*.
-//!
-//! These are the storage-layer bounds Phase 1 enforces. Reflection /
-//! resolution caps and per-agent quotas land in later phases (§2.4 / §2.6) and
-//! will live next to those modules.
+//! Memory subsystem caps. CLAUDE.md §5 — every value is documented with
+//! *why this number*. Caps that gate a specific subsystem (recall,
+//! librarian, reflection scheduler) live here so the renderer, store, and
+//! background workers all share one source of truth.
 
 /// Maximum bytes of a single memory's `content`.
 ///
@@ -22,19 +20,15 @@ pub const CONTRADICTION_REASON_MAX_BYTES: usize = 1024;
 
 /// Hard cap on the number of materialized memory rows held per agent.
 ///
-/// CLAUDE.md §5: every batch capped. Keeps the renderer's stable +
-/// contextual layer bounded (Phase 2) and gives the librarian a target
-/// for eviction (Phase 6). Reads at this surface assert the cap as a
+/// Keeps the renderer's stable + contextual layer bounded and gives the
+/// librarian a target for eviction. Read paths assert the cap as a
 /// saturation signal — overshooting means the writer ignored the same
 /// limit.
 pub const MAX_MEMORIES_PER_AGENT: usize = 1024;
 
 /// Hard cap on a single page of journal events returned to in-process
-/// callers.
-///
-/// The journal grows unbounded with mutation history, so any `fetch_all`
-/// over it needs an upper bound. Operator audit (Phase 8) will paginate
-/// through this cap with a cursor.
+/// callers. The journal grows unbounded with mutation history; the
+/// operator audit endpoint paginates through this cap with a cursor.
 pub const MAX_EVENTS_PER_PAGE: usize = 1024;
 
 /// Byte budget for the rendered stable layer (pinned + Self) inside the
@@ -53,8 +47,7 @@ pub const STABLE_LAYER_MAX_BYTES: usize = 4096;
 /// the set.
 pub const CONTEXTUAL_LAYER_MAX_BYTES: usize = 4096;
 
-/// Top-K cap on the contextual retrieval. Phase 9 will rank by similarity
-/// × recency × state and stop here.
+/// Top-K cap on the contextual retrieval (cosine similarity).
 pub const CONTEXTUAL_TOP_K: usize = 16;
 
 /// Per-line overhead added to a memory's content when estimating render
@@ -145,7 +138,7 @@ pub const MAX_SIMILAR_PAIRS_PER_AGENT: usize = 256;
 /// (doc/memory.md §1.7) Long enough that a memory validated today still
 /// surfaces the same way next month; short enough that an agent that
 /// hasn't seen evidence of a memory in a while stops trusting it.
-pub const VALIDATION_DECAY_SECS: u64 = 60 * 60 * 24 * 30;
+pub const VALIDATION_DECAY: chrono::Duration = chrono::Duration::seconds(60 * 60 * 24 * 30);
 
 /// Polling cadence for the librarian sweep.
 ///

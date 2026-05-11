@@ -101,12 +101,11 @@ impl Tool for MemoryForgetTool {
 
         let outcome = self
             .deps
-            .store
+            .store()
             .apply(MemoryMutation::Forget {
                 agent,
                 target: memory_id,
                 source: MutationSource::Turn(ctx.request_id),
-                operator_override: false,
             })
             .await
             .map_err(store_to_tool_err)?;

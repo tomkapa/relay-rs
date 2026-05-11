@@ -1,4 +1,4 @@
-//! Embedding provider seam (doc/memory.md §2.9 — Phase 9).
+//! Embedding provider seam.
 //!
 //! Sibling to [`LlmProvider`](super::traits::LlmProvider): same SDK family,
 //! a different surface, separately configured. Memory's `recall` tool, the

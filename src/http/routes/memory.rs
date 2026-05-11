@@ -1,5 +1,5 @@
 //! Operator audit + write surface for the agent memory subsystem
-//! (doc/memory.md §1.9, §2.8 — Phase 8).
+//! (doc/memory.md §1.9).
 //!
 //! All paths land under `/agents/{id}/memory*`. Writes go through the
 //! same journal that the agent's tool calls take, but with
@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::agents::AgentId;
 use crate::memory::{
-    MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryMutation, MemoryRow, MemoryState,
-    MutationKind, MutationSource, MutationSourceKind, ValidationSource,
+    MemoryContent, MemoryEventId, MemoryEventPayload, MemoryId, MemoryKind, MemoryMutation,
+    MemoryRow, MemoryState, MutationKind, MutationSource, MutationSourceKind, ValidationSource,
 };
 
 use super::super::error::HttpError;
@@ -179,22 +179,36 @@ async fn list_events(
         .into_iter()
         .filter(|e| {
             filter.source.is_none_or(|s| e.source.kind() == s)
-                && filter.mutation.is_none_or(|m| e.mutation == m)
+                && filter.mutation.is_none_or(|m| e.mutation_kind() == m)
         })
-        .map(|e| EventResponse {
-            id: e.id,
-            agent_id: e.agent_id,
-            mutation: e.mutation.as_str().to_owned(),
-            target_memory_id: e.target_memory_id,
-            content_before: e.content_before.map(|c| c.as_str().to_owned()),
-            content_after: e.content_after.map(|c| c.as_str().to_owned()),
-            source: e.source.kind().as_str().to_owned(),
-            source_turn_id: e.source.turn_id(),
-            created_at: e.created_at,
-        })
+        .map(EventResponse::from)
         .collect();
 
     Ok(Json(filtered))
+}
+
+impl From<crate::memory::MemoryEvent> for EventResponse {
+    fn from(e: crate::memory::MemoryEvent) -> Self {
+        let (content_before, content_after) = match &e.payload {
+            MemoryEventPayload::Write { content, .. } => (None, Some(content.as_str().to_owned())),
+            MemoryEventPayload::Update { before, after, .. } => (
+                Some(before.as_str().to_owned()),
+                Some(after.as_str().to_owned()),
+            ),
+            MemoryEventPayload::Forget { before } => (Some(before.as_str().to_owned()), None),
+        };
+        Self {
+            id: e.id,
+            agent_id: e.agent_id,
+            mutation: e.mutation_kind().as_str().to_owned(),
+            target_memory_id: e.target_memory_id,
+            content_before,
+            content_after,
+            source: e.source.kind().as_str().to_owned(),
+            source_turn_id: e.source.turn_id(),
+            created_at: e.created_at,
+        }
+    }
 }
 
 async fn pin_memory(

@@ -1,5 +1,5 @@
 //! Librarian — mechanical sweep + resolution-job enqueue
-//! (doc/memory.md §1.8, §2.6, §2.7 — Phases 6 and 7).
+//! (doc/memory.md §1.8).
 //!
 //! The mechanical sweep ([`run_librarian_sweep`]) runs no LLM:
 //!
@@ -7,7 +7,7 @@
 //!    higher-state, older-provenance copy. The other side is forgotten;
 //!    a `cross_session_rewrite` validation event lands on the survivor.
 //! 2. *Decay* — [`MemoryStore::decay_validated`] demotes Validated rows
-//!    whose `last_validated_at` is older than [`VALIDATION_DECAY_SECS`].
+//!    whose `last_validated_at` is older than [`VALIDATION_DECAY`].
 //! 3. *Eviction* — when over [`MAX_MEMORIES_PER_AGENT`], the lowest-scored
 //!    non-pinned rows are forgotten.
 //! 4. *Contradiction detection* — pairs at
@@ -16,14 +16,14 @@
 //!
 //! [`LibrarianScheduler`] runs the sweep periodically per agent and, for
 //! each unresolved contradiction event, enqueues a `RequestKind::Resolution`
-//! job — Phase 7 dispatches that to `agent.resolve_contradiction`.
+//! job that the worker pool dispatches to the agent's resolution path.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use tokio::task::JoinHandle;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agents::AgentId;
@@ -35,9 +35,9 @@ use crate::types::{Participant, Prompt};
 
 use super::limits::{
     CONTRADICTION_SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, LIBRARIAN_BATCH_LIMIT,
-    LIBRARIAN_POLL_SECS, MAX_MEMORIES_PER_AGENT, MAX_SIMILAR_PAIRS_PER_AGENT,
-    VALIDATION_DECAY_SECS,
+    LIBRARIAN_POLL_SECS, MAX_MEMORIES_PER_AGENT, MAX_SIMILAR_PAIRS_PER_AGENT, VALIDATION_DECAY,
 };
+use super::scheduled_task::ScheduledTask;
 use super::store::{
     MemoryMutation, MutationSource, PairCandidate, SharedMemoryStore, ValidationSource,
 };
@@ -92,8 +92,9 @@ pub async fn run_librarian_sweep(
                 )
                 .await?;
         }
-        // Forget the loser via the operator-override path so a pinned row
-        // (rare but possible) survives. Pinned rows skip the merge.
+        // Pinned losers survive the merge — the Librarian source never
+        // bypasses pin protection, but skipping early avoids a wasted
+        // `PinnedImmutable` error and is the spec'd behaviour.
         if drop_.pinned {
             continue;
         }
@@ -102,7 +103,6 @@ pub async fn run_librarian_sweep(
                 agent,
                 target: drop_.id,
                 source: MutationSource::Librarian,
-                operator_override: false,
             })
             .await?;
         forgotten.insert(drop_.id);
@@ -110,10 +110,7 @@ pub async fn run_librarian_sweep(
     }
 
     // 2. Decay — bump down stale Validated rows.
-    let cutoff = now
-        - chrono::Duration::seconds(
-            i64::try_from(VALIDATION_DECAY_SECS).expect("invariant: decay secs fits in i64"),
-        );
+    let cutoff = now - VALIDATION_DECAY;
     report.demoted = store.decay_validated(agent, cutoff).await?;
 
     // 3. Eviction — bring per-agent count under quota.
@@ -204,22 +201,15 @@ fn has_negation(text: &str) -> bool {
 }
 
 /// Background scheduler that runs the librarian sweep per agent on a
-/// fixed cadence and enqueues resolution jobs for unresolved
-/// contradictions (Phase 7).
+/// fixed cadence and enqueues resolution jobs for unresolved contradictions.
+#[derive(Debug)]
 pub struct LibrarianScheduler {
-    shutdown: DropGuard,
-    handle: JoinHandle<()>,
-}
-
-impl std::fmt::Debug for LibrarianScheduler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LibrarianScheduler").finish_non_exhaustive()
-    }
+    task: ScheduledTask,
 }
 
 impl LibrarianScheduler {
-    /// Spawn with the production cadence. The internal cancel token reacts
-    /// to either the supplied parent token or a drop of the handle.
+    /// Spawn with the production cadence. The parent token wires shutdown
+    /// into the main runtime Ctrl+C signal.
     #[must_use]
     pub fn spawn(
         pool: PgPool,
@@ -247,56 +237,35 @@ impl LibrarianScheduler {
         poll_interval: Duration,
         parent: Option<CancellationToken>,
     ) -> Self {
-        let owned = CancellationToken::new();
-        let local_for_loop = owned.clone();
-        let inner = SchedulerLoop {
+        let inner = Arc::new(SchedulerInner {
             pool,
             store,
             queue,
             clock,
-            poll_interval,
             batch_limit: LIBRARIAN_BATCH_LIMIT,
-        };
-        let handle = tokio::spawn(async move { inner.run(local_for_loop, parent).await });
-        Self {
-            shutdown: owned.drop_guard(),
-            handle,
-        }
+        });
+        let task = ScheduledTask::spawn("librarian_scheduler", poll_interval, parent, move || {
+            let inner = inner.clone();
+            async move { inner.tick().await }
+        });
+        Self { task }
     }
 
     pub async fn shutdown(self) {
-        drop(self.shutdown);
-        if let Err(e) = self.handle.await {
-            warn!(error = %e, "librarian_scheduler.join.error");
-        }
+        self.task.shutdown().await;
     }
 }
 
 #[derive(Debug)]
-struct SchedulerLoop {
+struct SchedulerInner {
     pool: PgPool,
     store: SharedMemoryStore,
     queue: SharedPromptQueue,
     clock: SharedClock,
-    poll_interval: Duration,
     batch_limit: usize,
 }
 
-impl SchedulerLoop {
-    async fn run(self, local: CancellationToken, parent: Option<CancellationToken>) {
-        loop {
-            tokio::select! {
-                biased;
-                () = local.cancelled() => return,
-                () = parent_cancelled(parent.as_ref()) => return,
-                () = tokio::time::sleep(self.poll_interval) => {},
-            }
-            if let Err(e) = self.tick().await {
-                warn!(error = %e, "librarian_scheduler.tick.error");
-            }
-        }
-    }
-
+impl SchedulerInner {
     async fn tick(&self) -> Result<(), super::store::MemoryStoreError> {
         let now: DateTime<Utc> = self.clock.now_wall().into();
         let agents = self.list_agents().await?;
@@ -380,13 +349,6 @@ impl SchedulerLoop {
             }
         }
         Ok(())
-    }
-}
-
-async fn parent_cancelled(parent: Option<&CancellationToken>) {
-    match parent {
-        Some(token) => token.cancelled().await,
-        None => std::future::pending::<()>().await,
     }
 }
 

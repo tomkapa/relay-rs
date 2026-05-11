@@ -1,4 +1,4 @@
-//! Trait-contract tests for the Phase 4 reflection pipeline:
+//! Trait-contract tests for the reflection pipeline:
 //!
 //! - The queue's claim path returns `RequestKind::Reflection` rows with
 //!   their `kind_payload` and serialises memory-mutating jobs per agent.

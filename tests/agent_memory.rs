@@ -1,5 +1,5 @@
 //! Behaviour tests for [`relay_rs::memory::AgentMemory`] + the underlying
-//! caches and composer (doc/memory.md §2.2 — Phase 2).
+//! caches and composer (doc/memory.md §1.3).
 //!
 //! Proves the assembled `system` prompt has the expected
 //! `<core>...</core>` / `<role>...</role>` / `<memory>...</memory>`

@@ -1,22 +1,20 @@
-//! System tools — first-party capabilities the agent invokes through
-//! the tool seam.
+//! System tools — first-party capabilities the agent invokes through the
+//! tool seam.
 //!
-//! Two flavours:
+//! Three families:
 //!
-//! * **Communication** — [`SendMessageTool`] (the only delivery
-//!   mechanism for messages between participants) and [`GetSessionTool`]
+//! * **Communication** — [`SendMessageTool`] (the only delivery mechanism
+//!   for messages between participants) and [`GetSessionTool`]
 //!   (cross-session read scoped to the caller's DAG). Both consume
 //!   [`super::ToolCallContext`] via `execute_with_ctx`.
 //! * **Memory** — [`MemoryWriteTool`], [`MemoryUpdateTool`],
-//!   [`MemoryForgetTool`] (Phase 3). All three share a per-turn
-//!   mutation counter via [`MemoryToolDeps`].
-//! * **Built-in capabilities** — [`WebFetchTool`] and
-//!   [`WebSearchTool`].
+//!   [`MemoryForgetTool`], [`RecallTool`]. The three mutation tools share
+//!   a per-turn cap via [`MemoryToolDeps`]; `recall` carries its own.
+//! * **Built-in capabilities** — [`WebFetchTool`] and [`WebSearchTool`].
 //!
-//! Registration lives in the composition root (`src/app.rs`) — there
-//! is no `register` helper here. Each tool's constructor is
-//! `pub`-exported so adding a system tool is one new file in this
-//! directory + one `.with(...)` line in `app.rs`. Externally-supplied
+//! Registration lives in the composition root (`src/app.rs`) — there is
+//! no `register` helper here. Adding a system tool is one new file in
+//! this directory + one `.with(...)` line in `app.rs`. Externally-supplied
 //! tools enter through the MCP registry instead of this module.
 
 mod get_session;

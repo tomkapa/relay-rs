@@ -1,20 +1,16 @@
 //! Composes the rendered memory section of the system prompt
-//! (doc/memory.md §1.3, §2.2 Phase 2).
+//! (doc/memory.md §1.3).
 //!
-//! The composer takes the agent's full set of materialized memories and
-//! produces:
+//! Two layers come out of one call:
 //!
-//! - The *stable layer* — pinned + Self-kind, sorted by state then
-//!   recency, trimmed to a byte budget.
-//! - The *contextual layer* — top-K Other / Procedure / Open retrieved
-//!   against the session's opening context. Phase 9 lands the embedding
-//!   provider that drives the actual ranking; Phase 2 stubs this layer to
-//!   empty so the renderer's structure is in place when retrieval
-//!   arrives.
+//! - *Stable* — pinned + Self-kind, sorted by state then recency, trimmed
+//!   to a byte budget.
+//! - *Contextual* — top-K Other / Procedure / Open already ranked by the
+//!   loader (cosine similarity against the session's opening text).
 //!
 //! The output carries both the rendered text and a per-section
 //! [`MemoryHandleMap`] (`M-NN ↔ MemoryId`) so the agent's tool calls
-//! (Phase 3) can be resolved back to UUIDs.
+//! can be resolved back to UUIDs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,43 +37,17 @@ const KIND_ORDER: &[MemoryKind] = &[
     MemoryKind::Open,
 ];
 
-/// Resolved (handle ↔ id) map for one session's composed memory section.
+/// Rendered memory section + the (handle ↔ id) map the rendering
+/// produced.
 ///
-/// Frozen for the session's lifetime alongside the rendered text.
-/// Phase 3's mutation tools call [`Self::resolve`] on every `M-NN`
-/// argument the model sends back.
-#[derive(Debug, Clone, Default)]
-pub struct MemoryHandleMap {
-    by_handle: HashMap<MemoryHandle, MemoryId>,
-}
-
-impl MemoryHandleMap {
-    #[must_use]
-    pub fn resolve(&self, handle: MemoryHandle) -> Option<MemoryId> {
-        self.by_handle.get(&handle).copied()
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_handle.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_handle.is_empty()
-    }
-}
-
-/// Rendered memory section + the handle map the rendering produced.
-///
-/// `text` includes the surrounding `<memory>...</memory>` envelope
-/// when non-empty; empty memory yields an empty `text` so callers can
-/// append it unconditionally. Fields are encapsulated; access through
-/// [`Self::text`] / [`Self::handles`].
+/// `text` includes the surrounding `<memory>...</memory>` envelope when
+/// non-empty; empty memory yields an empty `text` so callers can append
+/// it unconditionally. The handle map is private — callers reach
+/// [`Self::resolve_handle`] for the only operation they need.
 #[derive(Debug, Clone)]
 pub struct MemorySection {
     text: Arc<str>,
-    handles: MemoryHandleMap,
+    handles: HashMap<MemoryHandle, MemoryId>,
 }
 
 impl MemorySection {
@@ -85,7 +55,7 @@ impl MemorySection {
     pub fn empty() -> Self {
         Self {
             text: Arc::from(""),
-            handles: MemoryHandleMap::default(),
+            handles: HashMap::new(),
         }
     }
 
@@ -94,16 +64,18 @@ impl MemorySection {
         &self.text
     }
 
+    /// Resolve a session-scoped `M-NN` handle back to its `MemoryId`.
+    /// Returns `None` if the handle was never minted for this section
+    /// (a hallucinated reference, or a section whose cache entry has
+    /// been evicted and recomposed without the row).
     #[must_use]
-    pub fn handles(&self) -> &MemoryHandleMap {
-        &self.handles
+    pub fn resolve_handle(&self, handle: MemoryHandle) -> Option<MemoryId> {
+        self.handles.get(&handle).copied()
     }
 
     /// `text` is empty iff the handle map is empty (the renderer only
     /// produces an envelope when at least one row was rendered, and
-    /// every rendered row contributes a handle). Either check is
-    /// equivalent; we key off the handle map since it is structurally
-    /// the smaller invariant.
+    /// every rendered row contributes a handle).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
@@ -221,7 +193,7 @@ fn render(stable: &[&MemoryRow], contextual: &[&MemoryRow]) -> MemorySection {
 
     MemorySection {
         text: Arc::from(buf),
-        handles: MemoryHandleMap { by_handle: handles },
+        handles,
     }
 }
 
@@ -262,7 +234,7 @@ mod tests {
     fn empty_input_renders_empty_section() {
         let section = compose_memory_section(&[], &[]);
         assert!(section.is_empty());
-        assert!(section.handles().is_empty());
+        assert!(section.is_empty());
     }
 
     #[test]
@@ -364,7 +336,7 @@ mod tests {
         let section = compose_memory_section(&rows, &[]);
         let id = rows[0].id;
         let handle = MemoryHandle::try_from(1u32).expect("valid");
-        assert_eq!(section.handles().resolve(handle), Some(id));
+        assert_eq!(section.resolve_handle(handle), Some(id));
         assert!(section.text().contains("M-1"));
     }
 

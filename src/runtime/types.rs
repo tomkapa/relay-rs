@@ -233,13 +233,13 @@ crate::str_enum! {
     /// column `CHECK` constraint and the JSON wire format used by
     /// [`RequestKindPayload`].
     pub enum RequestKind {
-        /// User-facing reply turn — the existing behavior. Carries no
-        /// `kind_payload`.
+        /// User-facing reply turn. Carries the empty
+        /// [`RequestKindPayload::Normal`] variant.
         Normal     => "normal",
-        /// Autonomous self-curation (Phase 4). Payload is
+        /// Autonomous self-curation. Payload is
         /// [`RequestKindPayload::Reflection`].
         Reflection => "reflection",
-        /// Single-contradiction resolution (Phase 7). Payload is
+        /// Single-contradiction resolution. Payload is
         /// [`RequestKindPayload::Resolution`].
         Resolution => "resolution",
     }

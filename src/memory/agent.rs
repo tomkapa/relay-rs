@@ -1,12 +1,11 @@
 //! Per-turn [`Memory`] backed by the agents registry + the agent's
-//! memory store (doc/memory.md §2.2 — Phase 2).
+//! memory store (doc/memory.md §1.3).
 //!
 //! Each call resolves the viewer's role prompt (cached, TTL-bounded by
 //! [`crate::agents::AGENT_PROMPT_CACHE_TTL`]) and composes the final
-//! `system` field as
-//! `<core>...</core>\n<role>{prompt}</role>` followed by the rendered
-//! `<memory>...</memory>` section. Both the role prompt and the memory
-//! section are cached per session — the latter via
+//! `system` field as `<core>...</core>\n<role>{prompt}</role>` followed
+//! by the rendered `<memory>...</memory>` section. Both the role prompt
+//! and the memory section are cached per session — the latter via
 //! [`SessionMemoryCache`].
 //!
 //! See [`SessionMemoryCache`]'s module doc for the deliberate divergence

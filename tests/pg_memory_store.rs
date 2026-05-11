@@ -1,5 +1,4 @@
-//! Trait-contract tests for [`relay_rs::memory::PgMemoryStore`] (doc/memory.md
-//! §2.1, Phase 1):
+//! Trait-contract tests for [`relay_rs::memory::PgMemoryStore`]:
 //!
 //! - journal append correctness
 //! - materialized-view consistency
@@ -16,8 +15,8 @@ use std::sync::Arc;
 
 use relay_rs::clock::SystemClock;
 use relay_rs::memory::{
-    MemoryContent, MemoryId, MemoryKind, MemoryMutation, MemoryState, MemoryStore,
-    MemoryStoreError, MutationKind, MutationSource, MutationSourceKind, PgMemoryStore,
+    MemoryContent, MemoryEventPayload, MemoryId, MemoryKind, MemoryMutation, MemoryState,
+    MemoryStore, MemoryStoreError, MutationKind, MutationSource, MutationSourceKind, PgMemoryStore,
     ResolutionOutcome, ResolutionReason,
 };
 use relay_rs::runtime::{PromptRequestId, RequestKind};
@@ -82,16 +81,13 @@ async fn write_appends_event_and_materialised_row() {
     assert_eq!(events.len(), 1);
     let ev = &events[0];
     assert_eq!(ev.id, outcome.event_id);
-    assert_eq!(ev.mutation, MutationKind::Write);
+    assert_eq!(ev.mutation_kind(), MutationKind::Write);
     assert_eq!(ev.target_memory_id, outcome.memory_id);
-    assert!(ev.content_before.is_none());
-    assert_eq!(
-        ev.content_after
-            .as_ref()
-            .expect("write has content")
-            .as_str(),
-        "I default to terse replies."
-    );
+    let MemoryEventPayload::Write { content, kind, .. } = &ev.payload else {
+        panic!("expected Write payload, got {:?}", ev.payload);
+    };
+    assert_eq!(content.as_str(), "I default to terse replies.");
+    assert_eq!(*kind, MemoryKind::Identity);
     assert_eq!(ev.source.kind(), MutationSourceKind::Operator);
 
     let listed = s.list(db.default_agent_id).await.expect("list");
@@ -122,7 +118,6 @@ async fn update_records_before_and_after_content() {
             content: content("translator is fast on Romance languages"),
             state: MemoryState::Tentative,
             source: MutationSource::Operator,
-            operator_override: false,
         })
         .await
         .expect("update");
@@ -137,15 +132,12 @@ async fn update_records_before_and_after_content() {
     let events = s.list_events(db.default_agent_id).await.expect("events");
     assert_eq!(events.len(), 2);
     let upd = &events[1];
-    assert_eq!(upd.mutation, MutationKind::Update);
-    assert_eq!(
-        upd.content_before.as_ref().expect("before").as_str(),
-        "translator is fast on European languages"
-    );
-    assert_eq!(
-        upd.content_after.as_ref().expect("after").as_str(),
-        "translator is fast on Romance languages"
-    );
+    assert_eq!(upd.mutation_kind(), MutationKind::Update);
+    let MemoryEventPayload::Update { before, after, .. } = &upd.payload else {
+        panic!("expected Update payload, got {:?}", upd.payload);
+    };
+    assert_eq!(before.as_str(), "translator is fast on European languages");
+    assert_eq!(after.as_str(), "translator is fast on Romance languages");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -169,7 +161,6 @@ async fn forget_removes_materialised_but_journal_keeps_event() {
             agent: db.default_agent_id,
             target: written.memory_id,
             source: MutationSource::Librarian,
-            operator_override: false,
         })
         .await
         .expect("forget");
@@ -183,12 +174,11 @@ async fn forget_removes_materialised_but_journal_keeps_event() {
     let events = s.list_events(db.default_agent_id).await.expect("events");
     assert_eq!(events.len(), 2);
     let f = &events[1];
-    assert_eq!(f.mutation, MutationKind::Forget);
-    assert_eq!(
-        f.content_before.as_ref().expect("before").as_str(),
-        "ask one focused clarifying question"
-    );
-    assert!(f.content_after.is_none());
+    assert_eq!(f.mutation_kind(), MutationKind::Forget);
+    let MemoryEventPayload::Forget { before } = &f.payload else {
+        panic!("expected Forget payload, got {:?}", f.payload);
+    };
+    assert_eq!(before.as_str(), "ask one focused clarifying question");
     assert_eq!(f.source.kind(), MutationSourceKind::Librarian);
 }
 
@@ -205,7 +195,6 @@ async fn update_unknown_id_is_not_found() {
             content: content("nope"),
             state: MemoryState::Tentative,
             source: MutationSource::Operator,
-            operator_override: false,
         })
         .await
         .expect_err("should fail");
@@ -235,7 +224,6 @@ async fn pinned_row_rejects_agent_update_but_accepts_operator_override() {
             content: content("agent attempt"),
             state: MemoryState::Tentative,
             source: MutationSource::Turn(PromptRequestId::new()),
-            operator_override: false,
         })
         .await
         .expect_err("agent edit blocked");
@@ -251,7 +239,6 @@ async fn pinned_row_rejects_agent_update_but_accepts_operator_override() {
             content: content("operator override"),
             state: MemoryState::Core,
             source: MutationSource::Operator,
-            operator_override: true,
         })
         .await
         .expect("operator override succeeds");
@@ -299,7 +286,6 @@ async fn rebuild_materialized_reproduces_live_view() {
         content: content("first revised"),
         state: MemoryState::Tentative,
         source: MutationSource::Operator,
-        operator_override: false,
     })
     .await
     .expect("update");
@@ -308,7 +294,6 @@ async fn rebuild_materialized_reproduces_live_view() {
         agent: db.default_agent_id,
         target: c.memory_id,
         source: MutationSource::Operator,
-        operator_override: false,
     })
     .await
     .expect("forget");
@@ -618,7 +603,6 @@ async fn set_pinned_toggles_protection() {
             content: content("changed"),
             state: MemoryState::Tentative,
             source: MutationSource::Turn(PromptRequestId::new()),
-            operator_override: false,
         })
         .await
         .expect_err("pinned protects");

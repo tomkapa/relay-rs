@@ -1,21 +1,22 @@
-//! Memory tools (doc/memory.md §1.5, §2.3).
+//! Memory tools (doc/memory.md §1.4, §1.5).
 //!
-//! The three mutation tools share a per-turn counter so a single turn
-//! cannot exceed [`MAX_MEMORY_MUTATIONS_PER_TURN`] across them combined:
+//! Four tools, each in its own file. The three mutation tools share one
+//! [`PerTurnCallCounter`] so a single turn cannot exceed
+//! [`MAX_MEMORY_MUTATIONS_PER_TURN`] across them combined; `recall` carries
+//! its own counter with a separate cap so reads don't spend the mutation
+//! budget.
 //!
 //! - [`MemoryWriteTool`] (`memory_write`) — mints a new memory at
 //!   `Tentative`.
 //! - [`MemoryUpdateTool`] (`memory_update`) — replaces content; resets
 //!   state to `Tentative`. Pinned rows reject agent edits.
-//! - [`MemoryForgetTool`] (`memory_forget`) — drops the materialized
-//!   row; the journal keeps the event so reverts work. Pinned rows
-//!   reject agent forgets.
+//! - [`MemoryForgetTool`] (`memory_forget`) — drops the materialized row;
+//!   the journal keeps the event so the operator can revert.
 //! - [`RecallTool`] (`recall`) — embedding-driven retrieval against the
 //!   agent's existing memories.
 //!
-//! Each tool lives in its own file. Shared infrastructure
-//! ([`MemoryToolDeps`] + the per-turn counter + handle resolution) lives
-//! here in the module root.
+//! Shared infrastructure ([`MemoryToolDeps`] + the per-turn counter +
+//! handle resolution) lives here in the module root.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -41,21 +42,26 @@ pub use recall::RecallTool;
 pub use update::MemoryUpdateTool;
 pub use write::MemoryWriteTool;
 
-/// Per-turn mutation counter shared by the three tools.
+/// Per-turn call counter shared by the memory tools.
 ///
-/// Bounded HashMap keyed by request id — when a turn exceeds the cap,
-/// further mutation calls return `InvalidInput`. Entries are evicted in
-/// bulk once the map is full so memory cannot grow without bound across
-/// long-running processes.
+/// Bounded HashMap keyed by request id; once a turn hits `cap_per_turn`,
+/// further calls return [`CapExceeded`]. Entries are bulk-evicted when the
+/// map fills so memory cannot grow without bound across long-running
+/// processes — older counters were already enforced live, so clearing does
+/// not retroactively let a turn exceed the cap.
+///
+/// The mutation tools share one counter (combined `write`+`update`+`forget`
+/// cap); `recall` holds its own with a separate cap so the model can read
+/// memory without spending its mutation budget.
 #[derive(Debug)]
-pub(super) struct MutationCounter {
+pub(super) struct PerTurnCallCounter {
     inner: Mutex<HashMap<PromptRequestId, usize>>,
     cap_per_turn: usize,
     bookkeeping_max_entries: usize,
 }
 
-impl MutationCounter {
-    fn new() -> Self {
+impl PerTurnCallCounter {
+    fn mutations() -> Self {
         Self::with_cap(MAX_MEMORY_MUTATIONS_PER_TURN)
     }
 
@@ -71,11 +77,8 @@ impl MutationCounter {
         let mut map = self
             .inner
             .lock()
-            .expect("invariant: MutationCounter mutex never poisoned");
+            .expect("invariant: PerTurnCallCounter mutex never poisoned");
         if map.len() >= self.bookkeeping_max_entries && !map.contains_key(&request_id) {
-            // Bulk-clear when the map fills up. Counts older than this
-            // bookkeeping bound were already enforced live; clearing
-            // does not retroactively let a turn exceed the cap.
             map.clear();
         }
         let entry = map.entry(request_id).or_insert(0);
@@ -94,29 +97,32 @@ pub(super) struct CapExceeded {
     pub cap: usize,
 }
 
-/// Shared infrastructure the four memory tools hold a handle on —
-/// the store, the section loader (handle resolution + composed-section
-/// load), and the per-turn mutation counter.
+/// Shared infrastructure the four memory tools hold a handle on.
+///
+/// Owns the section loader (mutation tools go through `loader.store()` for
+/// storage and through the loader itself for `M-NN` handle resolution) and
+/// the per-turn mutation counter.
 #[derive(Debug, Clone)]
 pub struct MemoryToolDeps {
-    pub store: SharedMemoryStore,
     pub(super) loader: MemorySectionLoader,
-    pub(super) counter: Arc<MutationCounter>,
+    pub(super) counter: Arc<PerTurnCallCounter>,
 }
 
 impl MemoryToolDeps {
-    /// Construct from the shared section loader. The store handle is
-    /// pulled off the loader for the mutation / recall paths that talk
-    /// to storage directly; the mutation counter is private to this
-    /// module.
     #[must_use]
     pub fn new(loader: MemorySectionLoader) -> Self {
-        let store = loader.store().clone();
         Self {
-            store,
             loader,
-            counter: Arc::new(MutationCounter::new()),
+            counter: Arc::new(PerTurnCallCounter::mutations()),
         }
+    }
+
+    /// Direct handle on the underlying memory store — sourced from the
+    /// section loader so the renderer and the mutation tools cannot bind
+    /// against different stores. `recall`, the mutation tools, and the
+    /// resolution-close helper all read through here.
+    pub(super) fn store(&self) -> &SharedMemoryStore {
+        self.loader.store()
     }
 }
 
@@ -127,7 +133,7 @@ pub(super) fn expect_agent(ctx: &ToolCallContext) -> Result<AgentId, ToolError> 
 }
 
 pub(super) fn check_cap(
-    counter: &MutationCounter,
+    counter: &PerTurnCallCounter,
     request_id: PromptRequestId,
 ) -> Result<(), ToolError> {
     counter.try_increment(request_id).map(|_| ()).map_err(|e| {
@@ -145,6 +151,7 @@ pub(super) fn parse_to_tool_err(e: ParseError) -> ToolError {
 pub(super) fn store_to_tool_err(e: MemoryStoreError) -> ToolError {
     match e {
         MemoryStoreError::NotFound { .. }
+        | MemoryStoreError::EventNotFound { .. }
         | MemoryStoreError::WrongAgent { .. }
         | MemoryStoreError::PinnedImmutable { .. }
         | MemoryStoreError::Parse(_) => ToolError::InvalidInput(e.to_string()),
@@ -165,7 +172,7 @@ pub(super) async fn maybe_close_resolution(
         contradiction_event_id,
     } = &ctx.kind_payload
     {
-        deps.store
+        deps.store()
             .resolve_contradiction(
                 *contradiction_event_id,
                 ResolutionOutcome::Mutation(event_id),
@@ -207,7 +214,7 @@ mod tests {
 
     #[test]
     fn counter_caps_at_per_turn_limit() {
-        let counter = MutationCounter::new();
+        let counter = PerTurnCallCounter::mutations();
         let req = PromptRequestId::new();
         for i in 1..=MAX_MEMORY_MUTATIONS_PER_TURN {
             assert_eq!(counter.try_increment(req).expect("under cap"), i);
@@ -217,7 +224,7 @@ mod tests {
 
     #[test]
     fn counter_is_per_request() {
-        let counter = MutationCounter::new();
+        let counter = PerTurnCallCounter::mutations();
         let r1 = PromptRequestId::new();
         let r2 = PromptRequestId::new();
         for _ in 0..MAX_MEMORY_MUTATIONS_PER_TURN {

@@ -1,10 +1,10 @@
-//! Trait-contract tests for the Phase 3 memory mutation tools
-//! (doc/memory.md §1.5, §2.3): `memory_write`, `memory_update`,
-//! `memory_forget`. The tools share a per-turn mutation counter so a
-//! single turn cannot exceed [`MAX_MEMORY_MUTATIONS_PER_TURN`].
+//! Trait-contract tests for the memory mutation tools (doc/memory.md
+//! §1.5): `memory_write`, `memory_update`, `memory_forget`. They share a
+//! per-turn counter so a single turn cannot exceed
+//! [`MAX_MEMORY_MUTATIONS_PER_TURN`].
 //!
-//! `recall` is intentionally absent — it depends on the embedding
-//! provider that lands in Phase 9.
+//! `recall` lives in its own integration test alongside the embedding
+//! provider stub.
 
 #![allow(clippy::expect_used)]
 

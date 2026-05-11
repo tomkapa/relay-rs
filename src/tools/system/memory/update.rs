@@ -108,14 +108,13 @@ impl Tool for MemoryUpdateTool {
 
         let outcome = self
             .deps
-            .store
+            .store()
             .apply(MemoryMutation::Update {
                 agent,
                 target: memory_id,
                 content,
                 state: MemoryState::Tentative,
                 source: MutationSource::Turn(ctx.request_id),
-                operator_override: false,
             })
             .await
             .map_err(store_to_tool_err)?;

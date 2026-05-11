@@ -83,7 +83,7 @@ impl MemorySectionLoader {
     ///   (see [`compose_memory_section`]).
     /// - **Contextual** — top-K Other/Procedure/Open rows ranked by
     ///   cosine similarity against the session's opening user message
-    ///   (doc/memory.md §1.3, Phase 9).
+    ///   (doc/memory.md §1.3).
     ///
     /// The contextual layer is degraded-empty on any of: missing
     /// opening message, snapshot failure, embedding failure, search
@@ -143,7 +143,7 @@ impl MemorySectionLoader {
         handle: MemoryHandle,
     ) -> Result<Option<MemoryId>, MemoryError> {
         let section = self.load(session, agent).await?;
-        Ok(section.handles().resolve(handle))
+        Ok(section.resolve_handle(handle))
     }
 }
 

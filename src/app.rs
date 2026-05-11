@@ -415,8 +415,8 @@ pub async fn build_server(
     let workers = pool.spawn();
 
     // Background scheduler that periodically enqueues reflection turns
-    // (doc/memory.md §1.6 — Phase 4). Polls Postgres on a fixed cadence;
-    // the actual reflection runs through the worker pool above.
+    // (doc/memory.md §1.6). The reflection itself runs through the worker
+    // pool above.
     let reflection_scheduler = ReflectionScheduler::spawn(
         pieces.pool.clone(),
         pieces.queue.clone(),
@@ -424,9 +424,8 @@ pub async fn build_server(
         cancel.clone(),
     );
 
-    // Librarian — runs the mechanical sweep per agent and enqueues
-    // resolution turns for unresolved contradictions (doc/memory.md
-    // §1.8, §2.6, §2.7 — Phases 6 and 7).
+    // Librarian — mechanical sweep per agent, plus resolution-turn
+    // enqueue for unresolved contradictions (doc/memory.md §1.8).
     let librarian_scheduler = LibrarianScheduler::spawn(
         pieces.pool.clone(),
         pieces.memory_store.clone(),

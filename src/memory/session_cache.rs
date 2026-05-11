@@ -1,34 +1,15 @@
-//! Per-session cache of composed memory sections.
+//! Per-session cache of composed memory sections, backed by
+//! [`BoundedTtlCache`]. Cheap-clone — sharing the cache between
+//! subsystems does not need an external `Arc<...>` wrapper.
 //!
-//! Backed by the generic [`BoundedTtlCache`]; this module wires the
-//! `(SessionId, AgentId)` key and the `Arc<MemorySection>` value
-//! together with the loader closure the agent layer hands in.
-//!
-//! Cheap-clone — sharing the cache between subsystems does not need an
-//! external `Arc<...>` wrapper.
-//!
-//! ## Divergence from `doc/memory.md` §1.3 — revisit
-//!
-//! The doc says memory is "assembled at session start and frozen for
-//! the session's lifetime". The strict reading: store the composed
-//! section as session state (e.g. `session_memory_snapshots` row at
-//! create-time) so the snapshot survives process restarts and outlives
-//! any cache eviction.
-//!
-//! What we ship instead: a process-local TTL cache. Composition is
-//! lazy on the first turn that needs it; the section is held until TTL
-//! eviction or process restart. This trades the strict "frozen for
-//! session's lifetime" invariant for a much smaller diff (no schema /
-//! write path / migration). The user-visible difference: a session
-//! that lives longer than [`crate::memory::SESSION_MEMORY_CACHE_TTL_SECS`],
-//! or that survives a process restart, will recompose its memory
-//! section and pick up writes that landed in between turns.
-//!
-//! When to revisit: if drift across a long-lived session becomes a
-//! correctness issue (e.g. an operator note shows up mid-conversation
-//! and confuses the model), promote this to a `session_memory_snapshots`
-//! table so the invariant is structurally enforced rather than
-//! cache-luck.
+//! Divergence from `doc/memory.md` §1.3: the doc reads "assembled at
+//! session start and frozen for the session's lifetime". We ship a
+//! process-local TTL cache instead — composition is lazy on the first
+//! turn that needs it. A session that outlives
+//! [`crate::memory::SESSION_MEMORY_CACHE_TTL_SECS`] or survives a process
+//! restart will recompose and pick up any writes that landed in between.
+//! Revisit by promoting to a `session_memory_snapshots` table if drift
+//! across long-lived sessions becomes a correctness issue.
 
 use std::sync::Arc;
 use std::time::Duration;

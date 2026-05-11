@@ -1,4 +1,4 @@
-//! OpenAI-compatible embedding provider (doc/memory.md §2.9 — Phase 9).
+//! OpenAI-compatible embedding provider.
 //!
 //! Sibling to [`OpenAiProvider`](super::client::OpenAiProvider). Talks to
 //! any endpoint that speaks OpenAI's `/v1/embeddings` shape. Configured

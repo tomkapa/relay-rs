@@ -12,8 +12,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::memory::{
-    MAX_RECALL_CALLS_PER_TURN, MemoryId, MemoryKind, RECALL_DEFAULT_RESULTS, RECALL_MAX_RESULTS,
-    SearchFilter,
+    MAX_RECALL_CALLS_PER_TURN, MemoryId, MemoryKind, RECALL_MAX_RESULTS, RecallLimit, SearchFilter,
 };
 use crate::provider::{SharedEmbeddingProvider, embed_one};
 use crate::tools::{Tool, ToolCallContext, ToolError};
@@ -31,16 +30,18 @@ const TOOL_DESCRIPTION: &str = "Search your private memory by similarity to a fr
      Arguments: `query` (free text); optional `kind` filter (\"self\", \"other\", \
      \"procedure\", \"open\"); optional `limit` (1..=8, default 4).\n\
      \n\
-     Reading memory does NOT validate it — the librarian needs an independent signal \
-     to promote a tentative memory.";
+     Recall is read-only: surfacing a memory does not validate it. Promotion needs \
+     an independent signal (cross-session re-write, operator endorsement).";
 
 #[derive(Debug, Deserialize)]
 struct Input {
     query: String,
     #[serde(default)]
     kind: Option<MemoryKind>,
+    /// 1..=`RECALL_MAX_RESULTS`. Defaults to `RecallLimit::DEFAULT` when
+    /// the field is absent. Out-of-range values fail at parse time.
     #[serde(default)]
-    limit: Option<u8>,
+    limit: RecallLimit,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,7 +56,6 @@ struct OutputItem {
 #[derive(Debug, Serialize)]
 struct Output {
     matches: Vec<OutputItem>,
-    note: &'static str,
 }
 
 pub struct RecallTool {
@@ -67,7 +67,7 @@ pub struct RecallTool {
     /// Per-turn call counter. Recall reads, doesn't mutate, so spending
     /// the mutation budget on it would surprise the model — it has its
     /// own.
-    call_counter: Arc<super::MutationCounter>,
+    call_counter: Arc<super::PerTurnCallCounter>,
 }
 
 impl std::fmt::Debug for RecallTool {
@@ -96,7 +96,9 @@ impl RecallTool {
             input_schema,
             deps,
             embeddings,
-            call_counter: Arc::new(super::MutationCounter::with_cap(MAX_RECALL_CALLS_PER_TURN)),
+            call_counter: Arc::new(super::PerTurnCallCounter::with_cap(
+                MAX_RECALL_CALLS_PER_TURN,
+            )),
         }
     }
 }
@@ -131,10 +133,7 @@ impl Tool for RecallTool {
             )));
         }
 
-        let limit = parsed
-            .limit
-            .unwrap_or(RECALL_DEFAULT_RESULTS)
-            .min(RECALL_MAX_RESULTS);
+        let limit = parsed.limit.get();
 
         let query_embedding = embed_one(self.embeddings.as_ref(), &parsed.query)
             .await
@@ -149,7 +148,7 @@ impl Tool for RecallTool {
         };
         let results = self
             .deps
-            .store
+            .store()
             .search_by_embedding(agent, &query_embedding, usize::from(limit), filter)
             .await
             .map_err(store_to_tool_err)?;
@@ -157,7 +156,7 @@ impl Tool for RecallTool {
         // Reading does NOT advance validation (doc/memory.md §1.7) — only
         // the access counter and last_accessed_at update.
         let ids: Vec<MemoryId> = results.iter().map(|s| s.row.id).collect();
-        if let Err(e) = self.deps.store.record_access(&ids).await {
+        if let Err(e) = self.deps.store().record_access(&ids).await {
             warn!(error = %e, "recall.record_access.error");
         }
 
@@ -172,9 +171,6 @@ impl Tool for RecallTool {
             })
             .collect();
 
-        Ok(serde_json::to_string(&Output {
-            matches: items,
-            note: "Recall is read-only — surfacing a memory does not validate it.",
-        })?)
+        Ok(serde_json::to_string(&Output { matches: items })?)
     }
 }

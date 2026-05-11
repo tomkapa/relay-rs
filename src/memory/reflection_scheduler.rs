@@ -1,27 +1,24 @@
 //! Background scheduler that enqueues reflection turns
-//! (doc/memory.md §1.6, §2.4 — Phase 4).
+//! (doc/memory.md §1.6).
 //!
-//! The scheduler polls Postgres on a configurable cadence. For each
-//! `(agent_id, session_id)` pair where:
+//! Polls Postgres on a configurable cadence. For each `(agent, session)`
+//! pair where:
 //!
 //! 1. the time since the latest message exceeds
 //!    [`super::limits::REFLECTION_IDLE_TIMEOUT_SECS`], AND
 //! 2. there are messages strictly after the latest
 //!    `reflection_checkpoints` row for that pair
 //!
-//! it enqueues a single `RequestKind::Reflection` job. The scheduler
-//! never talks to the LLM itself — the worker pool dispatches the
-//! resulting row to [`crate::agent_core::Agent::reflect`].
-//!
-//! The owned `JoinHandle` belongs to [`crate::app::Server`] so graceful
-//! shutdown waits on it (CLAUDE.md §7 — no floating tasks).
+//! the scheduler enqueues a single `RequestKind::Reflection` job. The
+//! scheduler never talks to the LLM — the worker pool dispatches the
+//! resulting row through the same `Agent` path as a normal turn.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use tokio::task::JoinHandle;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agents::AgentId;
@@ -36,37 +33,16 @@ use crate::types::{Participant, Prompt};
 use super::limits::{
     REFLECTION_IDLE_TIMEOUT_SECS, REFLECTION_SCHEDULER_BATCH_LIMIT, REFLECTION_SCHEDULER_POLL_SECS,
 };
+use super::scheduled_task::ScheduledTask;
 
-/// Owned wrapper around the scheduler task.
-///
-/// Cancellation has two paths that fire together:
-///
-/// - The owned [`DropGuard`] cancels an internal child token, so
-///   dropping or calling [`Self::shutdown`] always winds the loop down
-///   even when no parent token was supplied.
-/// - When a parent token is passed to [`Self::spawn_with_cadence`] the
-///   internal child also reacts to the parent's cancellation, so a
-///   process-wide Ctrl+C signal (delivered through the main
-///   `CancellationToken`) propagates here in lockstep with the rest of
-///   the runtime.
+#[derive(Debug)]
 pub struct ReflectionScheduler {
-    shutdown: DropGuard,
-    handle: JoinHandle<()>,
-}
-
-impl std::fmt::Debug for ReflectionScheduler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReflectionScheduler")
-            .finish_non_exhaustive()
-    }
+    task: ScheduledTask,
 }
 
 impl ReflectionScheduler {
-    /// Spawn the background loop with the production poll cadence
-    /// ([`REFLECTION_SCHEDULER_POLL_SECS`]) and the supplied parent
-    /// token. The composition root (`src/app.rs`) passes its main
-    /// runtime cancel token here so Ctrl+C cancels the scheduler in
-    /// lockstep with HTTP / workers / MCP refresher.
+    /// Spawn with the production poll cadence. The supplied parent token
+    /// wires shutdown into the main runtime Ctrl+C signal.
     #[must_use]
     pub fn spawn(
         pool: PgPool,
@@ -83,15 +59,8 @@ impl ReflectionScheduler {
         )
     }
 
-    /// Spawn with an explicit poll cadence. Used by tests so they
-    /// don't have to wait the production 60-second tick; callers in
-    /// composition roots use [`Self::spawn`].
-    ///
-    /// `parent` is the optional outer cancellation token. When `Some`,
-    /// the loop also exits when the parent is cancelled — this is how
-    /// the production runtime threads its main Ctrl+C signal in.
-    /// Tests typically pass `None` and rely on
-    /// [`Self::shutdown`] / drop.
+    /// Spawn with an explicit poll cadence. Tests use this to avoid waiting
+    /// the production 60s; production callers use [`Self::spawn`].
     #[must_use]
     pub fn spawn_with_cadence(
         pool: PgPool,
@@ -100,66 +69,38 @@ impl ReflectionScheduler {
         poll_interval: Duration,
         parent: Option<CancellationToken>,
     ) -> Self {
-        let owned = CancellationToken::new();
-        let local_for_loop = owned.clone();
-        let inner = SchedulerLoop {
+        let inner = Arc::new(SchedulerInner {
             pool,
             queue,
             clock,
-            poll_interval,
             idle_threshold: chrono::Duration::seconds(
                 i64::try_from(REFLECTION_IDLE_TIMEOUT_SECS)
                     .expect("invariant: REFLECTION_IDLE_TIMEOUT_SECS fits in i64"),
             ),
             batch_limit: REFLECTION_SCHEDULER_BATCH_LIMIT,
-        };
-        let handle = tokio::spawn(async move { inner.run(local_for_loop, parent).await });
-        Self {
-            shutdown: owned.drop_guard(),
-            handle,
-        }
+        });
+        let task = ScheduledTask::spawn("reflection_scheduler", poll_interval, parent, move || {
+            let inner = inner.clone();
+            async move { inner.tick().await }
+        });
+        Self { task }
     }
 
-    /// Cancel and join. Idempotent.
     pub async fn shutdown(self) {
-        drop(self.shutdown);
-        if let Err(e) = self.handle.await {
-            warn!(error = %e, "reflection_scheduler.join.error");
-        }
+        self.task.shutdown().await;
     }
 }
 
 #[derive(Debug)]
-struct SchedulerLoop {
+struct SchedulerInner {
     pool: PgPool,
     queue: SharedPromptQueue,
     clock: SharedClock,
-    poll_interval: Duration,
     idle_threshold: chrono::Duration,
     batch_limit: usize,
 }
 
-impl SchedulerLoop {
-    /// Drive the loop until either the owned `local` token cancels
-    /// (drop / explicit shutdown) or the optional `parent` cancels
-    /// (process-wide Ctrl+C).
-    async fn run(self, local: CancellationToken, parent: Option<CancellationToken>) {
-        loop {
-            // `parent.is_none()` collapses to the same shape as
-            // having a never-cancelled token without an extra arm —
-            // build a future that resolves on either.
-            tokio::select! {
-                biased;
-                () = local.cancelled() => return,
-                () = parent_cancelled(parent.as_ref()) => return,
-                () = tokio::time::sleep(self.poll_interval) => {},
-            }
-            if let Err(e) = self.tick().await {
-                warn!(error = %e, "reflection_scheduler.tick.error");
-            }
-        }
-    }
-
+impl SchedulerInner {
     async fn tick(&self) -> Result<(), sqlx::Error> {
         let now: DateTime<Utc> = self.clock.now_wall().into();
         let cutoff = now - self.idle_threshold;
@@ -185,14 +126,11 @@ impl SchedulerLoop {
         Ok(())
     }
 
-    /// Find `(agent_id, session_id)` pairs whose latest message is older
-    /// than `cutoff` AND has at least one message past the most recent
-    /// reflection checkpoint (or no checkpoint at all).
-    ///
-    /// One round-trip per tick. The query joins through
-    /// `session_messages` to compute "latest message per (agent,
-    /// session)" and against `reflection_checkpoints` to filter out
-    /// already-processed pairs.
+    /// Find `(agent, session)` pairs whose latest message is older than
+    /// `cutoff` and which have at least one message past the most recent
+    /// reflection checkpoint (or no checkpoint at all). Excludes pairs
+    /// that already have a pending/processing reflection so the scheduler
+    /// is idempotent across ticks.
     async fn find_candidates(
         &self,
         cutoff: DateTime<Utc>,
@@ -274,10 +212,10 @@ impl SchedulerLoop {
             .collect())
     }
 
-    /// Enqueue a single reflection job. Idempotency key derives from
-    /// `(agent, session, last_turn_id)` so a candidate that survives
-    /// across two ticks (because the previous enqueue is still pending)
-    /// returns the same row instead of duplicating.
+    /// Enqueue a single reflection job. The idempotency key derives from
+    /// `(agent, session, last_turn_id)` so a candidate that survives across
+    /// two ticks (because the previous enqueue is still pending) maps back
+    /// to the same row.
     async fn enqueue_reflection(
         &self,
         c: &ReflectionCandidate,
@@ -290,10 +228,9 @@ impl SchedulerLoop {
             turn = c.last_turn_id,
         ))
         .expect("invariant: reflection idempotency key fits the cap");
-        // The `content` is the user-prompt body. Reflection has no
-        // user-facing prompt — we put a short placeholder so the column
-        // CHECK passes; the actual prompt is built by `agent.reflect`
-        // from the conversation history.
+        // Reflection has no user-facing prompt; the column CHECK requires a
+        // non-empty body, so this placeholder satisfies it. The actual
+        // prompt is built by the worker from session history.
         let content = Prompt::try_from("(reflection)")
             .expect("invariant: reflection content placeholder is valid");
         let req = NewPromptRequest {
@@ -318,50 +255,17 @@ impl SchedulerLoop {
     }
 }
 
-/// Helper for the dual-token select arm: resolves only when `parent`
-/// exists and is cancelled. When `parent` is `None`, the future never
-/// resolves, so the loop only watches the local token.
-async fn parent_cancelled(parent: Option<&CancellationToken>) {
-    match parent {
-        Some(token) => token.cancelled().await,
-        None => std::future::pending::<()>().await,
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ReflectionCandidate {
     agent_id: AgentId,
     session_id: SessionId,
     last_turn_id: PromptRequestId,
+    /// Latest message timestamp for this candidate — used only by the SQL
+    /// ordering and surfaced in tracing; the loop itself does not read it
+    /// after `find_candidates` returns.
+    #[allow(dead_code)]
     latest_at: DateTime<Utc>,
 }
 
-#[allow(dead_code)]
-impl ReflectionCandidate {
-    fn debug_age_ms(&self, now: DateTime<Utc>) -> i64 {
-        (now - self.latest_at).num_milliseconds()
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod tests {
-    use super::*;
-
-    // The scheduler's SQL paths are exercised by the
-    // `tests/reflection_scheduler.rs` integration tests against a real
-    // Postgres. Pure-unit coverage here would only re-test the trivial
-    // candidate-struct accessors.
-    #[test]
-    fn candidate_age_is_non_negative_for_past_timestamp() {
-        let now = Utc::now();
-        let earlier = now - chrono::Duration::seconds(120);
-        let c = ReflectionCandidate {
-            agent_id: AgentId::new(),
-            session_id: SessionId::new(),
-            last_turn_id: PromptRequestId::new(),
-            latest_at: earlier,
-        };
-        assert!(c.debug_age_ms(now) >= 0);
-    }
-}
+// SQL paths are covered by `tests/reflection_pipeline.rs` against a real
+// Postgres. The candidate struct is too trivial to merit pure-unit tests.

@@ -1,11 +1,14 @@
-//! Storage seam for the memory subsystem (doc/memory.md §2.1).
+//! Storage seam for the memory subsystem (doc/memory.md §1.2, §1.7–§1.9).
 //!
-//! One transactional mutation function is the only path through which memory
-//! changes — both the agent's tool calls (Phase 3) and the operator surface
-//! (Phase 8) call into it. The trait keeps the worker pool, librarian, and
-//! HTTP layer decoupled from Postgres so the rest of the runtime can be
-//! exercised against an in-memory fake when integration tests do not want a
-//! database.
+//! One transactional mutation function ([`MemoryStore::apply`]) is the only
+//! path through which memory changes — agent tool calls, operator notes, and
+//! librarian sweeps all funnel through it. Every mutation appends one row to
+//! the journal ([`MemoryEvent`]) and updates the materialized table
+//! ([`MemoryRow`]) in the same transaction.
+//!
+//! The trait keeps the worker pool, librarian, and HTTP layer decoupled from
+//! Postgres so the rest of the runtime can be exercised against an in-memory
+//! fake when integration tests do not want a database.
 
 use std::fmt;
 use std::sync::Arc;
@@ -25,15 +28,19 @@ use super::types::{
     MutationSourceKind,
 };
 
-/// All failure modes the memory store can surface. CLAUDE.md §12 — one
-/// error type at the module boundary, every variant exhaustive at the call
-/// site.
+/// All failure modes the memory store can surface. CLAUDE.md §12 — one error
+/// type at the module boundary, every variant exhaustive at the call site.
 #[derive(Debug, Error)]
 pub enum MemoryStoreError {
     /// Target memory id was not found in `agent_memories`. Update / forget
     /// hit a row that has already been forgotten or never existed.
     #[error("memory {id:?} not found")]
     NotFound { id: MemoryId },
+
+    /// Target journal event id was not found in `memory_events`. Surfaced
+    /// by the revert path against a stale id.
+    #[error("memory event {id:?} not found")]
+    EventNotFound { id: MemoryEventId },
 
     /// Target row exists but belongs to a different agent. Memory is
     /// per-agent and private (doc/memory.md §1.11) — a cross-agent edit is
@@ -58,7 +65,7 @@ pub enum MemoryStoreError {
 
     /// Embedding provider call failed during a mutation. `MemoryStore::apply`
     /// propagates this so a missing embedding never produces a row that
-    /// retrieval cannot match (doc/memory.md §2.9 — failure handling).
+    /// retrieval cannot match.
     #[error("memory store embedding provider: {0}")]
     Provider(#[from] ProviderError),
 }
@@ -92,14 +99,23 @@ impl MutationSource {
             Self::Operator | Self::Librarian => None,
         }
     }
+
+    /// Only the operator path is allowed to mutate pinned rows. Derived
+    /// from the source so the predicate cannot drift out of sync with a
+    /// separate `operator_override` boolean.
+    #[must_use]
+    pub const fn bypasses_pin(&self) -> bool {
+        matches!(self, Self::Operator)
+    }
 }
 
-/// Input to [`MemoryStore::apply`]. The single shape every mutation flows
-/// through; the variant determines which journal `mutation` label is
-/// written and which materialized-row update runs.
+/// Input to [`MemoryStore::apply`].
 ///
-/// `state` is honoured directly today; the lifecycle state machine
-/// (doc/memory.md §1.7) will narrow agent-facing callers later.
+/// The variant selects which journal label is written and which
+/// materialized-row update runs; pinned-row protection is derived from the
+/// source (`source.bypasses_pin()`), not a parallel boolean. Agent tool
+/// calls pass `MutationSource::Turn(_)`; the HTTP operator surface passes
+/// `Operator`; the librarian passes `Librarian`.
 #[derive(Debug, Clone)]
 pub enum MemoryMutation {
     /// Mint a new memory row.
@@ -111,16 +127,14 @@ pub enum MemoryMutation {
         pinned: bool,
         source: MutationSource,
     },
-    /// Replace `content` on an existing memory.
+    /// Replace `content` on an existing memory. `state` is the *new* state
+    /// after the update; kind and pinned are preserved from the prior row.
     Update {
         agent: AgentId,
         target: MemoryId,
         content: MemoryContent,
         state: MemoryState,
         source: MutationSource,
-        /// When `true`, the pinned-row protection is bypassed. Set only on
-        /// the operator path.
-        operator_override: bool,
     },
     /// Drop a memory row from the materialized view. The journal retains
     /// the event so the row can be replayed back into existence.
@@ -128,7 +142,6 @@ pub enum MemoryMutation {
         agent: AgentId,
         target: MemoryId,
         source: MutationSource,
-        operator_override: bool,
     },
 }
 
@@ -166,27 +179,20 @@ impl MemoryMutation {
     }
 }
 
-/// Outcome of a successful [`MemoryStore::apply`] call. Carries enough
-/// information for the caller to know which rows changed without reading
-/// back the materialized view.
+/// Outcome of a successful [`MemoryStore::apply`] call. The materialized
+/// `row` is `None` on `Forget` (the row is gone) and `Some` on
+/// `Write` / `Update`.
 #[derive(Debug, Clone)]
 pub struct MutationOutcome {
-    /// The journal row written.
     pub event_id: MemoryEventId,
-    /// The materialized row id touched. For `Write` this is the freshly
-    /// minted id; for `Update` / `Forget` it is the targeted row.
     pub memory_id: MemoryId,
-    /// Materialized row after the mutation. `None` for `Forget` because
-    /// the row is gone from `agent_memories`.
     pub row: Option<MemoryRow>,
 }
 
 /// Snapshot of a single row in `agent_memories`.
 ///
-/// `embedding` is `None` when the row was written before the embedding
-/// provider was wired (Phase 9); `Some` once the embedding writer has
-/// populated it. Retrieval paths (Phase 2 contextual layer, Phase 3
-/// `recall`, Phase 6 librarian) skip rows whose embedding is `None`.
+/// `source_turn_id` is `None` for operator notes and librarian-merged rows
+/// (neither has a producing turn); `Some(_)` for agent-written rows.
 #[derive(Debug, Clone)]
 pub struct MemoryRow {
     pub id: MemoryId,
@@ -202,17 +208,66 @@ pub struct MemoryRow {
     pub access_count: u64,
 }
 
+/// Per-mutation payload journaled with every event.
+///
+/// The variant matches the `memory_events_content_shape` +
+/// `memory_events_payload_shape` CHECK constraints exactly: every Rust
+/// shape is a valid row, every row decodes into exactly one shape. Replay
+/// and revert match the variant without touching an `Option`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryEventPayload {
+    /// New row minted. Carries the full attrs needed to recreate it.
+    Write {
+        content: MemoryContent,
+        kind: MemoryKind,
+        state: MemoryState,
+        pinned: bool,
+    },
+    /// Content (and possibly state) changed. `kind` and `pinned` are the
+    /// post-mutation values; today an Update does not change either, but
+    /// recording them keeps replay self-contained.
+    Update {
+        before: MemoryContent,
+        after: MemoryContent,
+        kind: MemoryKind,
+        state: MemoryState,
+        pinned: bool,
+    },
+    /// Row removed from the materialized view. `before` is the content at
+    /// the moment of removal, so a revert can restore it without consulting
+    /// the prior write event.
+    Forget { before: MemoryContent },
+}
+
+impl MemoryEventPayload {
+    /// Discriminator — drives the `memory_events.mutation` column.
+    #[must_use]
+    pub const fn kind(&self) -> MutationKind {
+        match self {
+            Self::Write { .. } => MutationKind::Write,
+            Self::Update { .. } => MutationKind::Update,
+            Self::Forget { .. } => MutationKind::Forget,
+        }
+    }
+}
+
 /// Snapshot of a single row in `memory_events`.
 #[derive(Debug, Clone)]
 pub struct MemoryEvent {
     pub id: MemoryEventId,
     pub agent_id: AgentId,
-    pub mutation: MutationKind,
     pub target_memory_id: MemoryId,
-    pub content_before: Option<MemoryContent>,
-    pub content_after: Option<MemoryContent>,
     pub source: MutationSource,
     pub created_at: DateTime<Utc>,
+    pub payload: MemoryEventPayload,
+}
+
+impl MemoryEvent {
+    /// Discriminator — drives the journal `mutation` column.
+    #[must_use]
+    pub const fn mutation_kind(&self) -> MutationKind {
+        self.payload.kind()
+    }
 }
 
 /// Filter applied by [`MemoryStore::search_by_embedding`].
@@ -222,12 +277,11 @@ pub struct SearchFilter {
     pub min_state: Option<crate::memory::MemoryState>,
 }
 
-/// One result from an embedding search — the row plus its cosine
-/// similarity score.
+/// One result from an embedding search — the row plus its cosine similarity
+/// score in `[-1, 1]` (higher = closer).
 #[derive(Debug, Clone)]
 pub struct ScoredMemoryRow {
     pub row: MemoryRow,
-    /// Cosine similarity in `[-1, 1]`. Higher is closer.
     pub similarity: f32,
 }
 
@@ -243,22 +297,19 @@ pub struct PairCandidate {
 /// thread-safe.
 ///
 /// The trait is intentionally narrow: every mutation flows through
-/// [`Self::apply`]; everything else is read or replay. Phase 2's renderer
-/// and Phase 3's tool layer talk to this trait, never to a concrete impl.
+/// [`Self::apply`]; everything else is read or replay.
 #[async_trait]
 pub trait MemoryStore: fmt::Debug + Send + Sync {
     /// Apply one mutation. Appends a journal row and updates the
-    /// materialized table in a single transaction. Every memory write in
-    /// the system goes through this function.
+    /// materialized table in a single transaction.
     async fn apply(&self, mutation: MemoryMutation) -> Result<MutationOutcome, MemoryStoreError>;
 
-    /// Snapshot every materialized row for `agent`, ordered by
-    /// `created_at` ascending. Used by the renderer (Phase 2) and the
-    /// operator audit endpoint (Phase 8).
+    /// Snapshot every materialized row for `agent`, ordered by `created_at`
+    /// ascending.
     async fn list(&self, agent: AgentId) -> Result<Vec<MemoryRow>, MemoryStoreError>;
 
-    /// Fetch a single materialized row. Returns `None` if the row has been
-    /// forgotten or never existed.
+    /// Fetch a single materialized row. Returns `None` if forgotten or
+    /// never existed.
     async fn get(&self, id: MemoryId) -> Result<Option<MemoryRow>, MemoryStoreError>;
 
     /// Snapshot every journal event for `agent`, ordered chronologically.
@@ -267,16 +318,14 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     async fn list_events(&self, agent: AgentId) -> Result<Vec<MemoryEvent>, MemoryStoreError>;
 
     /// Rebuild `agent_memories` for a single agent by replaying the
-    /// journal end to end. Used by tests that assert the materialized view
-    /// is a deterministic projection of the events log; the operator
-    /// revert path (Phase 8) calls this after appending an inverse event.
+    /// journal end to end. Used by the operator revert path (after
+    /// appending an inverse event) and by tests asserting the materialized
+    /// view is a deterministic projection of the events log.
     async fn rebuild_materialized(&self, agent: AgentId) -> Result<(), MemoryStoreError>;
 
     /// Top-K cosine-similarity search over `agent`'s memory embeddings.
-    /// Implementations that do not have an embedding writer wired
-    /// (`embedding` column NULL on every row) return an empty vector —
-    /// the renderer (Phase 2) and `recall` tool (Phase 3) treat the empty
-    /// result as a degraded contextual layer rather than an error.
+    /// Rows without an embedding are skipped — the renderer and `recall`
+    /// tool treat an empty result as a degraded layer rather than an error.
     async fn search_by_embedding(
         &self,
         agent: AgentId,
@@ -286,9 +335,8 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     ) -> Result<Vec<ScoredMemoryRow>, MemoryStoreError>;
 
     /// Pairs of an agent's memories whose cosine similarity ≥ `threshold`,
-    /// excluding (a, a) self-pairs. Used by the librarian's dedup and
-    /// contradiction-detection sweep (Phase 6). Pairs are returned each
-    /// time only once (canonical ordering by id).
+    /// excluding self-pairs. Each pair appears once (canonical ordering by
+    /// id).
     async fn similar_pairs(
         &self,
         agent: AgentId,
@@ -296,19 +344,19 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
         max_pairs: usize,
     ) -> Result<Vec<PairCandidate>, MemoryStoreError>;
 
-    /// Apply decay rules: any non-pinned `Validated` row whose
-    /// `last_validated_at` is older than `cutoff` gets demoted to `Held`
-    /// via the journal. Returns the number of rows demoted.
+    /// Demote non-pinned `Validated` rows whose `last_validated_at` is
+    /// older than `cutoff` to `Held` via the journal. Returns the count of
+    /// rows demoted.
     async fn decay_validated(
         &self,
         agent: AgentId,
         cutoff: DateTime<Utc>,
     ) -> Result<usize, MemoryStoreError>;
 
-    /// Stamp an independent-signal validation for the memory.
-    /// Promotes the row's state per the lifecycle rules (Tentative → Held
-    /// on first validation; Held → Validated on second). The journal is
-    /// updated to reflect any state change so replay is faithful.
+    /// Stamp an independent-signal validation for the memory. Promotes the
+    /// row's state per the lifecycle rules (Tentative → Held on first
+    /// validation; Held → Validated on second). The journal is updated to
+    /// reflect any state change so replay is faithful.
     async fn record_validation(
         &self,
         agent: AgentId,
@@ -317,10 +365,9 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError>;
 
-    /// Insert a librarian-detected contradiction event for the given
-    /// pair. Returns the event id. Idempotent on `(memory_a, memory_b)`
-    /// against currently-unresolved rows — duplicate insert returns the
-    /// existing id.
+    /// Insert a librarian-detected contradiction event for the given pair.
+    /// Idempotent on `(memory_a, memory_b)` against currently-unresolved
+    /// rows — duplicate insert returns the existing id.
     async fn record_contradiction(
         &self,
         agent: AgentId,
@@ -335,19 +382,15 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
         agent: AgentId,
     ) -> Result<Vec<ContradictionEventRow>, MemoryStoreError>;
 
-    /// Fetch one contradiction event by id. Returns `None` if not found
-    /// or already resolved.
+    /// Fetch one contradiction event by id.
     async fn read_contradiction(
         &self,
         id: crate::memory::ContradictionEventId,
     ) -> Result<Option<ContradictionEventRow>, MemoryStoreError>;
 
-    /// Mark a contradiction event resolved. The variant determines whether
-    /// the close points at a journal event ([`ResolutionOutcome::Mutation`])
-    /// or carries a free-text rationale ([`ResolutionOutcome::NoAction`]).
-    /// Idempotent: the underlying `WHERE resolved_at IS NULL` guard means a
-    /// second call against an already-closed row is a no-op rather than a
-    /// clobber.
+    /// Mark a contradiction event resolved. Idempotent: the underlying
+    /// `WHERE resolved_at IS NULL` guard makes a second call against an
+    /// already-closed row a no-op.
     async fn resolve_contradiction(
         &self,
         id: crate::memory::ContradictionEventId,
@@ -355,25 +398,23 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     ) -> Result<(), MemoryStoreError>;
 
     /// Force-evict the lowest-scoring non-pinned rows beyond `quota`.
-    /// Returns ids of evicted memories. Used by the librarian (Phase 6).
+    /// Returns ids of evicted memories.
     async fn evict_overflow(
         &self,
         agent: AgentId,
         quota: usize,
     ) -> Result<Vec<MemoryId>, MemoryStoreError>;
 
-    /// Append an inverse-mutation event for the given journal id and
-    /// rebuild the materialized row. Used by the operator revert path
-    /// (Phase 8). Returns the materialized row after revert (None when
-    /// the revert removed the row).
+    /// Append an inverse-mutation event for the given journal id and rebuild
+    /// the materialized row. Returns the row after revert (`None` when the
+    /// revert removed the row).
     async fn revert_event(
         &self,
         agent: AgentId,
         event: MemoryEventId,
     ) -> Result<Option<MemoryRow>, MemoryStoreError>;
 
-    /// Toggle the pinned flag on a row. Operator-only; agent paths cannot
-    /// reach here.
+    /// Toggle the pinned flag on a row. Operator-only.
     async fn set_pinned(
         &self,
         agent: AgentId,
@@ -382,19 +423,16 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     ) -> Result<MemoryRow, MemoryStoreError>;
 
     /// Increment the access counter and bump `last_accessed_at` for the
-    /// rows whose ids match. Bounded — `ids.len()` ≤ `MAX_MEMORIES_PER_AGENT`.
+    /// matching rows. Bounded — `ids.len()` ≤ `MAX_MEMORIES_PER_AGENT`.
     /// Reading does NOT advance validation (doc/memory.md §1.7).
     async fn record_access(&self, ids: &[MemoryId]) -> Result<(), MemoryStoreError>;
 }
 
 /// One row in `contradiction_events`. Three valid shapes mirror the
-/// `contradiction_events_resolved_consistent` CHECK in migration 7:
-///
+/// `contradiction_events_resolved_consistent` CHECK:
 /// * pending — every resolution column is `None`.
-/// * mutation close — `resolved_at` set, `resolution_event_id` set,
-///   `resolution_reason` is `None`.
-/// * no-action close — `resolved_at` set, `resolution_event_id` is `None`,
-///   `resolution_reason` set.
+/// * mutation close — `resolved_at` + `resolution_event_id` set, reason `None`.
+/// * no-action close — `resolved_at` + `resolution_reason` set, event_id `None`.
 #[derive(Debug, Clone)]
 pub struct ContradictionEventRow {
     pub id: crate::memory::ContradictionEventId,
@@ -408,11 +446,9 @@ pub struct ContradictionEventRow {
     pub resolution_reason: Option<String>,
 }
 
-/// Free-text rationale persisted on a no-action contradiction close.
-///
-/// Smart constructor at the boundary (CLAUDE.md §1) so the column's length
-/// invariant is encoded in the type — once you hold a [`ResolutionReason`],
-/// it is known to be 1..=`CONTRADICTION_REASON_MAX_BYTES` bytes.
+/// Free-text rationale persisted on a no-action contradiction close. Smart
+/// constructor at the boundary so the column's 1..=`CONTRADICTION_REASON_MAX_BYTES`
+/// length invariant is encoded in the type.
 #[derive(Debug, Clone)]
 pub struct ResolutionReason(String);
 
@@ -451,13 +487,12 @@ impl TryFrom<String> for ResolutionReason {
 /// Outcome of a resolution turn — fed to [`MemoryStore::resolve_contradiction`].
 ///
 /// The two variants map to the two non-pending shapes of the
-/// `contradiction_events_resolved_consistent` CHECK constraint, so the
-/// type system makes the invalid combination (event id AND reason, or
-/// neither) unrepresentable.
+/// `contradiction_events_resolved_consistent` CHECK, so the invalid
+/// combination (both / neither) is unrepresentable.
 #[derive(Debug, Clone)]
 pub enum ResolutionOutcome {
-    /// A mutation tool (`memory_update` / `memory_forget`) closed the pair
-    /// inline; `event_id` points at the journal row that did it.
+    /// A mutation tool closed the pair inline; `event_id` points at the
+    /// journal row that did it.
     Mutation(MemoryEventId),
     /// The resolution turn ended without mutating either memory; `reason`
     /// is the assistant's final text (truncated to the column cap).
@@ -467,11 +502,10 @@ pub enum ResolutionOutcome {
 /// Origin of a [`MemoryStore::record_validation`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationSource {
-    /// Cross-session re-write: the librarian found the same content
-    /// emerging in a different session.
+    /// Cross-session re-write: the librarian found the same content emerging
+    /// in a different session.
     CrossSessionRewrite,
-    /// External confirmation: an agent's own follow-up turn (recall +
-    /// web_search + reply) confirmed the memory.
+    /// External confirmation: an agent's own follow-up turn confirmed it.
     ExternalConfirmation,
     /// Operator endorsement: a `manager_note` flagged the memory as
     /// validated.
@@ -490,6 +524,5 @@ impl ValidationSource {
     }
 }
 
-/// Cheap-clone handle so collaborators can hold the store without a
-/// generic parameter.
+/// Cheap-clone handle so collaborators can hold the store without a generic.
 pub type SharedMemoryStore = Arc<dyn MemoryStore>;

@@ -36,10 +36,9 @@ pub struct Settings {
     /// Postgres connection string. Required at startup — there is no in-memory
     /// fallback. Wrapped in [`SecretString`] because the URL embeds a password.
     pub database_url: SecretString,
-    /// Embedding provider configuration (doc/memory.md §2.9 — Phase 9).
-    /// Required: the memory subsystem refuses to start without one. Decoupled
-    /// from the chat provider so chat and embeddings can point at different
-    /// vendors.
+    /// Embedding provider configuration. Required: the memory subsystem
+    /// refuses to start without one. Decoupled from the chat provider so
+    /// chat and embeddings can point at different vendors.
     pub embedding: EmbeddingSettings,
 }
 

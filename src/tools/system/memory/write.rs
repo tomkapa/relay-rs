@@ -107,7 +107,7 @@ impl Tool for MemoryWriteTool {
         let content = MemoryContent::try_from(parsed.content).map_err(parse_to_tool_err)?;
         let outcome = self
             .deps
-            .store
+            .store()
             .apply(MemoryMutation::Write {
                 agent,
                 kind: parsed.kind,
