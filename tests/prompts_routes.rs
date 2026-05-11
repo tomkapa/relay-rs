@@ -69,6 +69,12 @@ impl PromptsHarness {
                 .await
                 .expect("spawn thread stream");
 
+        let memory_store: relay_rs::memory::SharedMemoryStore =
+            Arc::new(relay_rs::memory::PgMemoryStore::new(
+                pool.clone(),
+                clock.clone(),
+                common::embedding::FakeEmbeddingProvider::shared(),
+            ));
         let state = AppState {
             queue: queue.clone(),
             leases,
@@ -76,6 +82,7 @@ impl PromptsHarness {
             sessions,
             agents: agents.clone(),
             dag,
+            memory_store,
             mcp_store,
             mcp_refresh,
             thread_stream,
@@ -156,7 +163,7 @@ async fn followup_with_session_id_routes_to_session_agent() {
             content: Prompt::try_from("hi").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-root").expect("key"),
             kind: relay_rs::runtime::RequestKind::Normal,
-            kind_payload: None,
+            kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
         .expect("enqueue root");

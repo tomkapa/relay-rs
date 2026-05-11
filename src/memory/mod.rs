@@ -6,13 +6,14 @@
 //!   composed `<memory>` section). The agent loop calls into this once
 //!   per turn. Backed today by [`AgentMemory`] / [`StaticMemory`].
 //! - [`MemoryStore`] — the agent's persistent, journaled memory rows
-//!   (doc/memory.md). Phase 1 lands the storage foundation
-//!   ([`PgMemoryStore`]); Phase 2 lands the composer + session cache
-//!   that turn rows into a system-prompt section.
+//!   (doc/memory.md). [`PgMemoryStore`] is the storage foundation; the
+//!   composer + session cache turn rows into a system-prompt section.
 
 mod agent;
 mod composer;
+mod librarian;
 mod limits;
+mod loader;
 mod pg_store;
 mod reflection_scheduler;
 mod session_cache;
@@ -20,25 +21,34 @@ mod r#static;
 mod store;
 mod traits;
 mod types;
+mod vector;
 
-pub use agent::{AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, ROLE_TAG_CLOSE, ROLE_TAG_OPEN};
+pub use agent::{
+    AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, ModeCores, ROLE_TAG_CLOSE, ROLE_TAG_OPEN,
+};
 pub use composer::{
     MEMORY_TAG_CLOSE, MEMORY_TAG_OPEN, MemoryHandleMap, MemorySection, compose_memory_section,
 };
+pub use librarian::{LibrarianScheduler, LibrarianSweepReport, run_librarian_sweep};
 pub use limits::{
     CONTEXTUAL_LAYER_MAX_BYTES, CONTEXTUAL_TOP_K, CONTRADICTION_REASON_MAX_BYTES,
-    MAX_EVENTS_PER_PAGE, MAX_MEMORIES_PER_AGENT, MAX_MEMORY_MUTATIONS_PER_REFLECTION,
-    MAX_MEMORY_MUTATIONS_PER_TURN, MEMORY_CONTENT_MAX_BYTES, REFLECTION_IDLE_TIMEOUT_SECS,
+    CONTRADICTION_SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, LIBRARIAN_BATCH_LIMIT,
+    LIBRARIAN_POLL_SECS, MAX_EVENTS_PER_PAGE, MAX_MEMORIES_PER_AGENT,
+    MAX_MEMORY_MUTATIONS_PER_REFLECTION, MAX_MEMORY_MUTATIONS_PER_TURN, MAX_RECALL_CALLS_PER_TURN,
+    MAX_SIMILAR_PAIRS_PER_AGENT, MEMORY_CONTENT_MAX_BYTES, OPERATOR_AUDIT_PAGE_LIMIT,
+    RECALL_DEFAULT_RESULTS, RECALL_MAX_RESULTS, REFLECTION_IDLE_TIMEOUT_SECS,
     REFLECTION_SCHEDULER_BATCH_LIMIT, REFLECTION_SCHEDULER_POLL_SECS, SESSION_MEMORY_CACHE_CAP,
-    SESSION_MEMORY_CACHE_TTL_SECS, STABLE_LAYER_MAX_BYTES,
+    SESSION_MEMORY_CACHE_TTL_SECS, STABLE_LAYER_MAX_BYTES, VALIDATION_DECAY_SECS,
 };
+pub use loader::MemorySectionLoader;
 pub use pg_store::PgMemoryStore;
 pub use reflection_scheduler::ReflectionScheduler;
 pub use session_cache::SessionMemoryCache;
 pub use r#static::StaticMemory;
 pub use store::{
-    MemoryEvent, MemoryMutation, MemoryRow, MemoryStore, MemoryStoreError, MutationOutcome,
-    MutationSource, SharedMemoryStore,
+    ContradictionEventRow, MemoryEvent, MemoryMutation, MemoryRow, MemoryStore, MemoryStoreError,
+    MutationOutcome, MutationSource, PairCandidate, ResolutionOutcome, ResolutionReason,
+    ScoredMemoryRow, SearchFilter, SharedMemoryStore, ValidationSource,
 };
 pub use traits::{Memory, MemoryError, SharedMemory};
 pub use types::{

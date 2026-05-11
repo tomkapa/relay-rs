@@ -7,11 +7,13 @@
 -- last-processed turn per (agent, session) so reflection (Phase 4) is
 -- idempotent across resumption.
 --
--- Existing-table change: `prompt_requests` gains a `kind` enum + nullable
+-- Existing-table change: `prompt_requests` gains a `kind` enum and a
 -- `kind_payload` JSONB so the same queue/worker pool dispatches normal,
--- reflection, and resolution turns (no fork). Pre-launch — see
--- `feedback_no_backcompat`: existing dev rows get the `'normal'` default in
--- one shot and the column is `NOT NULL` from the start.
+-- reflection, and resolution turns (no fork). Both columns are NOT NULL
+-- and 1:1 with each other — every kind has a payload variant
+-- (`Normal {}` is empty for now, room for Normal-specific fields later
+-- without a wire-format break). Pre-launch — see `feedback_no_backcompat`:
+-- existing dev rows get the `'normal'` defaults in one shot.
 --
 -- pgvector is already enabled in migration 1. The `embedding` column on
 -- `agent_memories` is nullable for Phase 1 because no embedding writer
@@ -30,7 +32,8 @@
 ALTER TABLE prompt_requests
     ADD COLUMN kind         TEXT NOT NULL DEFAULT 'normal'
                             CHECK (kind IN ('normal','reflection','resolution')),
-    ADD COLUMN kind_payload JSONB NULL;
+    ADD COLUMN kind_payload JSONB NOT NULL
+                            DEFAULT '{"kind":"normal","data":{}}'::jsonb;
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- memory_events — append-only journal. The source of truth: `agent_memories`
@@ -110,10 +113,15 @@ CREATE INDEX agent_memories_agent_idx
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- contradiction_events — librarian-detected pairs awaiting resolution
--- (Phase 6/7). Resolution sets `resolved_at` + `resolution_event_id`
--- pointing at the journal event that closed it (a `memory_update`,
--- `memory_forget`, or a `no_action` marker — encoded as NULL with a reason
--- in the resolution path).
+-- (Phase 6/7). Closed in one of two shapes:
+--   * mutation close — `resolution_event_id` points at the `memory_update` /
+--     `memory_forget` journal row that resolved the pair; `resolution_reason`
+--     is NULL because the journal row is the audit record.
+--   * no-action close — `resolution_event_id` is NULL; `resolution_reason`
+--     carries the assistant's final-text rationale (the resolution turn
+--     decided neither memory needed mutating).
+-- A row is `pending` while all three of resolved_at / resolution_event_id /
+-- resolution_reason are NULL.
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE TABLE contradiction_events (
     id                    UUID PRIMARY KEY,
@@ -124,14 +132,25 @@ CREATE TABLE contradiction_events (
     created_at            TIMESTAMPTZ NOT NULL,
     resolved_at           TIMESTAMPTZ NULL,
     resolution_event_id   UUID NULL REFERENCES memory_events(id) ON DELETE SET NULL,
+    resolution_reason     TEXT NULL CHECK (
+        resolution_reason IS NULL
+        OR octet_length(resolution_reason) BETWEEN 1 AND 1024
+    ),
     -- The two memories must be distinct for a contradiction to be meaningful.
     CONSTRAINT contradiction_events_distinct CHECK (memory_a <> memory_b),
-    -- `resolved_at` and `resolution_event_id` are written together — both
-    -- set when the resolution turn closes the pair, both NULL while
-    -- pending. Either side present without the other means the resolution
-    -- path partially succeeded, which is a bug.
+    -- Three valid states: pending, mutation-closed, no-action-closed. Any
+    -- other combination of (resolved_at, resolution_event_id, resolution_reason)
+    -- means the resolution path partially succeeded, which is a bug.
     CONSTRAINT contradiction_events_resolved_consistent CHECK (
-        (resolved_at IS NULL) = (resolution_event_id IS NULL)
+        (resolved_at IS NULL
+            AND resolution_event_id IS NULL
+            AND resolution_reason IS NULL)
+        OR (resolved_at IS NOT NULL
+            AND resolution_event_id IS NOT NULL
+            AND resolution_reason IS NULL)
+        OR (resolved_at IS NOT NULL
+            AND resolution_event_id IS NULL
+            AND resolution_reason IS NOT NULL)
     )
 );
 

@@ -16,8 +16,9 @@ use relay_rs::agents::{AgentPromptCache, PgAgentStore, SharedAgentStore};
 use relay_rs::clock::{SharedClock, SystemClock, TestClock};
 use relay_rs::memory::{
     AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, MEMORY_TAG_CLOSE, MEMORY_TAG_OPEN, Memory,
-    MemoryContent, MemoryHandle, MemoryKind, MemoryMutation, MemoryState, MutationSource,
-    PgMemoryStore, ROLE_TAG_CLOSE, ROLE_TAG_OPEN, SessionMemoryCache, SharedMemoryStore,
+    MemoryContent, MemoryHandle, MemoryKind, MemoryMutation, MemorySectionLoader, MemoryState,
+    MutationSource, PgMemoryStore, ROLE_TAG_CLOSE, ROLE_TAG_OPEN, SessionMemoryCache,
+    SharedMemoryStore,
 };
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::types::Participant;
@@ -26,6 +27,14 @@ mod common;
 use common::pg::{TestDb, human_to_agent_session};
 
 const CORE: &str = "be professional and helpful";
+
+fn cores() -> relay_rs::memory::ModeCores {
+    relay_rs::memory::ModeCores {
+        normal: std::sync::Arc::from(CORE),
+        reflection: std::sync::Arc::from(CORE),
+        resolution: std::sync::Arc::from(CORE),
+    }
+}
 
 struct Fixture {
     memory: AgentMemory,
@@ -38,15 +47,16 @@ fn build_memory(db: &TestDb, clock: SharedClock) -> Fixture {
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
-    let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(db.pool.clone(), clock.clone()));
+    let embeddings = common::embedding::FakeEmbeddingProvider::shared();
+    let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
+        db.pool.clone(),
+        clock.clone(),
+        embeddings.clone(),
+    ));
     let session_cache = SessionMemoryCache::new(16, Duration::from_secs(60), clock.clone());
-    let memory = AgentMemory::new(
-        agents.clone(),
-        prompt_cache,
-        store.clone(),
-        session_cache,
-        CORE,
-    );
+    let loader =
+        MemorySectionLoader::new(store.clone(), sessions.clone(), embeddings, session_cache);
+    let memory = AgentMemory::new(agents.clone(), prompt_cache, loader, cores());
     Fixture {
         memory,
         sessions,
@@ -64,7 +74,7 @@ async fn assembles_core_then_role_in_order() {
     let viewer = Participant::agent(db.default_agent_id);
     let prompt = f
         .memory
-        .system_prompt(session, viewer)
+        .system_prompt(session, viewer, relay_rs::runtime::RequestKind::Normal)
         .await
         .expect("system prompt");
 
@@ -93,7 +103,11 @@ async fn empty_memory_skips_memory_section() {
     let session = human_to_agent_session(f.sessions.as_ref(), db.default_agent_id).await;
     let prompt = f
         .memory
-        .system_prompt(session, Participant::agent(db.default_agent_id))
+        .system_prompt(
+            session,
+            Participant::agent(db.default_agent_id),
+            relay_rs::runtime::RequestKind::Normal,
+        )
         .await
         .expect("system prompt");
 
@@ -125,7 +139,11 @@ async fn renders_memory_section_after_role() {
     let session = human_to_agent_session(f.sessions.as_ref(), agent_id).await;
     let prompt = f
         .memory
-        .system_prompt(session, Participant::agent(agent_id))
+        .system_prompt(
+            session,
+            Participant::agent(agent_id),
+            relay_rs::runtime::RequestKind::Normal,
+        )
         .await
         .expect("system prompt");
 
@@ -158,7 +176,7 @@ async fn frozen_during_session_returns_identical_prompt() {
 
     let first = f
         .memory
-        .system_prompt(session, viewer)
+        .system_prompt(session, viewer, relay_rs::runtime::RequestKind::Normal)
         .await
         .expect("first");
 
@@ -176,7 +194,7 @@ async fn frozen_during_session_returns_identical_prompt() {
 
     let second = f
         .memory
-        .system_prompt(session, viewer)
+        .system_prompt(session, viewer, relay_rs::runtime::RequestKind::Normal)
         .await
         .expect("second");
 
@@ -215,7 +233,11 @@ async fn resolve_handle_round_trips_to_memory_id() {
     // Compose the section so the handle map is populated.
     let _ = f
         .memory
-        .system_prompt(session, Participant::agent(agent_id))
+        .system_prompt(
+            session,
+            Participant::agent(agent_id),
+            relay_rs::runtime::RequestKind::Normal,
+        )
         .await
         .expect("compose");
 
@@ -280,6 +302,10 @@ async fn pg_memory_store_underlying_constructs() {
     // the integration tests do.
     let db = TestDb::fresh().await;
     let clock: SharedClock = SystemClock::shared();
-    let _store: SharedMemoryStore = Arc::new(PgMemoryStore::new(db.pool.clone(), clock.clone()));
+    let _store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
+        db.pool.clone(),
+        clock.clone(),
+        common::embedding::FakeEmbeddingProvider::shared(),
+    ));
     let _cache = SessionMemoryCache::new(4, Duration::from_secs(1), clock);
 }

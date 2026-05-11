@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::runtime::PromptRequestId;
+use crate::runtime::{PromptRequestId, RequestKindPayload};
 use crate::session::SessionId;
 use crate::types::{Participant, ToolName};
 
+use super::modes::RequestKindModes;
 use super::url::UrlError;
 
 #[derive(Debug, Error)]
@@ -47,7 +48,7 @@ pub enum ToolError {
 /// Threaded by the agent loop into [`Tool::execute_with_ctx`]. Most tools
 /// (`web_fetch`, `web_search`, MCP tools) ignore it and fall through to
 /// [`Tool::execute`]. System tools (`send_message`, `get_session`) consume it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ToolCallContext {
     /// The session that produced this tool call.
     pub session_id: SessionId,
@@ -66,6 +67,15 @@ pub struct ToolCallContext {
     /// Postgres `LISTEN/NOTIFY` then routes the chunk by
     /// `prompt_requests.root_request_id` to the right thread fan-in.
     pub request_id: PromptRequestId,
+    /// Kind-specific metadata for the active claim, copied from
+    /// `prompt_requests.kind_payload`. Always present — `Normal` claims
+    /// carry the empty [`RequestKindPayload::Normal`] variant. Tools that
+    /// opt into kind-specific behaviour (the memory mutation tools close
+    /// the active contradiction during a resolution claim) pattern-match
+    /// this. Carrying the whole enum — instead of a per-variant scalar —
+    /// keeps agent_core ignorant of which variants exist; new payload
+    /// variants are added without touching the turn loop.
+    pub kind_payload: RequestKindPayload,
 }
 
 /// A side-effecting capability the model can request.
@@ -97,6 +107,15 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
         _ctx: &ToolCallContext,
     ) -> Result<String, ToolError> {
         self.execute(input).await
+    }
+
+    /// Modes (request kinds) this tool participates in. Defaults to
+    /// every mode — opt out only when a tool is genuinely meaningless
+    /// or unsafe in a given mode. The agent's per-turn chat-request
+    /// builder filters specs by `kind`, and the dispatcher refuses to
+    /// invoke a tool whose `modes()` excludes the active kind.
+    fn modes(&self) -> RequestKindModes {
+        RequestKindModes::ALL
     }
 }
 

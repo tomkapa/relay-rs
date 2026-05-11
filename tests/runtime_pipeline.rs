@@ -142,8 +142,14 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
         factory,
         AGENT_PROMPT_CACHE_CAP,
         AGENT_PROMPT_CACHE_TTL,
-        clock,
+        clock.clone(),
     ));
+    let memory_store_for_pool: relay_rs::memory::SharedMemoryStore =
+        Arc::new(relay_rs::memory::PgMemoryStore::new(
+            db.pool.clone(),
+            clock,
+            common::embedding::FakeEmbeddingProvider::shared(),
+        ));
 
     let cfg = WorkerConfig {
         workers: 2,
@@ -161,6 +167,7 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
         sessions.clone(),
         dag,
         db.pool.clone(),
+        memory_store_for_pool,
         cfg,
     )
     .spawn();
@@ -189,7 +196,7 @@ fn req(
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
         kind: relay_rs::runtime::RequestKind::Normal,
-        kind_payload: None,
+        kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }
 
@@ -206,7 +213,7 @@ fn req_root(agent_id: relay_rs::agents::AgentId, content: &str, key: &str) -> Ne
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
         kind: relay_rs::runtime::RequestKind::Normal,
-        kind_payload: None,
+        kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }
 

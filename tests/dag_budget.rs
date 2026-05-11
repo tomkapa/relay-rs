@@ -37,7 +37,7 @@ async fn seed_dag(db: &TestDb) -> PromptRequestId {
             idempotency_key: IdempotencyKey::try_from(format!("dag-seed-{}", uuid::Uuid::new_v4()))
                 .expect("key"),
             kind: relay_rs::runtime::RequestKind::Normal,
-            kind_payload: None,
+            kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
         .expect("enqueue");

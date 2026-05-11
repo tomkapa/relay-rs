@@ -110,3 +110,54 @@ pub const REFLECTION_SCHEDULER_POLL_SECS: u64 = 60;
 /// enqueues per poll. Bounded so a sudden burst of idle sessions cannot
 /// overwhelm the queue.
 pub const REFLECTION_SCHEDULER_BATCH_LIMIT: usize = 32;
+
+/// Top-K cap applied to a single `recall` tool result. Bounds the worst
+/// case bytes the model can pull into context per turn.
+pub const RECALL_MAX_RESULTS: u8 = 8;
+
+/// Default top-K for `recall` when the caller omits `limit`.
+pub const RECALL_DEFAULT_RESULTS: u8 = 4;
+
+/// Per-turn cap on how many `recall` tool calls a single turn may make.
+/// Sized so a normal turn that legitimately wants context can issue
+/// several queries without runaway looping.
+pub const MAX_RECALL_CALLS_PER_TURN: usize = 6;
+
+/// Cosine-similarity threshold above which a pair of memories is
+/// considered "the same content" for dedup.
+///
+/// Calibrated for `text-embedding-3-small`; at 0.95 a typo-difference
+/// reliably matches while two distinct beliefs do not.
+pub const DEDUP_SIMILARITY_THRESHOLD: f32 = 0.95;
+
+/// Cosine-similarity threshold above which a pair of memories is a
+/// candidate for contradiction detection (subject to a heuristic textual
+/// signal of opposition — see `librarian::contradicts`).
+pub const CONTRADICTION_SIMILARITY_THRESHOLD: f32 = 0.85;
+
+/// Hard cap on pairs returned by [`MemoryStore::similar_pairs`] per
+/// agent per sweep. Bounded because a quadratic scan over an agent at
+/// quota would otherwise return up to ~5e5 pairs.
+pub const MAX_SIMILAR_PAIRS_PER_AGENT: usize = 256;
+
+/// Age threshold beyond which a `Validated` memory decays back to `Held`.
+///
+/// (doc/memory.md §1.7) Long enough that a memory validated today still
+/// surfaces the same way next month; short enough that an agent that
+/// hasn't seen evidence of a memory in a while stops trusting it.
+pub const VALIDATION_DECAY_SECS: u64 = 60 * 60 * 24 * 30;
+
+/// Polling cadence for the librarian sweep.
+///
+/// Sized longer than the reflection cadence — librarian work is heavier
+/// (per-pair queries) and only needs to catch up overnight. Bounded so
+/// a wedged scheduler cannot hammer the database.
+pub const LIBRARIAN_POLL_SECS: u64 = 60 * 60;
+
+/// Cap on how many agents a single librarian tick processes. Bounded
+/// so a fleet of agents does not produce one gigantic transaction.
+pub const LIBRARIAN_BATCH_LIMIT: usize = 32;
+
+/// Cap on how many agent rows the operator audit endpoint returns per
+/// page. Bounds the worst-case payload size.
+pub const OPERATOR_AUDIT_PAGE_LIMIT: usize = 256;

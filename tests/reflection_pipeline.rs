@@ -40,10 +40,10 @@ async fn enqueue_reflection_row(
         content: Prompt::try_from("(reflection)").expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
         kind: RequestKind::Reflection,
-        kind_payload: Some(RequestKindPayload::Reflection {
+        kind_payload: RequestKindPayload::Reflection {
             session_id: session,
             since_turn_id: since,
-        }),
+        },
     };
     queue.enqueue(req).await.expect("enqueue").request_id()
 }
@@ -69,7 +69,7 @@ async fn claim_returns_reflection_kind_and_payload() {
         .expect("claim")
         .expect("some");
     assert_eq!(claimed.kind, RequestKind::Reflection);
-    match claimed.kind_payload.expect("payload") {
+    match claimed.kind_payload {
         RequestKindPayload::Reflection {
             session_id,
             since_turn_id,
@@ -77,9 +77,7 @@ async fn claim_returns_reflection_kind_and_payload() {
             assert_eq!(session_id, session);
             assert_eq!(since_turn_id, since);
         }
-        other @ RequestKindPayload::Resolution { .. } => {
-            panic!("unexpected payload {other:?}")
-        }
+        other => panic!("unexpected payload {other:?}"),
     }
 }
 

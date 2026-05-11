@@ -87,6 +87,20 @@ crate::str_enum! {
     }
 }
 
+impl MemoryState {
+    /// Higher = more trusted; drives the stable-layer prompt order and the
+    /// eviction priority used by `evict_overflow`.
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        match self {
+            Self::Core => 4,
+            Self::Validated => 3,
+            Self::Held => 2,
+            Self::Tentative => 1,
+        }
+    }
+}
+
 crate::str_enum! {
     /// Origin of a memory mutation. Distinguishes agent-driven writes
     /// (carried back to the producing turn) from operator-authored notes

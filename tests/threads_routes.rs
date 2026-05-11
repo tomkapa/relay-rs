@@ -79,6 +79,12 @@ impl ThreadsHarness {
                 .await
                 .expect("spawn thread stream");
 
+        let memory_store: relay_rs::memory::SharedMemoryStore =
+            Arc::new(relay_rs::memory::PgMemoryStore::new(
+                pool.clone(),
+                clock.clone(),
+                common::embedding::FakeEmbeddingProvider::shared(),
+            ));
         let state = AppState {
             queue: queue.clone(),
             leases,
@@ -86,6 +92,7 @@ impl ThreadsHarness {
             sessions,
             agents: agent_store,
             dag,
+            memory_store,
             mcp_store,
             mcp_refresh,
             thread_stream: thread_stream.clone(),
@@ -114,7 +121,7 @@ async fn enqueue_human_root(harness: &ThreadsHarness, content: &str, key: &str) 
             content: Prompt::try_from(content).expect("prompt"),
             idempotency_key: IdempotencyKey::try_from(key).expect("key"),
             kind: relay_rs::runtime::RequestKind::Normal,
-            kind_payload: None,
+            kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
         .expect("enqueue")

@@ -304,10 +304,10 @@ impl SchedulerLoop {
             content,
             idempotency_key: key,
             kind: RequestKind::Reflection,
-            kind_payload: Some(RequestKindPayload::Reflection {
+            kind_payload: RequestKindPayload::Reflection {
                 session_id: c.session_id,
                 since_turn_id: c.last_turn_id,
-            }),
+            },
         };
         let outcome = self.queue.enqueue(req).await?;
         debug!(

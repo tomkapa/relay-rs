@@ -369,7 +369,7 @@ impl PromptQueue for PgPromptQueue {
             crate::agents::AgentId,
             Option<String>,
             RequestKind,
-            Option<sqlx::types::Json<RequestKindPayload>>,
+            sqlx::types::Json<RequestKindPayload>,
         )> = sqlx::query_as(
             "UPDATE prompt_requests
              SET status = $1,
@@ -423,9 +423,9 @@ impl PromptQueue for PgPromptQueue {
         // an orphan span; the divergence shows up as multiple inbound
         // links in Honeycomb, which is the right way to surface it.
         let traceparent = drained.iter().find_map(|(_, _, _, tp, _, _)| tp.clone());
-        let kind_payload = drained
-            .iter()
-            .find_map(|(_, _, _, _, _, p)| p.as_ref().map(|j| j.0.clone()));
+        // Every drained row in a claim shares a kind (§6 above), and every
+        // row carries a payload (NOT NULL column) — pull from the first.
+        let kind_payload = drained[0].5.0.clone();
 
         let mut prompts = Vec::with_capacity(drained.len());
         for (request_id, content, _, _, _, _) in drained {
@@ -604,18 +604,15 @@ async fn insert_prompt_request(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), PromptError> {
     let traceparent = propagation::current_traceparent();
-    // §6: kind and payload must agree if a payload was supplied.
-    if let Some(payload) = req.kind_payload.as_ref() {
-        assert_eq!(
-            payload.kind(),
-            req.kind,
-            "invariant: NewPromptRequest.kind_payload variant must match kind"
-        );
-    }
-    let payload_json = req.kind_payload.as_ref().map(|p| {
-        serde_json::to_value(p)
-            .expect("invariant: RequestKindPayload serialises infallibly via serde_json")
-    });
+    // §6: kind and payload must agree — every kind has a payload variant,
+    // so this is unconditional.
+    assert_eq!(
+        req.kind_payload.kind(),
+        req.kind,
+        "invariant: NewPromptRequest.kind_payload variant must match kind"
+    );
+    let payload_json = serde_json::to_value(&req.kind_payload)
+        .expect("invariant: RequestKindPayload serialises infallibly via serde_json");
 
     sqlx::query(
         "INSERT INTO prompt_requests

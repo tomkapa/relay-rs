@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::provider::ToolSpec;
+use crate::runtime::RequestKind;
 
 use super::registry::ToolRegistry;
 use super::traits::SharedTool;
@@ -21,8 +22,23 @@ pub trait DynamicToolSource: std::fmt::Debug + Send + Sync {
     /// turn's snapshot is reference-counted, not copied.
     fn specs(&self) -> Arc<[ToolSpec]>;
 
+    /// Mode-filtered variant of [`Self::specs`]. Default implementation
+    /// returns every spec — implementations whose tools all default to
+    /// `RequestKindModes::ALL` (e.g. MCP-sourced tools) need not
+    /// override.
+    fn specs_for(&self, _kind: RequestKind) -> Arc<[ToolSpec]> {
+        self.specs()
+    }
+
     /// Look up a tool by its (prefixed) name.
     fn get(&self, name: &str) -> Option<SharedTool>;
+
+    /// Mode-filtered variant of [`Self::get`]. Default returns the same
+    /// result as [`Self::get`]; override only when the dynamic source
+    /// has per-mode opt-outs.
+    fn get_for(&self, _kind: RequestKind, name: &str) -> Option<SharedTool> {
+        self.get(name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,12 +79,40 @@ impl ToolBox {
         Arc::from(combined)
     }
 
+    /// Specs visible to `kind` — same shape as [`Self::specs`] but with
+    /// per-mode filtering applied to both halves of the toolbox.
+    #[must_use]
+    pub fn specs_for(&self, kind: RequestKind) -> Arc<[ToolSpec]> {
+        let builtins = self.builtins.specs_for(kind);
+        let dynamic = self.dynamic.specs_for(kind);
+        if dynamic.is_empty() {
+            return builtins;
+        }
+        if builtins.is_empty() {
+            return dynamic;
+        }
+        let mut combined: Vec<ToolSpec> = Vec::with_capacity(builtins.len() + dynamic.len());
+        combined.extend(builtins.iter().cloned());
+        combined.extend(dynamic.iter().cloned());
+        Arc::from(combined)
+    }
+
     #[must_use]
     pub fn get(&self, name: &str) -> Option<SharedTool> {
         if let Some(tool) = self.builtins.get(name) {
             return Some(tool);
         }
         self.dynamic.get(name)
+    }
+
+    /// Look up only if the tool's modes include `kind`. Built-ins
+    /// shadow MCP tools on a name collision (same as [`Self::get`]).
+    #[must_use]
+    pub fn get_for(&self, kind: RequestKind, name: &str) -> Option<SharedTool> {
+        if let Some(tool) = self.builtins.get_for(kind, name) {
+            return Some(tool);
+        }
+        self.dynamic.get_for(kind, name)
     }
 
     #[must_use]

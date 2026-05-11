@@ -9,6 +9,7 @@
 //! `.with(...)` line in [`system::register`].
 
 pub mod limits;
+mod modes;
 mod registry;
 pub mod system;
 mod toolbox;
@@ -16,6 +17,7 @@ mod traits;
 mod url;
 
 pub use limits::{TOOL_RESULT_MAX_BYTES, truncate_to_char_boundary};
+pub use modes::RequestKindModes;
 pub use registry::{ToolRegistry, ToolRegistryBuilder};
 pub use toolbox::{DynamicToolSource, ToolBox};
 pub use traits::{SharedTool, Tool, ToolCallContext, ToolError};

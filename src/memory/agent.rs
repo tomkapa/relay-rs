@@ -18,12 +18,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::agents::{AgentId, AgentPromptCache, SharedAgentStore};
+use crate::runtime::RequestKind;
 use crate::session::SessionId;
 use crate::types::Participant;
 
-use super::composer::{MemorySection, compose_memory_section};
-use super::session_cache::SessionMemoryCache;
-use super::store::SharedMemoryStore;
+use super::composer::MemorySection;
+use super::loader::MemorySectionLoader;
 use super::traits::{Memory, MemoryError};
 use super::types::{MemoryHandle, MemoryId};
 
@@ -35,19 +35,45 @@ pub const CORE_TAG_CLOSE: &str = "\n</core>\n";
 pub const ROLE_TAG_OPEN: &str = "<role>\n";
 pub const ROLE_TAG_CLOSE: &str = "\n</role>";
 
-/// Composite memory that assembles the system prompt from a constant
+/// The per-mode `<core>` strings the composition root configures.
+///
+/// One field per [`RequestKind`] — exhaustive by construction. Adding a
+/// new `RequestKind` variant produces a compile error here, forcing the
+/// composition root to supply a core for the new mode.
+#[derive(Debug, Clone)]
+pub struct ModeCores {
+    pub normal: Arc<str>,
+    pub reflection: Arc<str>,
+    pub resolution: Arc<str>,
+}
+
+impl ModeCores {
+    /// Pick the core string for a request kind. Exhaustive `match` so a
+    /// new variant lights up here at compile time.
+    #[must_use]
+    pub fn for_kind(&self, kind: RequestKind) -> Arc<str> {
+        match kind {
+            RequestKind::Normal => self.normal.clone(),
+            RequestKind::Reflection => self.reflection.clone(),
+            RequestKind::Resolution => self.resolution.clone(),
+        }
+    }
+}
+
+/// Composite memory that assembles the system prompt from a per-mode
 /// core, a per-agent role string fetched on demand, and a per-session
 /// composed memory section.
 ///
-/// `prompt_cache` and `session_cache` are cheap-clone handles — both
-/// caches hold their own `Arc` internally, so sharing across subsystems
-/// is just a clone.
+/// `prompt_cache` and `loader` are cheap-clone handles — both hold
+/// their own `Arc` state internally, so sharing across subsystems is
+/// just a clone. The loader is the single point that builds composed
+/// sections; the memory tool layer (`MemoryToolDeps`) takes the same
+/// loader so handle resolution and prompt rendering can never diverge.
 pub struct AgentMemory {
     agents: SharedAgentStore,
     prompt_cache: AgentPromptCache,
-    memory_store: SharedMemoryStore,
-    session_cache: SessionMemoryCache,
-    core: Arc<str>,
+    loader: MemorySectionLoader,
+    cores: ModeCores,
 }
 
 impl AgentMemory {
@@ -55,16 +81,14 @@ impl AgentMemory {
     pub fn new(
         agents: SharedAgentStore,
         prompt_cache: AgentPromptCache,
-        memory_store: SharedMemoryStore,
-        session_cache: SessionMemoryCache,
-        core: impl Into<Arc<str>>,
+        loader: MemorySectionLoader,
+        cores: ModeCores,
     ) -> Self {
         Self {
             agents,
             prompt_cache,
-            memory_store,
-            session_cache,
-            core: core.into(),
+            loader,
+            cores,
         }
     }
 
@@ -84,8 +108,7 @@ impl AgentMemory {
         agent: AgentId,
         handle: MemoryHandle,
     ) -> Result<Option<MemoryId>, MemoryError> {
-        let section = self.composed_section(session, agent).await?;
-        Ok(section.handles().resolve(handle))
+        self.loader.resolve_handle(session, agent, handle).await
     }
 
     async fn composed_section(
@@ -93,24 +116,13 @@ impl AgentMemory {
         session: SessionId,
         agent: AgentId,
     ) -> Result<Arc<MemorySection>, MemoryError> {
-        let store = self.memory_store.clone();
-        self.session_cache
-            .get_or_load(session, agent, || async move {
-                let rows = store
-                    .list(agent)
-                    .await
-                    .map_err(|e| MemoryError::Backend(e.to_string()))?;
-                Ok::<_, MemoryError>(compose_memory_section(&rows))
-            })
-            .await
+        self.loader.load(session, agent).await
     }
 }
 
 impl std::fmt::Debug for AgentMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentMemory")
-            .field("core_len", &self.core.len())
-            .finish_non_exhaustive()
+        f.debug_struct("AgentMemory").finish_non_exhaustive()
     }
 }
 
@@ -120,6 +132,7 @@ impl Memory for AgentMemory {
         &self,
         session: SessionId,
         viewer: Participant,
+        kind: RequestKind,
     ) -> Result<Arc<str>, MemoryError> {
         // Workers only run for agent receivers; a Human viewer is a wiring bug.
         let agent_id = viewer.agent_id().ok_or_else(|| {
@@ -131,7 +144,8 @@ impl Memory for AgentMemory {
             .await?;
         let memory_section = self.composed_section(session, agent_id).await?;
 
-        let core = self.core.as_ref();
+        let core_arc = self.cores.for_kind(kind);
+        let core = core_arc.as_ref();
         let role_str = role.as_str();
         let memory_str = memory_section.text();
         let separator = if memory_str.is_empty() { "" } else { "\n" };

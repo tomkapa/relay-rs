@@ -15,9 +15,11 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::agents::AgentId;
+use crate::provider::ProviderError;
 use crate::runtime::PromptRequestId;
 use crate::types::ParseError;
 
+use super::limits::CONTRADICTION_REASON_MAX_BYTES;
 use super::types::{
     MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState, MutationKind,
     MutationSourceKind,
@@ -53,6 +55,12 @@ pub enum MemoryStoreError {
     /// pattern-match on driver internals.
     #[error("memory store db error: {0}")]
     Db(#[from] sqlx::Error),
+
+    /// Embedding provider call failed during a mutation. `MemoryStore::apply`
+    /// propagates this so a missing embedding never produces a row that
+    /// retrieval cannot match (doc/memory.md §2.9 — failure handling).
+    #[error("memory store embedding provider: {0}")]
+    Provider(#[from] ProviderError),
 }
 
 /// Provenance attached to every mutation. `Turn` rides on the calling
@@ -175,9 +183,10 @@ pub struct MutationOutcome {
 
 /// Snapshot of a single row in `agent_memories`.
 ///
-/// The embedding is omitted from this projection — Phase 1 has no
-/// embedding writer, and the renderer (Phase 2) reads it through a
-/// separate query when it needs the vector.
+/// `embedding` is `None` when the row was written before the embedding
+/// provider was wired (Phase 9); `Some` once the embedding writer has
+/// populated it. Retrieval paths (Phase 2 contextual layer, Phase 3
+/// `recall`, Phase 6 librarian) skip rows whose embedding is `None`.
 #[derive(Debug, Clone)]
 pub struct MemoryRow {
     pub id: MemoryId,
@@ -204,6 +213,30 @@ pub struct MemoryEvent {
     pub content_after: Option<MemoryContent>,
     pub source: MutationSource,
     pub created_at: DateTime<Utc>,
+}
+
+/// Filter applied by [`MemoryStore::search_by_embedding`].
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilter {
+    pub kinds: Option<Vec<crate::memory::MemoryKind>>,
+    pub min_state: Option<crate::memory::MemoryState>,
+}
+
+/// One result from an embedding search — the row plus its cosine
+/// similarity score.
+#[derive(Debug, Clone)]
+pub struct ScoredMemoryRow {
+    pub row: MemoryRow,
+    /// Cosine similarity in `[-1, 1]`. Higher is closer.
+    pub similarity: f32,
+}
+
+/// A pair of memories the librarian flagged as duplicates / contradicting.
+#[derive(Debug, Clone)]
+pub struct PairCandidate {
+    pub a: MemoryRow,
+    pub b: MemoryRow,
+    pub similarity: f32,
 }
 
 /// Storage seam for the memory subsystem. Implementations must be
@@ -238,6 +271,223 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     /// is a deterministic projection of the events log; the operator
     /// revert path (Phase 8) calls this after appending an inverse event.
     async fn rebuild_materialized(&self, agent: AgentId) -> Result<(), MemoryStoreError>;
+
+    /// Top-K cosine-similarity search over `agent`'s memory embeddings.
+    /// Implementations that do not have an embedding writer wired
+    /// (`embedding` column NULL on every row) return an empty vector —
+    /// the renderer (Phase 2) and `recall` tool (Phase 3) treat the empty
+    /// result as a degraded contextual layer rather than an error.
+    async fn search_by_embedding(
+        &self,
+        agent: AgentId,
+        embedding: &[f32],
+        k: usize,
+        filter: SearchFilter,
+    ) -> Result<Vec<ScoredMemoryRow>, MemoryStoreError>;
+
+    /// Pairs of an agent's memories whose cosine similarity ≥ `threshold`,
+    /// excluding (a, a) self-pairs. Used by the librarian's dedup and
+    /// contradiction-detection sweep (Phase 6). Pairs are returned each
+    /// time only once (canonical ordering by id).
+    async fn similar_pairs(
+        &self,
+        agent: AgentId,
+        threshold: f32,
+        max_pairs: usize,
+    ) -> Result<Vec<PairCandidate>, MemoryStoreError>;
+
+    /// Apply decay rules: any non-pinned `Validated` row whose
+    /// `last_validated_at` is older than `cutoff` gets demoted to `Held`
+    /// via the journal. Returns the number of rows demoted.
+    async fn decay_validated(
+        &self,
+        agent: AgentId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, MemoryStoreError>;
+
+    /// Stamp an independent-signal validation for the memory.
+    /// Promotes the row's state per the lifecycle rules (Tentative → Held
+    /// on first validation; Held → Validated on second). The journal is
+    /// updated to reflect any state change so replay is faithful.
+    async fn record_validation(
+        &self,
+        agent: AgentId,
+        memory: MemoryId,
+        source: ValidationSource,
+        detail: Option<&str>,
+    ) -> Result<MemoryRow, MemoryStoreError>;
+
+    /// Insert a librarian-detected contradiction event for the given
+    /// pair. Returns the event id. Idempotent on `(memory_a, memory_b)`
+    /// against currently-unresolved rows — duplicate insert returns the
+    /// existing id.
+    async fn record_contradiction(
+        &self,
+        agent: AgentId,
+        a: MemoryId,
+        b: MemoryId,
+        reason: &str,
+    ) -> Result<crate::memory::ContradictionEventId, MemoryStoreError>;
+
+    /// List unresolved contradiction events for an agent, oldest first.
+    async fn unresolved_contradictions(
+        &self,
+        agent: AgentId,
+    ) -> Result<Vec<ContradictionEventRow>, MemoryStoreError>;
+
+    /// Fetch one contradiction event by id. Returns `None` if not found
+    /// or already resolved.
+    async fn read_contradiction(
+        &self,
+        id: crate::memory::ContradictionEventId,
+    ) -> Result<Option<ContradictionEventRow>, MemoryStoreError>;
+
+    /// Mark a contradiction event resolved. The variant determines whether
+    /// the close points at a journal event ([`ResolutionOutcome::Mutation`])
+    /// or carries a free-text rationale ([`ResolutionOutcome::NoAction`]).
+    /// Idempotent: the underlying `WHERE resolved_at IS NULL` guard means a
+    /// second call against an already-closed row is a no-op rather than a
+    /// clobber.
+    async fn resolve_contradiction(
+        &self,
+        id: crate::memory::ContradictionEventId,
+        outcome: ResolutionOutcome,
+    ) -> Result<(), MemoryStoreError>;
+
+    /// Force-evict the lowest-scoring non-pinned rows beyond `quota`.
+    /// Returns ids of evicted memories. Used by the librarian (Phase 6).
+    async fn evict_overflow(
+        &self,
+        agent: AgentId,
+        quota: usize,
+    ) -> Result<Vec<MemoryId>, MemoryStoreError>;
+
+    /// Append an inverse-mutation event for the given journal id and
+    /// rebuild the materialized row. Used by the operator revert path
+    /// (Phase 8). Returns the materialized row after revert (None when
+    /// the revert removed the row).
+    async fn revert_event(
+        &self,
+        agent: AgentId,
+        event: MemoryEventId,
+    ) -> Result<Option<MemoryRow>, MemoryStoreError>;
+
+    /// Toggle the pinned flag on a row. Operator-only; agent paths cannot
+    /// reach here.
+    async fn set_pinned(
+        &self,
+        agent: AgentId,
+        memory: MemoryId,
+        pinned: bool,
+    ) -> Result<MemoryRow, MemoryStoreError>;
+
+    /// Increment the access counter and bump `last_accessed_at` for the
+    /// rows whose ids match. Bounded — `ids.len()` ≤ `MAX_MEMORIES_PER_AGENT`.
+    /// Reading does NOT advance validation (doc/memory.md §1.7).
+    async fn record_access(&self, ids: &[MemoryId]) -> Result<(), MemoryStoreError>;
+}
+
+/// One row in `contradiction_events`. Three valid shapes mirror the
+/// `contradiction_events_resolved_consistent` CHECK in migration 7:
+///
+/// * pending — every resolution column is `None`.
+/// * mutation close — `resolved_at` set, `resolution_event_id` set,
+///   `resolution_reason` is `None`.
+/// * no-action close — `resolved_at` set, `resolution_event_id` is `None`,
+///   `resolution_reason` set.
+#[derive(Debug, Clone)]
+pub struct ContradictionEventRow {
+    pub id: crate::memory::ContradictionEventId,
+    pub agent_id: AgentId,
+    pub memory_a: MemoryId,
+    pub memory_b: MemoryId,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolution_event_id: Option<MemoryEventId>,
+    pub resolution_reason: Option<String>,
+}
+
+/// Free-text rationale persisted on a no-action contradiction close.
+///
+/// Smart constructor at the boundary (CLAUDE.md §1) so the column's length
+/// invariant is encoded in the type — once you hold a [`ResolutionReason`],
+/// it is known to be 1..=`CONTRADICTION_REASON_MAX_BYTES` bytes.
+#[derive(Debug, Clone)]
+pub struct ResolutionReason(String);
+
+impl ResolutionReason {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for ResolutionReason {
+    type Error = ParseError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let len = value.len();
+        if len == 0 {
+            return Err(ParseError::Empty {
+                field: "resolution_reason",
+            });
+        }
+        if len > CONTRADICTION_REASON_MAX_BYTES {
+            return Err(ParseError::TooLong {
+                field: "resolution_reason",
+                max: CONTRADICTION_REASON_MAX_BYTES,
+                got: len,
+            });
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Outcome of a resolution turn — fed to [`MemoryStore::resolve_contradiction`].
+///
+/// The two variants map to the two non-pending shapes of the
+/// `contradiction_events_resolved_consistent` CHECK constraint, so the
+/// type system makes the invalid combination (event id AND reason, or
+/// neither) unrepresentable.
+#[derive(Debug, Clone)]
+pub enum ResolutionOutcome {
+    /// A mutation tool (`memory_update` / `memory_forget`) closed the pair
+    /// inline; `event_id` points at the journal row that did it.
+    Mutation(MemoryEventId),
+    /// The resolution turn ended without mutating either memory; `reason`
+    /// is the assistant's final text (truncated to the column cap).
+    NoAction { reason: ResolutionReason },
+}
+
+/// Origin of a [`MemoryStore::record_validation`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationSource {
+    /// Cross-session re-write: the librarian found the same content
+    /// emerging in a different session.
+    CrossSessionRewrite,
+    /// External confirmation: an agent's own follow-up turn (recall +
+    /// web_search + reply) confirmed the memory.
+    ExternalConfirmation,
+    /// Operator endorsement: a `manager_note` flagged the memory as
+    /// validated.
+    OperatorEndorsement,
+}
+
+impl ValidationSource {
+    /// Wire label used in the column constraint.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CrossSessionRewrite => "cross_session_rewrite",
+            Self::ExternalConfirmation => "external_confirmation",
+            Self::OperatorEndorsement => "operator_endorsement",
+        }
+    }
 }
 
 /// Cheap-clone handle so collaborators can hold the store without a

@@ -7,7 +7,7 @@ use crate::clock::SharedClock;
 use crate::hook::{HookChain, TurnContext};
 use crate::memory::SharedMemory;
 use crate::provider::{ChatMessage, SharedProvider, UserContent};
-use crate::runtime::PromptRequestId;
+use crate::runtime::{PromptRequestId, RequestKind, RequestKindPayload};
 use crate::session::{SessionError, SessionId, SharedSessionStore};
 use crate::tools::ToolBox;
 use crate::types::{
@@ -87,7 +87,7 @@ impl Agent {
     pub(super) fn memory(&self) -> &SharedMemory {
         &self.memory
     }
-    pub(super) fn tools(&self) -> &ToolBox {
+    pub fn tools(&self) -> &ToolBox {
         &self.tools
     }
     pub(super) fn hooks(&self) -> &HookChain {
@@ -110,12 +110,20 @@ impl Agent {
     /// tool calls in between turns. Honours `cancel` at the next checkpoint.
     /// `observer` is notified at every assistant block and tool result so the
     /// SSE pipeline streams chunks as the loop progresses.
+    ///
+    /// `kind` selects the per-mode `<core>` and the tool subset the model
+    /// sees. `kind_payload` is the worker-supplied per-claim metadata
+    /// (mirroring `prompt_requests.kind_payload`); tools that opt into
+    /// kind-specific behaviour read it from [`crate::tools::ToolCallContext`].
+    /// agent_core itself is variant-agnostic — it only forwards.
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         skip_all,
         name = "agent.reply",
         fields(
             relay.session.id = %session,
             relay.viewer = %viewer,
+            relay.request.kind = kind.as_str(),
             relay.provider = self.provider.name(),
             relay.model = %self.model,
             relay.batch_size = prompts.len(),
@@ -130,22 +138,36 @@ impl Agent {
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
+        kind: RequestKind,
+        kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
         let result = self
-            .reply_inner(session, viewer, prompts, request_id, cancel, observer)
+            .reply_inner(
+                session,
+                viewer,
+                prompts,
+                request_id,
+                kind,
+                &kind_payload,
+                cancel,
+                observer,
+            )
             .await;
         record_reply(&result);
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn reply_inner(
         &self,
         session: SessionId,
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
+        kind: RequestKind,
+        kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
@@ -168,19 +190,30 @@ impl Agent {
             )
             .await?;
 
-        self.run_loop(session, viewer, counterpart, request_id, cancel, observer)
-            .await
+        self.run_loop(
+            session,
+            viewer,
+            counterpart,
+            request_id,
+            kind,
+            kind_payload,
+            cancel,
+            observer,
+        )
+        .await
     }
 
     /// Continue an existing reply from where it left off. Used by the worker's
     /// ping-pong guard between retries — the prompt was already appended on
     /// the first `reply` call.
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         skip_all,
         name = "agent.resume",
         fields(
             relay.session.id = %session,
             relay.viewer = %viewer,
+            relay.request.kind = kind.as_str(),
             relay.provider = self.provider.name(),
             relay.model = %self.model,
             relay.max_turns = self.max_turns.get(),
@@ -193,23 +226,37 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         request_id: PromptRequestId,
+        kind: RequestKind,
+        kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
         let counterpart = self.counterpart(session, viewer).await?;
         let result = self
-            .run_loop(session, viewer, counterpart, request_id, cancel, observer)
+            .run_loop(
+                session,
+                viewer,
+                counterpart,
+                request_id,
+                kind,
+                &kind_payload,
+                cancel,
+                observer,
+            )
             .await;
         record_reply(&result);
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_loop(
         &self,
         session: SessionId,
         viewer: Participant,
         counterpart: Participant,
         request_id: PromptRequestId,
+        kind: RequestKind,
+        kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
     ) -> Result<AgentReply, AgentError> {
@@ -247,6 +294,8 @@ impl Agent {
                     viewer_as_sender,
                     root_request_id,
                     request_id,
+                    kind,
+                    kind_payload,
                     &mut send_message_calls,
                     &cancel,
                     observer,

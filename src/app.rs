@@ -22,18 +22,19 @@ use crate::agents::{
     SharedAgents,
 };
 use crate::clock::{SharedClock, SystemClock};
-use crate::config::{ProviderSettings, Settings};
+use crate::config::{EmbeddingSettings, ProviderSettings, Settings};
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
 use crate::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
 use crate::memory::{
-    AgentMemory, PgMemoryStore, ReflectionScheduler, SESSION_MEMORY_CACHE_CAP,
-    SESSION_MEMORY_CACHE_TTL_SECS, SessionMemoryCache, SharedMemory, SharedMemoryStore,
+    AgentMemory, LibrarianScheduler, MemorySectionLoader, ModeCores, PgMemoryStore,
+    ReflectionScheduler, SESSION_MEMORY_CACHE_CAP, SESSION_MEMORY_CACHE_TTL_SECS,
+    SessionMemoryCache, SharedMemory, SharedMemoryStore,
 };
-use crate::provider::SharedProvider;
 use crate::provider::anthropic::AnthropicProvider;
-use crate::provider::openai::OpenAiProvider;
+use crate::provider::openai::{OpenAiEmbeddingProvider, OpenAiProvider};
+use crate::provider::{SharedEmbeddingProvider, SharedProvider};
 use crate::runtime::{
     PgDagBudget, PgPromptQueue, PgResponseHub, PgThreadStream, SharedDagBudget, SharedLeaseManager,
     SharedPromptQueue, SharedResponseSink, SharedResponseSource, SharedThreadStream, WorkerConfig,
@@ -42,7 +43,7 @@ use crate::runtime::{
 use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::system::{
     GetSessionTool, MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool,
-    SendMessageTool, WebFetchTool, WebSearchTool,
+    RecallTool, SendMessageTool, WebFetchTool, WebSearchTool,
 };
 use crate::tools::{ToolBox, ToolRegistry};
 
@@ -127,6 +128,45 @@ const CORE_SYSTEM_PROMPT: &str = "You are a thoughtful, professional teammate. \
     up the chain. When in doubt, reply to whoever asked you and let \
     them decide what to forward.";
 
+/// `<core>` block injected for `RequestKind::Reflection` turns. Reflects
+/// on the conversation since the last checkpoint and uses the memory
+/// mutation tools as needed; the LLM controls the loop and ends with
+/// plain assistant text when it has nothing more to do.
+const REFLECTION_CORE_PROMPT: &str = "You are reflecting on a recent conversation between turns. \
+    Decide what — if anything — to remember, update, or forget about \
+    yourself, the people and agents you spoke with, and the procedures \
+    you used. Each memory you write must be one or two sentences and \
+    independently meaningful when read in isolation.\n\
+    \n\
+    Use the memory mutation tools as needed; you may also `recall` to \
+    check whether a similar memory already exists before writing. When \
+    you have nothing more to do, end the turn with a brief plain-text \
+    sign-off (no tool call) and the loop will stop.\n\
+    \n\
+    Be conservative. Most conversations need zero or one new memories. \
+    If nothing in the conversation crossed the threshold of \"this is \
+    worth carrying forward across sessions\", emit no tool calls and \
+    end the turn.";
+
+/// `<core>` block injected for `RequestKind::Resolution` turns. The
+/// model receives a librarian-flagged contradiction pair and decides to
+/// update one, forget one, or close with no action. It may also use
+/// `web_search`, `web_fetch`, `recall`, or `send_message` to gather
+/// evidence (or ask a human) before deciding.
+const RESOLUTION_CORE_PROMPT: &str = "You are resolving a contradiction in your memory. Two memories \
+    were flagged as conflicting; read them carefully and decide what to do.\n\
+    \n\
+    Use `memory_update` to revise one memory or `memory_forget` to drop one \
+    when one of them is wrong. If both are correct in different contexts and \
+    neither needs mutating, end the turn with a short plain-text \
+    explanation — the system records the no-action close automatically using \
+    your final reply as the rationale. You may also use `recall`, \
+    `web_search`, `web_fetch`, or `send_message` to gather evidence or ask \
+    a human for clarification before deciding.\n\
+    \n\
+    Take your time. Investigate, then commit. End the turn with a brief \
+    plain-text sign-off (no tool call) once the contradiction is resolved.";
+
 const DEFAULT_AGENT_NAME: &str = "assistant";
 
 /// Seed body for the default agent. Owned by the DB after first insert —
@@ -145,6 +185,7 @@ pub struct Server {
     pub workers: WorkerPoolHandle,
     pub mcp_refresher: McpRefresher,
     pub reflection_scheduler: ReflectionScheduler,
+    pub librarian_scheduler: LibrarianScheduler,
     pub http_addr: SocketAddr,
 }
 
@@ -152,14 +193,11 @@ pub struct Server {
 #[derive(Debug)]
 struct Collaborators {
     provider: SharedProvider,
-    // The shared pool. Threaded into the worker pool for the reflection
-    // dispatch path (`agent.reflect` reads `session_messages` and writes
-    // `reflection_checkpoints`); concrete impls
-    // (PgSessionStore, PgPromptQueue, …) carry their own clones.
     pool: PgPool,
     sessions: SharedSessionStore,
     agents: SharedAgentStore,
     memory: SharedMemory,
+    memory_store: SharedMemoryStore,
     clock: SharedClock,
     builtin_tools: ToolRegistry,
     queue: SharedPromptQueue,
@@ -195,19 +233,39 @@ impl Collaborators {
             AGENT_PROMPT_CACHE_TTL,
             clock.clone(),
         );
-        let memory_store: SharedMemoryStore =
-            Arc::new(PgMemoryStore::new(pool.clone(), clock.clone()));
+        let embedding_provider: SharedEmbeddingProvider =
+            build_embedding_provider(&settings.embedding);
+        let memory_store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
+            pool.clone(),
+            clock.clone(),
+            embedding_provider.clone(),
+        ));
         let session_memory_cache = SessionMemoryCache::new(
             SESSION_MEMORY_CACHE_CAP,
             Duration::from_secs(SESSION_MEMORY_CACHE_TTL_SECS),
             clock.clone(),
         );
+        // One loader, two consumers — `AgentMemory` (system-prompt
+        // assembly) and `MemoryToolDeps` (handle resolution inside the
+        // mutation tools). Sharing the loader is what keeps the
+        // contextual layer consistent across the two paths that write
+        // into the same `(session, agent)` cache key.
+        let memory_loader = MemorySectionLoader::new(
+            memory_store.clone(),
+            sessions.clone(),
+            embedding_provider.clone(),
+            session_memory_cache.clone(),
+        );
+        let cores = ModeCores {
+            normal: Arc::from(CORE_SYSTEM_PROMPT),
+            reflection: Arc::from(REFLECTION_CORE_PROMPT),
+            resolution: Arc::from(RESOLUTION_CORE_PROMPT),
+        };
         let memory: SharedMemory = Arc::new(AgentMemory::new(
             agents.clone(),
             cache,
-            memory_store.clone(),
-            session_memory_cache.clone(),
-            CORE_SYSTEM_PROMPT,
+            memory_loader.clone(),
+            cores,
         ));
 
         let mcp_store: SharedMcpServerStore =
@@ -232,7 +290,14 @@ impl Collaborators {
         // root avoids a register-helper that just ferries a deps
         // struct in from this same call site. Adding a tool is one new
         // file in `tools/system/` + one `.with(...)` line here.
-        let memory_tools = MemoryToolDeps::new(memory_store.clone(), session_memory_cache.clone());
+        // The memory tool family shares one set of deps. `recall` is the
+        // only memory tool that talks to the embedding provider directly;
+        // the mutation tools embed through `MemoryStore`. `memory_update`
+        // and `memory_forget` close the active contradiction inline when
+        // the worker is dispatching a resolution turn (via
+        // `ToolCallContext::resolution_target`); the no-action close runs
+        // post-turn in the worker.
+        let memory_tools = MemoryToolDeps::new(memory_loader);
         let builtin_tools = ToolRegistry::builder()
             .with(Arc::new(WebFetchTool::new()?))
             .with(Arc::new(WebSearchTool::new(
@@ -249,7 +314,8 @@ impl Collaborators {
             .with(Arc::new(GetSessionTool::new(sessions.clone())))
             .with(Arc::new(MemoryWriteTool::new(memory_tools.clone())))
             .with(Arc::new(MemoryUpdateTool::new(memory_tools.clone())))
-            .with(Arc::new(MemoryForgetTool::new(memory_tools)))
+            .with(Arc::new(MemoryForgetTool::new(memory_tools.clone())))
+            .with(Arc::new(RecallTool::new(memory_tools, embedding_provider)))
             .build();
 
         // `memory_store` and `session_memory_cache` are not held on
@@ -263,6 +329,7 @@ impl Collaborators {
             sessions,
             agents,
             memory,
+            memory_store,
             clock,
             builtin_tools,
             queue,
@@ -342,6 +409,7 @@ pub async fn build_server(
         pieces.sessions.clone(),
         pieces.dag.clone(),
         pieces.pool.clone(),
+        pieces.memory_store.clone(),
         WorkerConfig::default(),
     );
     let workers = pool.spawn();
@@ -351,6 +419,17 @@ pub async fn build_server(
     // the actual reflection runs through the worker pool above.
     let reflection_scheduler = ReflectionScheduler::spawn(
         pieces.pool.clone(),
+        pieces.queue.clone(),
+        pieces.clock.clone(),
+        cancel.clone(),
+    );
+
+    // Librarian — runs the mechanical sweep per agent and enqueues
+    // resolution turns for unresolved contradictions (doc/memory.md
+    // §1.8, §2.6, §2.7 — Phases 6 and 7).
+    let librarian_scheduler = LibrarianScheduler::spawn(
+        pieces.pool.clone(),
+        pieces.memory_store.clone(),
         pieces.queue.clone(),
         pieces.clock.clone(),
         cancel.clone(),
@@ -372,6 +451,7 @@ pub async fn build_server(
         sessions: pieces.sessions,
         agents: pieces.agents,
         dag: pieces.dag,
+        memory_store: pieces.memory_store.clone(),
         mcp_store: pieces.mcp_store,
         mcp_refresh,
         thread_stream,
@@ -383,6 +463,7 @@ pub async fn build_server(
         workers,
         mcp_refresher,
         reflection_scheduler,
+        librarian_scheduler,
         http_addr: settings.http_addr,
     })
 }
@@ -396,6 +477,7 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
         workers,
         mcp_refresher,
         reflection_scheduler,
+        librarian_scheduler,
         http_addr,
     } = server;
     let app = router(state);
@@ -416,11 +498,22 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
     // HTTP first, then schedulers (no new enqueues), then workers.
     reflection_scheduler.shutdown().await;
     info!("reflection_scheduler.shutdown.complete");
+    librarian_scheduler.shutdown().await;
+    info!("librarian_scheduler.shutdown.complete");
     mcp_refresher.shutdown().await;
     info!("mcp.refresher.shutdown.complete");
     workers.shutdown().await;
     info!("workers.shutdown.complete");
     Ok(())
+}
+
+fn build_embedding_provider(s: &EmbeddingSettings) -> SharedEmbeddingProvider {
+    Arc::new(OpenAiEmbeddingProvider::new(
+        &s.api_key,
+        s.base_url.clone(),
+        s.model.clone(),
+        s.dimensions,
+    ))
 }
 
 fn build_provider(settings: &Settings) -> Result<SharedProvider, AppError> {

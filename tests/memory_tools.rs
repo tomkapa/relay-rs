@@ -15,8 +15,8 @@ use relay_rs::agents::{AgentPromptCache, PgAgentStore, SharedAgentStore};
 use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::memory::{
     AgentMemory, MAX_MEMORY_MUTATIONS_PER_TURN, MemoryContent, MemoryHandle, MemoryKind,
-    MemoryMutation, MemoryState, MutationSource, PgMemoryStore, SessionMemoryCache,
-    SharedMemoryStore,
+    MemoryMutation, MemorySectionLoader, MemoryState, MutationSource, PgMemoryStore,
+    SessionMemoryCache, SharedMemoryStore,
 };
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
@@ -32,6 +32,7 @@ use common::pg::{TestDb, human_to_agent_session, seed_prompt_request};
 
 struct Fixture {
     deps: MemoryToolDeps,
+    loader: MemorySectionLoader,
     store: SharedMemoryStore,
     session: relay_rs::session::SessionId,
     agent_id: relay_rs::agents::AgentId,
@@ -43,18 +44,29 @@ async fn fixture(db: &TestDb) -> Fixture {
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
-    let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(db.pool.clone(), clock.clone()));
+    let embeddings = common::embedding::FakeEmbeddingProvider::shared();
+    let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
+        db.pool.clone(),
+        clock.clone(),
+        embeddings.clone(),
+    ));
     let session_cache = SessionMemoryCache::new(8, Duration::from_secs(60), clock);
+    let loader =
+        MemorySectionLoader::new(store.clone(), sessions.clone(), embeddings, session_cache);
     let _memory = AgentMemory::new(
         agents,
         prompt_cache,
-        store.clone(),
-        session_cache.clone(),
-        "core",
+        loader.clone(),
+        relay_rs::memory::ModeCores {
+            normal: std::sync::Arc::from("core"),
+            reflection: std::sync::Arc::from("core"),
+            resolution: std::sync::Arc::from("core"),
+        },
     );
     let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
     Fixture {
-        deps: MemoryToolDeps::new(store.clone(), session_cache),
+        deps: MemoryToolDeps::new(loader.clone()),
+        loader,
         store,
         session,
         agent_id: db.default_agent_id,
@@ -67,6 +79,7 @@ fn ctx(f: &Fixture, request_id: PromptRequestId) -> ToolCallContext {
         viewer: Participant::agent(f.agent_id),
         root_request_id: request_id,
         request_id,
+        kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }
 
@@ -276,16 +289,19 @@ async fn handle_round_trips_through_session_cache() {
         .await
         .expect("seed");
 
-    // Resolve via the same session-cache the tools use; M-1 should map
-    // to the seeded memory id.
+    // Resolve via the same loader the tools use; M-1 should map to the
+    // seeded memory id.
     let agents: SharedAgentStore =
         Arc::new(PgAgentStore::new(db.pool.clone(), SystemClock::shared()));
     let memory = AgentMemory::new(
         agents,
         AgentPromptCache::new(2, Duration::from_secs(60), SystemClock::shared()),
-        store,
-        f.deps.session_cache.clone(),
-        "core",
+        f.loader.clone(),
+        relay_rs::memory::ModeCores {
+            normal: std::sync::Arc::from("core"),
+            reflection: std::sync::Arc::from("core"),
+            resolution: std::sync::Arc::from("core"),
+        },
     );
     let resolved = memory
         .resolve_handle(
@@ -296,4 +312,146 @@ async fn handle_round_trips_through_session_cache() {
         .await
         .expect("resolve");
     assert_eq!(resolved, Some(written.memory_id));
+}
+
+/// Build a ToolCallContext with a Resolution `kind_payload` attached.
+/// Mirrors what the worker forwards for `RequestKind::Resolution` claims.
+fn ctx_with_target(
+    f: &Fixture,
+    request_id: PromptRequestId,
+    target: relay_rs::memory::ContradictionEventId,
+) -> ToolCallContext {
+    ToolCallContext {
+        session_id: f.session,
+        viewer: Participant::agent(f.agent_id),
+        root_request_id: request_id,
+        request_id,
+        kind_payload: relay_rs::runtime::RequestKindPayload::Resolution {
+            contradiction_event_id: target,
+        },
+    }
+}
+
+async fn seed_pair_and_contradiction(
+    f: &Fixture,
+) -> (
+    relay_rs::memory::MemoryId,
+    relay_rs::memory::MemoryId,
+    relay_rs::memory::ContradictionEventId,
+) {
+    let a = f
+        .store
+        .apply(MemoryMutation::Write {
+            agent: f.agent_id,
+            kind: MemoryKind::Identity,
+            content: MemoryContent::try_from("ship on Friday").expect("c"),
+            state: MemoryState::Held,
+            pinned: false,
+            source: MutationSource::Operator,
+        })
+        .await
+        .expect("a");
+    let b = f
+        .store
+        .apply(MemoryMutation::Write {
+            agent: f.agent_id,
+            kind: MemoryKind::Identity,
+            content: MemoryContent::try_from("don't ship on Friday").expect("c"),
+            state: MemoryState::Held,
+            pinned: false,
+            source: MutationSource::Operator,
+        })
+        .await
+        .expect("b");
+    let id = f
+        .store
+        .record_contradiction(f.agent_id, a.memory_id, b.memory_id, "test")
+        .await
+        .expect("contradiction");
+    (a.memory_id, b.memory_id, id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_update_with_resolution_target_closes_contradiction() {
+    let db = TestDb::fresh().await;
+    let f = fixture(&db).await;
+    let (_, _, target) = seed_pair_and_contradiction(&f).await;
+
+    let update = MemoryUpdateTool::new(f.deps.clone());
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let _ = update
+        .execute_with_ctx(
+            json!({"handle": "M-1", "content": "ship on Friday after standup"}),
+            &ctx_with_target(&f, request, target),
+        )
+        .await
+        .expect("update");
+
+    let row = f
+        .store
+        .read_contradiction(target)
+        .await
+        .expect("read")
+        .expect("row");
+    assert!(row.resolved_at.is_some(), "contradiction should be closed");
+    assert!(
+        row.resolution_event_id.is_some(),
+        "mutation close points at the new event"
+    );
+    assert_eq!(row.resolution_reason, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_forget_with_resolution_target_closes_contradiction() {
+    let db = TestDb::fresh().await;
+    let f = fixture(&db).await;
+    let (_, _, target) = seed_pair_and_contradiction(&f).await;
+
+    let forget = MemoryForgetTool::new(f.deps.clone());
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let _ = forget
+        .execute_with_ctx(
+            json!({"handle": "M-1"}),
+            &ctx_with_target(&f, request, target),
+        )
+        .await
+        .expect("forget");
+
+    let row = f
+        .store
+        .read_contradiction(target)
+        .await
+        .expect("read")
+        .expect("row");
+    assert!(row.resolved_at.is_some());
+    assert!(row.resolution_event_id.is_some());
+    assert_eq!(row.resolution_reason, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_update_without_resolution_target_leaves_contradiction_open() {
+    let db = TestDb::fresh().await;
+    let f = fixture(&db).await;
+    let (_, _, target) = seed_pair_and_contradiction(&f).await;
+
+    let update = MemoryUpdateTool::new(f.deps.clone());
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let _ = update
+        .execute_with_ctx(
+            json!({"handle": "M-1", "content": "unrelated tweak"}),
+            &ctx(&f, request),
+        )
+        .await
+        .expect("update");
+
+    let row = f
+        .store
+        .read_contradiction(target)
+        .await
+        .expect("read")
+        .expect("row");
+    assert!(
+        row.resolved_at.is_none(),
+        "no resolution target -> contradiction stays pending"
+    );
 }

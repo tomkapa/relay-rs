@@ -245,17 +245,23 @@ crate::str_enum! {
     }
 }
 
-/// Kind-specific metadata persisted in `prompt_requests.kind_payload` as
-/// JSONB. The variant must match the row's [`RequestKind`]; `Normal` rows
-/// store NULL (no payload variant).
+/// Kind-specific metadata persisted in `prompt_requests.kind_payload` as JSONB.
 ///
-/// Adjacently-tagged JSON (`{"kind":"reflection","data":{...}}`) so a new
-/// variant cannot collide with an existing one — and so `serde_json::from_value`
+/// Every [`RequestKind`] has a corresponding variant — `Normal` is an
+/// empty struct today, but matching shapes 1:1 with `RequestKind` keeps
+/// the API symmetric and makes "is this a Normal claim?" a single match
+/// arm rather than `Option::is_none` plus a kind check. The empty struct
+/// (vs. unit) variant leaves room for Normal-specific fields without a
+/// wire-format break.
+///
+/// Adjacently-tagged JSON (`{"kind":"normal","data":{}}`) so a new variant
+/// cannot collide with an existing one — and so `serde_json::from_value`
 /// rejects an old-shaped payload deterministically rather than silently
 /// matching the wrong arm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum RequestKindPayload {
+    Normal {},
     Reflection {
         session_id: SessionId,
         since_turn_id: PromptRequestId,
@@ -272,6 +278,7 @@ impl RequestKindPayload {
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
         match self {
+            Self::Normal {} => RequestKind::Normal,
             Self::Reflection { .. } => RequestKind::Reflection,
             Self::Resolution { .. } => RequestKind::Resolution,
         }

@@ -2,6 +2,7 @@ use sqlx::PgPool;
 
 use crate::agents::SharedAgentStore;
 use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore};
+use crate::memory::SharedMemoryStore;
 use crate::runtime::{
     SharedDagBudget, SharedLeaseManager, SharedPromptQueue, SharedResponseSource,
     SharedThreadStream,
@@ -22,6 +23,10 @@ pub struct AppState {
     /// can `bump_or_fail` and the worker's quiescence trigger can query
     /// liveness without re-constructing the impl.
     pub dag: SharedDagBudget,
+    /// Operator-side memory access (doc/memory.md §1.9, §2.8 — Phase 8).
+    /// HTTP routes under `/agents/{id}/memory*` read and mutate through
+    /// this handle.
+    pub memory_store: SharedMemoryStore,
     pub mcp_store: SharedMcpServerStore,
     /// Send-half of the MCP refresh signal. Cheap to clone; CRUD handlers fire it
     /// after every write. The owning coordinator task lives on [`Server`].

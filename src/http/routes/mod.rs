@@ -4,6 +4,7 @@
 
 mod agents;
 mod mcp;
+mod memory;
 mod prompts;
 mod threads;
 
@@ -17,6 +18,7 @@ pub fn router(state: AppState) -> Router {
         .merge(prompts::router())
         .merge(agents::router())
         .merge(mcp::router())
+        .merge(memory::router())
         .merge(threads::router())
         .with_state(state)
         .layer(TraceLayer::new_for_http())

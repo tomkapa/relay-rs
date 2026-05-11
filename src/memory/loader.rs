@@ -1,0 +1,216 @@
+//! Shared loader for composed memory sections.
+//!
+//! Two seams need the same loader closure: [`AgentMemory`](super::agent::AgentMemory)
+//! (building the `<memory>` system-prompt block) and `MemoryToolDeps`
+//! (resolving `M-NN` handles inside mutation tools). Both write into the
+//! same [`SessionMemoryCache`] keyed on `(session, agent)`, so the cached
+//! value must be identical regardless of which path performed the load —
+//! whichever caller misses the cache first wins, and the other gets a
+//! cache hit. A divergent loader (e.g. one builds the contextual layer,
+//! the other doesn't) would silently bind the cached value to call order.
+//!
+//! [`MemorySectionLoader`] owns every handle the load path needs
+//! (`store`, `sessions`, `embeddings`, `cache`) and exposes one
+//! `load(session, agent)` method. Both seams delegate to it.
+
+use std::sync::Arc;
+
+use tracing::warn;
+
+use crate::agents::AgentId;
+use crate::provider::{
+    ChatMessage, EmbeddingProvider, SharedEmbeddingProvider, UserContent, embed_one,
+};
+use crate::session::{SessionId, SharedSessionStore};
+use crate::types::Participant;
+
+use super::composer::{MemorySection, compose_memory_section};
+use super::limits::CONTEXTUAL_TOP_K;
+use super::session_cache::SessionMemoryCache;
+use super::store::{MemoryRow, MemoryStore, SearchFilter, SharedMemoryStore};
+use super::traits::MemoryError;
+use super::types::{MemoryHandle, MemoryId, MemoryKind};
+
+/// Cheap-clone bundle of every handle the section-load path needs.
+///
+/// All four fields are `Arc`-backed; clones share the underlying state.
+#[derive(Debug, Clone)]
+pub struct MemorySectionLoader {
+    store: SharedMemoryStore,
+    sessions: SharedSessionStore,
+    embeddings: SharedEmbeddingProvider,
+    cache: SessionMemoryCache,
+}
+
+impl MemorySectionLoader {
+    #[must_use]
+    pub fn new(
+        store: SharedMemoryStore,
+        sessions: SharedSessionStore,
+        embeddings: SharedEmbeddingProvider,
+        cache: SessionMemoryCache,
+    ) -> Self {
+        Self {
+            store,
+            sessions,
+            embeddings,
+            cache,
+        }
+    }
+
+    /// Direct access to the underlying memory store. Mutation tools
+    /// (`memory_write` / `memory_update` / `memory_forget`) and `recall`
+    /// call `store.apply` / `store.search_by_embedding` directly; routing
+    /// every store call through the loader would add a level of
+    /// indirection for no benefit.
+    #[must_use]
+    pub fn store(&self) -> &SharedMemoryStore {
+        &self.store
+    }
+
+    /// Snapshot of the underlying session cache. Exposed so callers that
+    /// need to invalidate or inspect entries can do so without holding a
+    /// second handle.
+    #[must_use]
+    pub fn cache(&self) -> &SessionMemoryCache {
+        &self.cache
+    }
+
+    /// Load — or compose, on cache miss — the agent's composed memory
+    /// section for `(session, agent)`. The loader assembles both layers:
+    ///
+    /// - **Stable** — pinned + Identity rows, trimmed to byte budget
+    ///   (see [`compose_memory_section`]).
+    /// - **Contextual** — top-K Other/Procedure/Open rows ranked by
+    ///   cosine similarity against the session's opening user message
+    ///   (doc/memory.md §1.3, Phase 9).
+    ///
+    /// The contextual layer is degraded-empty on any of: missing
+    /// opening message, snapshot failure, embedding failure, search
+    /// failure. The stable layer renders regardless. Errors short-circuit
+    /// only when the store's `list` call itself fails — that's a backend
+    /// outage that the caller has to surface.
+    pub async fn load(
+        &self,
+        session: SessionId,
+        agent: AgentId,
+    ) -> Result<Arc<MemorySection>, MemoryError> {
+        let store = self.store.clone();
+        let sessions = self.sessions.clone();
+        let embeddings = self.embeddings.clone();
+        self.cache
+            .get_or_load(session, agent, || async move {
+                let rows = store
+                    .list(agent)
+                    .await
+                    .map_err(|e| MemoryError::Backend(e.to_string()))?;
+
+                let viewer = Participant::Agent { agent_id: agent };
+                let opening = match sessions.snapshot(session, viewer).await {
+                    Ok(snap) => first_user_text(&snap),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            relay.session.id = %session,
+                            relay.agent.id = %agent,
+                            "memory.contextual.snapshot.error"
+                        );
+                        None
+                    }
+                };
+
+                let contextual_rows = match opening {
+                    Some(text) if !text.is_empty() => {
+                        retrieve_contextual(&*store, &*embeddings, agent, &text).await
+                    }
+                    _ => Vec::new(),
+                };
+                let contextual_refs: Vec<&MemoryRow> = contextual_rows.iter().collect();
+
+                Ok::<_, MemoryError>(compose_memory_section(&rows, &contextual_refs))
+            })
+            .await
+    }
+
+    /// Resolve a session-scoped `M-NN` handle to its underlying memory
+    /// id. Returns `None` when the handle was never minted for this
+    /// session (a hallucinated reference, or a section whose cache entry
+    /// has been evicted and recomposed without the row).
+    pub async fn resolve_handle(
+        &self,
+        session: SessionId,
+        agent: AgentId,
+        handle: MemoryHandle,
+    ) -> Result<Option<MemoryId>, MemoryError> {
+        let section = self.load(session, agent).await?;
+        Ok(section.handles().resolve(handle))
+    }
+}
+
+/// First user-role message in `messages`, concatenated `Text` blocks
+/// joined by a newline. Returns `None` if no user message exists or it
+/// carries no text content. The agent's session always opens with a user
+/// message (the human's first prompt or another agent's `send_message`
+/// body), so the `None` branch is degraded-only — empty contextual
+/// layer.
+fn first_user_text(messages: &[ChatMessage]) -> Option<String> {
+    for m in messages {
+        let ChatMessage::User(blocks) = m else {
+            continue;
+        };
+        let mut out = String::new();
+        for b in blocks {
+            if let UserContent::Text(s) = b {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(s);
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Embed the opening text and run a top-K similarity search restricted
+/// to the contextual kinds (Other / Procedure / Open). Self + pinned
+/// rows are already handled by the stable layer, so excluding Identity
+/// avoids double-rendering.
+///
+/// Returns an empty vector on any failure — the stable layer is enough
+/// to ship a turn, and a transient embedding outage must not block the
+/// system prompt (doc/memory.md §2.9).
+async fn retrieve_contextual(
+    store: &dyn MemoryStore,
+    embeddings: &dyn EmbeddingProvider,
+    agent: AgentId,
+    text: &str,
+) -> Vec<MemoryRow> {
+    let query = match embed_one(embeddings, text).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, relay.agent.id = %agent, "memory.contextual.embed.error");
+            return Vec::new();
+        }
+    };
+    let filter = SearchFilter {
+        kinds: Some(vec![
+            MemoryKind::Other,
+            MemoryKind::Procedure,
+            MemoryKind::Open,
+        ]),
+        min_state: None,
+    };
+    match store
+        .search_by_embedding(agent, &query, CONTEXTUAL_TOP_K, filter)
+        .await
+    {
+        Ok(scored) => scored.into_iter().map(|s| s.row).collect(),
+        Err(e) => {
+            warn!(error = %e, relay.agent.id = %agent, "memory.contextual.search.error");
+            Vec::new()
+        }
+    }
+}

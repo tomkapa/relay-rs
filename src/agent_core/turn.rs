@@ -11,9 +11,9 @@ use crate::hook::{ToolContext, TurnContext};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, ToolCall, ToolCallId, ToolResult, UserContent,
 };
-use crate::runtime::PromptRequestId;
+use crate::runtime::{PromptRequestId, RequestKind, RequestKindPayload};
 use crate::session::SessionId;
-use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolCallContext, truncate_to_char_boundary};
+use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolBox, ToolCallContext, truncate_to_char_boundary};
 use crate::types::{MessageSender, Participant, TurnIndex};
 
 use super::core::{Agent, send_message_tool_name};
@@ -35,12 +35,16 @@ impl Agent {
         viewer_as_sender: MessageSender,
         root_request_id: PromptRequestId,
         request_id: PromptRequestId,
+        kind: RequestKind,
+        kind_payload: &RequestKindPayload,
         send_message_calls: &mut usize,
         cancel: &CancellationToken,
         observer: Option<&SharedTurnObserver>,
     ) -> Result<Option<String>, AgentError> {
         self.hooks().before_turn(ctx).await?.into_result()?;
-        let response = self.send_one_turn(ctx.session_id, viewer, cancel).await?;
+        let response = self
+            .send_one_turn(ctx.session_id, viewer, kind, cancel)
+            .await?;
         self.hooks()
             .after_turn(ctx, &response)
             .await?
@@ -85,6 +89,7 @@ impl Agent {
             viewer,
             root_request_id,
             request_id,
+            kind_payload: kind_payload.clone(),
         };
         // Counted regardless of tool error — the model already saw the failure
         // via the tool result; the worker's ping-pong guard cares only about
@@ -95,7 +100,15 @@ impl Agent {
             }
         }
         let results = self
-            .run_tools(ctx, &tool_calls, &tool_ctx, cancel, observer)
+            .run_tools(
+                ctx,
+                &tool_calls,
+                self.tools(),
+                kind,
+                &tool_ctx,
+                cancel,
+                observer,
+            )
             .await?;
         // Sender = `System` so the row renders to viewer-as-User without
         // claiming the human authored the result.
@@ -115,15 +128,28 @@ impl Agent {
         &self,
         session: SessionId,
         viewer: Participant,
+        kind: RequestKind,
         cancel: &CancellationToken,
     ) -> Result<ChatResponse, AgentError> {
-        let request = self.build_chat_request(session, viewer).await?;
+        let request = self.build_chat_request(session, viewer, kind).await?;
+        self.call_provider(request, self.provider_timeout(), cancel)
+            .await
+    }
 
+    /// Single LLM provider entry point. Every code path that talks to a
+    /// model — normal turn, reflection, resolution — funnels through here
+    /// so timeout, cancellation, and error mapping live in one place.
+    pub(super) async fn call_provider(
+        &self,
+        request: ChatRequest,
+        timeout_after: std::time::Duration,
+        cancel: &CancellationToken,
+    ) -> Result<ChatResponse, AgentError> {
         let send = self.provider().send(request);
         tokio::select! {
             biased;
             () = cancel.cancelled() => Err(AgentError::Cancelled),
-            r = timeout(self.provider_timeout(), send) => match r {
+            r = timeout(timeout_after, send) => match r {
                 Ok(Ok(resp)) => Ok(resp),
                 Ok(Err(e)) => Err(AgentError::Provider(e)),
                 Err(_) => Err(AgentError::ProviderTimeout),
@@ -151,6 +177,7 @@ impl Agent {
         &self,
         session: SessionId,
         viewer: Participant,
+        kind: RequestKind,
     ) -> Result<ChatRequest, AgentError> {
         let span = tracing::Span::current();
         let own = self.sessions().snapshot(session, viewer).await?;
@@ -177,25 +204,32 @@ impl Agent {
         messages.extend(parent);
         messages.extend(own);
 
-        let system = self.memory().system_prompt(session, viewer).await?;
+        let system = self.memory().system_prompt(session, viewer, kind).await?;
         span.record("relay.system_prompt.bytes", system.len());
         span.record("relay.messages.count", messages.len());
+
+        let tools = self.tools().specs_for(kind);
         Ok(ChatRequest {
             model: self.model().clone(),
             system,
             messages,
-            tools: self.tools().specs(),
+            tools,
             max_output_tokens: self.max_output_tokens(),
         })
     }
 
-    /// Execute every tool call from the assistant turn, returning a `ToolResult`
-    /// for each — never short-circuits, so the model receives a complete
-    /// picture of what happened.
-    async fn run_tools(
+    /// Execute every tool call from the assistant turn against `tools`,
+    /// returning a `ToolResult` for each — never short-circuits, so the
+    /// model receives a complete picture of what happened. The toolbox is
+    /// mode-filtered, so different turn modes (normal, reflection,
+    /// resolution) can present different closed sets to the model.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_tools(
         &self,
         ctx: TurnContext,
         calls: &[&ToolCall],
+        tools: &ToolBox,
+        kind: RequestKind,
         tool_ctx: &ToolCallContext,
         cancel: &CancellationToken,
         observer: Option<&SharedTurnObserver>,
@@ -211,7 +245,7 @@ impl Agent {
                 call,
             };
             self.hooks().before_tool(hook_ctx).await?.into_result()?;
-            let result = self.run_one_tool(call, tool_ctx, cancel).await;
+            let result = self.run_one_tool(call, tools, kind, tool_ctx, cancel).await;
             self.hooks()
                 .after_tool(hook_ctx, &result)
                 .await?
@@ -242,13 +276,22 @@ impl Agent {
     async fn run_one_tool(
         &self,
         call: &ToolCall,
+        tools: &ToolBox,
+        kind: RequestKind,
         tool_ctx: &ToolCallContext,
         cancel: &CancellationToken,
     ) -> ToolResult {
         let id = call.id.clone();
-        let Some(tool) = self.tools().get(call.name.as_str()) else {
+        let Some(tool) = tools.get_for(kind, call.name.as_str()) else {
             warn!(relay.tool = %call.name, "tool.unknown");
-            return error_result(id, format!("unknown tool: {}", call.name));
+            return error_result(
+                id,
+                format!(
+                    "unknown tool for kind={kind}: {name}",
+                    kind = kind.as_str(),
+                    name = call.name
+                ),
+            );
         };
 
         let exec = tool.execute_with_ctx(call.input.clone(), tool_ctx);

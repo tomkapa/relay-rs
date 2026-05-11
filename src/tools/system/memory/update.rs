@@ -13,7 +13,8 @@ use crate::tools::{Tool, ToolCallContext, ToolError};
 use crate::types::ToolName;
 
 use super::{
-    MemoryToolDeps, check_cap, expect_agent, parse_to_tool_err, resolve_handle, store_to_tool_err,
+    MemoryToolDeps, check_cap, expect_agent, maybe_close_resolution, parse_to_tool_err,
+    resolve_handle, store_to_tool_err,
 };
 
 const TOOL_NAME: &str = "memory_update";
@@ -118,6 +119,8 @@ impl Tool for MemoryUpdateTool {
             })
             .await
             .map_err(store_to_tool_err)?;
+
+        maybe_close_resolution(&self.deps, ctx, outcome.event_id).await?;
 
         let out = Output {
             memory_id: outcome.memory_id,

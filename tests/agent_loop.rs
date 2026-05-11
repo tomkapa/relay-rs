@@ -179,6 +179,8 @@ async fn returns_text_when_no_tool_call() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKind::Normal,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )
@@ -207,6 +209,8 @@ async fn runs_tool_then_returns_text() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKind::Normal,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )
@@ -235,6 +239,8 @@ async fn unknown_tool_does_not_loop_forever() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKind::Normal,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )
@@ -264,6 +270,8 @@ async fn cancellation_short_circuits() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKind::Normal,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             cancel,
             None,
         )
@@ -290,6 +298,8 @@ async fn provider_specs_match_registered_tools() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKind::Normal,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )

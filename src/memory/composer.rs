@@ -110,17 +110,33 @@ impl MemorySection {
     }
 }
 
-/// Compose the memory section from the agent's full row set.
+/// Compose the memory section from the agent's full row set and an
+/// optional pre-retrieved contextual layer.
 ///
 /// `rows` is the entire materialized table for the agent (capped per
 /// agent at [`super::limits::MAX_MEMORIES_PER_AGENT`]); the composer
-/// filters into the two layers. Phase 9 will add an `opener: &str`
-/// parameter for the contextual retrieval; today it is unused.
+/// filters into the stable layer. `contextual` is the top-K rows the
+/// embedding search returned, already in score order; pass `&[]` when
+/// no embedding query is available (e.g. operator audit endpoints).
+/// The composer trims contextual rows to the contextual byte budget
+/// and skips any whose id already appears in the stable layer.
 #[must_use]
-pub fn compose_memory_section(rows: &[MemoryRow]) -> MemorySection {
+pub fn compose_memory_section<'a>(
+    rows: &'a [MemoryRow],
+    contextual: &'a [&'a MemoryRow],
+) -> MemorySection {
     let stable = select_stable_layer(rows);
-    let contextual = select_contextual_layer(rows);
-    render(&stable, &contextual)
+    let stable_ids: std::collections::HashSet<crate::memory::MemoryId> =
+        stable.iter().map(|r| r.id).collect();
+    let trimmed_contextual: Vec<&MemoryRow> = trim_to_budget(
+        contextual
+            .iter()
+            .copied()
+            .filter(|r| !stable_ids.contains(&r.id))
+            .collect(),
+        super::limits::CONTEXTUAL_LAYER_MAX_BYTES,
+    );
+    render(&stable, &trimmed_contextual)
 }
 
 /// Stable layer per doc/memory.md §1.3: pinned + Self-kind, sorted by
@@ -132,29 +148,12 @@ fn select_stable_layer(rows: &[MemoryRow]) -> Vec<&MemoryRow> {
         .filter(|r| r.pinned || r.kind == MemoryKind::Identity)
         .collect();
     candidates.sort_by(|a, b| {
-        state_priority(b.state)
-            .cmp(&state_priority(a.state))
+        b.state
+            .priority()
+            .cmp(&a.state.priority())
             .then_with(|| b.created_at.cmp(&a.created_at))
     });
     trim_to_budget(candidates, STABLE_LAYER_MAX_BYTES)
-}
-
-/// Contextual layer per doc/memory.md §1.3: top-K embedding-retrieved
-/// from Other / Procedure / Open. Phase 2 stub returns empty — Phase 9
-/// adds the embedding provider and replaces this body.
-fn select_contextual_layer(_rows: &[MemoryRow]) -> Vec<&MemoryRow> {
-    Vec::new()
-}
-
-/// Per-state priority used by the stable-layer sort. Higher = more
-/// trusted, surfaces first in the rendered prompt.
-const fn state_priority(state: super::types::MemoryState) -> u8 {
-    match state {
-        super::types::MemoryState::Core => 4,
-        super::types::MemoryState::Validated => 3,
-        super::types::MemoryState::Held => 2,
-        super::types::MemoryState::Tentative => 1,
-    }
 }
 
 fn trim_to_budget(rows: Vec<&MemoryRow>, budget: usize) -> Vec<&MemoryRow> {
@@ -261,7 +260,7 @@ mod tests {
 
     #[test]
     fn empty_input_renders_empty_section() {
-        let section = compose_memory_section(&[]);
+        let section = compose_memory_section(&[], &[]);
         assert!(section.is_empty());
         assert!(section.handles().is_empty());
     }
@@ -294,7 +293,7 @@ mod tests {
                 300,
             ),
         ];
-        let section = compose_memory_section(&rows);
+        let section = compose_memory_section(&rows, &[]);
         let txt = section.text();
         assert!(txt.contains("self memory"), "Self kind included: {txt}");
         assert!(
@@ -343,7 +342,7 @@ mod tests {
                 500,
             ),
         ];
-        let section = compose_memory_section(&rows);
+        let section = compose_memory_section(&rows, &[]);
         let txt = section.text();
         let pos = |s: &str| txt.find(s).expect("present");
         // Validated > Held > Tentative; within Validated the newer one first.
@@ -362,7 +361,7 @@ mod tests {
             false,
             100,
         )];
-        let section = compose_memory_section(&rows);
+        let section = compose_memory_section(&rows, &[]);
         let id = rows[0].id;
         let handle = MemoryHandle::try_from(1u32).expect("valid");
         assert_eq!(section.handles().resolve(handle), Some(id));
@@ -379,7 +378,7 @@ mod tests {
             false,
             100,
         )];
-        let section = compose_memory_section(&rows);
+        let section = compose_memory_section(&rows, &[]);
         assert!(
             section.text().contains("- [M-1, validated] terse replies"),
             "render shape: {}",
@@ -412,7 +411,7 @@ mod tests {
                 )
             })
             .collect();
-        let section = compose_memory_section(&rows);
+        let section = compose_memory_section(&rows, &[]);
         // Must include at least one row, but fewer than all 10.
         let count = section.text().matches("- [M-").count();
         assert!(count >= 1, "at least one row kept");
@@ -442,7 +441,7 @@ mod tests {
                 200,
             ),
         ];
-        let section = compose_memory_section(&rows);
+        let section = compose_memory_section(&rows, &[]);
         let txt = section.text();
         let other = txt.find("### Other").expect("### Other present");
         let proc = txt.find("### Procedure").expect("### Procedure present");

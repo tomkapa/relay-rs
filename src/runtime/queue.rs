@@ -161,15 +161,15 @@ pub struct NewPromptRequest {
     /// [`RequestKind::Reflection`] and the librarian enqueues with
     /// [`RequestKind::Resolution`].
     pub kind: RequestKind,
-    /// Kind-specific payload — must agree with `kind`. `Normal` carries
-    /// no payload; `Reflection` and `Resolution` carry their respective
-    /// variants from [`RequestKindPayload`].
-    pub kind_payload: Option<RequestKindPayload>,
+    /// Kind-specific payload — must agree with `kind`. Every kind has its
+    /// own variant; `Normal` is an empty struct today but the symmetry
+    /// keeps the queue / worker / agent surfaces variant-agnostic.
+    pub kind_payload: RequestKindPayload,
 }
 
 impl NewPromptRequest {
-    /// Build a normal user-facing prompt with no kind payload — the
-    /// shape every HTTP-triggered enqueue takes.
+    /// Build a normal user-facing prompt — the shape every
+    /// HTTP-triggered enqueue takes.
     #[must_use]
     pub fn normal(
         session: Option<SessionId>,
@@ -187,7 +187,7 @@ impl NewPromptRequest {
             content,
             idempotency_key,
             kind: RequestKind::Normal,
-            kind_payload: None,
+            kind_payload: RequestKindPayload::Normal {},
         }
     }
 }
@@ -262,10 +262,11 @@ pub struct ClaimedSession {
     /// Drives worker dispatch (Normal → `agent.reply_batch`, Reflection
     /// → `agent.reflect`).
     pub kind: RequestKind,
-    /// Kind-specific payload from the first drained row. `Normal` rows
-    /// carry `None`; the worker pulls the metadata it needs out of the
-    /// variant for `Reflection` / `Resolution`.
-    pub kind_payload: Option<RequestKindPayload>,
+    /// Kind-specific payload from the first drained row. The worker
+    /// pattern-matches on this for kind-specific post-turn dispatch
+    /// (reflection checkpoint, no-action contradiction close); the
+    /// `Normal` arm is a no-op today.
+    pub kind_payload: RequestKindPayload,
 }
 
 impl ClaimedSession {

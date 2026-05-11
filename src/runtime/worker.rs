@@ -108,6 +108,10 @@ pub struct WorkerPool {
     /// `reflection_checkpoints`). The normal-turn path goes through the
     /// trait surfaces and never touches this.
     pool: PgPool,
+    /// Memory store handle. The resolution dispatch path uses it to close
+    /// no-action contradictions (the mutation path closes inline via the
+    /// memory tools).
+    memory_store: crate::memory::SharedMemoryStore,
     cfg: WorkerConfig,
 }
 
@@ -122,6 +126,7 @@ impl WorkerPool {
         sessions: SharedSessionStore,
         dag: SharedDagBudget,
         pool: PgPool,
+        memory_store: crate::memory::SharedMemoryStore,
         cfg: WorkerConfig,
     ) -> Self {
         Self {
@@ -132,6 +137,7 @@ impl WorkerPool {
             sessions,
             dag,
             pool,
+            memory_store,
             cfg,
         }
     }
@@ -155,6 +161,7 @@ impl WorkerPool {
                 sessions: self.sessions.clone(),
                 dag: self.dag.clone(),
                 pool: self.pool.clone(),
+                memory_store: self.memory_store.clone(),
                 cfg: cfg.clone(),
                 shutdown: shutdown.clone(),
             };
@@ -178,6 +185,7 @@ struct Worker {
     sessions: SharedSessionStore,
     dag: SharedDagBudget,
     pool: PgPool,
+    memory_store: crate::memory::SharedMemoryStore,
     cfg: WorkerConfig,
     shutdown: CancellationToken,
 }
@@ -279,17 +287,9 @@ impl Worker {
                 )
                 .await;
             }
-            RequestKind::Reflection => {
-                self.run_reflection(&agent, &claim, cancel.clone(), &receipt)
+            RequestKind::Reflection | RequestKind::Resolution => {
+                self.run_background_kind(&agent, &claim, prompts, cancel.clone(), &receipt)
                     .await;
-            }
-            RequestKind::Resolution => {
-                // Phase 7 wires the librarian-resolution dispatch. Until
-                // then, mark the row failed so an accidentally-enqueued
-                // resolution does not pin the lease.
-                let reason =
-                    FailureReason::Unrecoverable("resolution dispatch not implemented".into());
-                self.finalise(&receipt, reason).await;
             }
         }
 
@@ -303,52 +303,24 @@ impl Worker {
         }
     }
 
-    /// Reflection turn — invoked when the queue hands us a
-    /// `RequestKind::Reflection` row. No SSE, no DAG quiescence, no
-    /// ping-pong guard; success/failure is recorded on the prompt
-    /// request just like a normal turn so the scheduler can advance.
-    async fn run_reflection(
+    /// Background kind dispatch (Reflection / Resolution).
+    ///
+    /// Routes through the same `agent.reply` path as a normal turn —
+    /// differences: no observer (no SSE), no ping-pong guard (the model
+    /// is free to end without a `send_message` call), and a single
+    /// kind-specific post-turn step ([`Self::post_turn_for_kind`]) that
+    /// matches on `claim.kind_payload`. Persists every LLM call into
+    /// `session_messages` like normal turns so token-usage and
+    /// behavioural traces are captured uniformly.
+    async fn run_background_kind(
         &self,
         agent: &Agent,
         claim: &ClaimedSession,
+        prompts: Vec<Prompt>,
         cancel: CancellationToken,
         receipt: &Arc<ClaimReceipt>,
     ) {
-        // §6: the queue's payload variant must agree with the row's kind
-        // (asserted at insert time too); a missing payload here is a
-        // schema corruption signal.
-        let (session_id, since_turn_id) = match claim.kind_payload.as_ref() {
-            Some(RequestKindPayload::Reflection {
-                session_id,
-                since_turn_id,
-            }) => (*session_id, Some(*since_turn_id)),
-            other => {
-                warn!(
-                    relay.session.id = %claim.session,
-                    payload = ?other,
-                    "worker.reflect.bad_payload",
-                );
-                self.finalise(
-                    receipt,
-                    FailureReason::Unrecoverable(
-                        "reflection payload missing or wrong shape".into(),
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-        // The claim's session is the row's session — the scheduler
-        // enqueues against the same session it found turns for, so the
-        // payload's session must match.
-        if session_id != claim.session {
-            warn!(
-                relay.session.id = %claim.session,
-                relay.payload.session.id = %session_id,
-                "worker.reflect.payload_session_mismatch",
-            );
-        }
-
+        let viewer = Participant::agent(claim.receiver_agent_id);
         let request_id = claim
             .prompts
             .first()
@@ -357,65 +329,141 @@ impl Worker {
 
         let outcome = timeout(
             self.cfg.max_turn_duration,
-            agent.reflect(
-                &self.pool,
-                claim.receiver_agent_id,
+            agent.reply(
                 claim.session,
+                viewer,
+                prompts,
                 request_id,
-                since_turn_id,
+                claim.kind,
+                claim.kind_payload.clone(),
                 cancel,
+                None,
             ),
         )
         .await;
 
         match outcome {
-            Ok(Ok(reflection)) => {
-                if let Err(e) = self
-                    .write_reflection_checkpoint(
-                        claim.receiver_agent_id,
-                        claim.session,
-                        &reflection,
-                    )
-                    .await
-                {
-                    warn!(error = %e, "worker.reflect.checkpoint.error");
-                    let reason = FailureReason::Unrecoverable(format!("checkpoint: {e}"));
-                    self.finalise(receipt, reason).await;
-                    return;
-                }
+            Ok(Ok(reply)) => {
                 if let Err(e) = self.queue.mark_done(receipt).await {
-                    warn!(error = %e, "worker.reflect.mark_done.error");
+                    warn!(error = %e, "worker.background.mark_done.error");
                 }
+                self.post_turn_for_kind(claim, &reply).await;
                 info!(
                     relay.session.id = %claim.session,
                     relay.agent.id = %claim.receiver_agent_id,
-                    relay.reflection.mutations = reflection.mutations,
-                    "worker.reflect.ok",
+                    relay.request.kind = claim.kind.as_str(),
+                    relay.send_message.calls = reply.send_message_calls(),
+                    "worker.background.ok",
                 );
             }
             Ok(Err(e)) => {
-                warn!(error = %e, "worker.reflect.error");
+                warn!(error = %e, relay.request.kind = claim.kind.as_str(), "worker.background.error");
                 self.finalise(receipt, FailureReason::Provider(e.to_string()))
                     .await;
             }
             Err(_elapsed) => {
-                warn!(relay.session.id = %claim.session, "worker.reflect.timeout");
+                warn!(relay.session.id = %claim.session, relay.request.kind = claim.kind.as_str(), "worker.background.timeout");
                 self.finalise(receipt, FailureReason::Timeout).await;
             }
         }
     }
 
-    /// Upsert the `(agent, session)` row in `reflection_checkpoints`.
-    /// `reflection_event_id` is left NULL — the schema allows it
-    /// (migration 8) and Phase 5 will wire it through once the
-    /// individual mutation events are linked.
+    /// Single kind-specific post-turn dispatcher — every variant of
+    /// [`RequestKindPayload`] gets its branch here. The exhaustive match
+    /// makes "I forgot to handle the new kind" a compile error rather
+    /// than a runtime no-op. Best-effort: every branch logs and proceeds
+    /// rather than failing the request, since the turn itself already
+    /// succeeded.
+    async fn post_turn_for_kind(&self, claim: &ClaimedSession, reply: &AgentReply) {
+        match &claim.kind_payload {
+            RequestKindPayload::Normal {} => {
+                // Nothing to do post-turn for normal claims; the success
+                // path is just `mark_done` + DAG quiescence emission, both
+                // handled by `run_with_pingpong_guard`. This arm exists so
+                // the match stays exhaustive.
+            }
+            RequestKindPayload::Reflection { .. } => {
+                if let Err(e) = self
+                    .write_reflection_checkpoint(claim.receiver_agent_id, claim.session)
+                    .await
+                {
+                    warn!(error = %e, "worker.reflect.checkpoint.error");
+                }
+            }
+            RequestKindPayload::Resolution {
+                contradiction_event_id,
+            } => {
+                self.close_no_action_if_unresolved(*contradiction_event_id, reply.final_text())
+                    .await;
+            }
+        }
+    }
+
+    /// If the resolution turn ended without a mutation tool closing the
+    /// contradiction, stamp the row as a no-action close with the
+    /// assistant's final text as the rationale. Best-effort — failure to
+    /// close logs and proceeds (the librarian re-enqueues unresolved rows
+    /// on the next sweep).
+    async fn close_no_action_if_unresolved(
+        &self,
+        target: crate::memory::ContradictionEventId,
+        final_text: &str,
+    ) {
+        match self.memory_store.read_contradiction(target).await {
+            Ok(Some(row)) if row.resolved_at.is_none() => {
+                // The mutation path didn't close it — model chose no-action
+                // implicitly. Truncate the final text to fit the column cap;
+                // empty replies use a sentinel so we never violate the
+                // 1..=N length invariant.
+                let mut reason_raw = final_text.trim().to_string();
+                if reason_raw.is_empty() {
+                    reason_raw = "no-action (empty reply)".to_string();
+                }
+                if reason_raw.len() > crate::memory::CONTRADICTION_REASON_MAX_BYTES {
+                    crate::tools::truncate_to_char_boundary(
+                        &mut reason_raw,
+                        crate::memory::CONTRADICTION_REASON_MAX_BYTES,
+                    );
+                }
+                let reason = crate::memory::ResolutionReason::try_from(reason_raw)
+                    .expect("invariant: 1..=cap enforced by trim+sentinel+truncate");
+                if let Err(e) = self
+                    .memory_store
+                    .resolve_contradiction(
+                        target,
+                        crate::memory::ResolutionOutcome::NoAction { reason },
+                    )
+                    .await
+                {
+                    warn!(error = %e, relay.contradiction.id = %target, "worker.resolution.close.error");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, relay.contradiction.id = %target, "worker.resolution.read.error");
+            }
+        }
+    }
+
+    /// Advance `reflection_checkpoints` to the latest message in the
+    /// session. Called after a successful reflection turn.
     async fn write_reflection_checkpoint(
         &self,
         agent: crate::agents::AgentId,
         session: SessionId,
-        reflection: &crate::agent_core::ReflectionOutcome,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
+        let last_turn: Option<(PromptRequestId,)> = sqlx::query_as(
+            "SELECT request_id FROM session_messages
+             WHERE session_id = $1
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(session)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((last_turn_id,)) = last_turn else {
+            return Ok(());
+        };
         sqlx::query(
             "INSERT INTO reflection_checkpoints
                  (agent_id, session_id, last_turn_id, reflection_event_id, created_at)
@@ -427,7 +475,7 @@ impl Worker {
         )
         .bind(agent)
         .bind(session)
-        .bind(reflection.last_processed_turn_id)
+        .bind(last_turn_id)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -537,13 +585,30 @@ impl Worker {
         if prompts_consumed {
             timeout(
                 self.cfg.max_turn_duration,
-                agent.resume(session, viewer, request_id, cancel, Some(observer)),
+                agent.resume(
+                    session,
+                    viewer,
+                    request_id,
+                    RequestKind::Normal,
+                    RequestKindPayload::Normal {},
+                    cancel,
+                    Some(observer),
+                ),
             )
             .await
         } else {
             timeout(
                 self.cfg.max_turn_duration,
-                agent.reply(session, viewer, prompts, request_id, cancel, Some(observer)),
+                agent.reply(
+                    session,
+                    viewer,
+                    prompts,
+                    request_id,
+                    RequestKind::Normal,
+                    RequestKindPayload::Normal {},
+                    cancel,
+                    Some(observer),
+                ),
             )
             .await
         }

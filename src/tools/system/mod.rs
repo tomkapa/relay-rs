@@ -26,7 +26,7 @@ mod web_fetch;
 mod web_search;
 
 pub use get_session::GetSessionTool;
-pub use memory::{MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool};
+pub use memory::{MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool, RecallTool};
 pub use send_message::SendMessageTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;

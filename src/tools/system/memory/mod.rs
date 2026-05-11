@@ -1,17 +1,17 @@
-//! Memory mutation tools (doc/memory.md §1.5, §2.3 — Phase 3).
+//! Memory tools (doc/memory.md §1.5, §2.3).
 //!
-//! Three tools share a per-turn mutation counter so a single turn cannot
-//! exceed [`MAX_MEMORY_MUTATIONS_PER_TURN`] across them combined:
+//! The three mutation tools share a per-turn counter so a single turn
+//! cannot exceed [`MAX_MEMORY_MUTATIONS_PER_TURN`] across them combined:
 //!
 //! - [`MemoryWriteTool`] (`memory_write`) — mints a new memory at
 //!   `Tentative`.
 //! - [`MemoryUpdateTool`] (`memory_update`) — replaces content; resets
 //!   state to `Tentative`. Pinned rows reject agent edits.
 //! - [`MemoryForgetTool`] (`memory_forget`) — drops the materialized
-//!   row; the journal keeps the event so reverts (Phase 8) work.
-//!   Pinned rows reject agent forgets.
-//!
-//! `recall` is deferred to Phase 9 (needs the embedding provider).
+//!   row; the journal keeps the event so reverts work. Pinned rows
+//!   reject agent forgets.
+//! - [`RecallTool`] (`recall`) — embedding-driven retrieval against the
+//!   agent's existing memories.
 //!
 //! Each tool lives in its own file. Shared infrastructure
 //! ([`MemoryToolDeps`] + the per-turn counter + handle resolution) lives
@@ -20,24 +20,24 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tracing::warn;
-
 use crate::agents::AgentId;
 use crate::memory::{
-    MAX_MEMORY_MUTATIONS_PER_TURN, MemoryHandle, MemoryId, MemoryStoreError, SessionMemoryCache,
-    SharedMemoryStore, compose_memory_section,
+    MAX_MEMORY_MUTATIONS_PER_TURN, MemoryEventId, MemoryHandle, MemoryId, MemorySectionLoader,
+    MemoryStoreError, ResolutionOutcome, SharedMemoryStore,
 };
-use crate::runtime::PromptRequestId;
+use crate::runtime::{PromptRequestId, RequestKindPayload};
 use crate::session::SessionId;
 use crate::types::ParseError;
 
 use super::super::traits::{ToolCallContext, ToolError};
 
 mod forget;
+mod recall;
 mod update;
 mod write;
 
 pub use forget::MemoryForgetTool;
+pub use recall::RecallTool;
 pub use update::MemoryUpdateTool;
 pub use write::MemoryWriteTool;
 
@@ -56,17 +56,18 @@ pub(super) struct MutationCounter {
 
 impl MutationCounter {
     fn new() -> Self {
+        Self::with_cap(MAX_MEMORY_MUTATIONS_PER_TURN)
+    }
+
+    pub(super) fn with_cap(cap_per_turn: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
-            cap_per_turn: MAX_MEMORY_MUTATIONS_PER_TURN,
-            // Sized so a busy steady state of in-flight turns each
-            // counting toward the cap fits without churn; bulk-evicted
-            // when the map fills up.
+            cap_per_turn,
             bookkeeping_max_entries: 1024,
         }
     }
 
-    fn try_increment(&self, request_id: PromptRequestId) -> Result<usize, CapExceeded> {
+    pub(super) fn try_increment(&self, request_id: PromptRequestId) -> Result<usize, CapExceeded> {
         let mut map = self
             .inner
             .lock()
@@ -93,23 +94,27 @@ pub(super) struct CapExceeded {
     pub cap: usize,
 }
 
-/// Shared infrastructure the three tools hold a handle on — the store,
-/// the per-session handle map, and the per-turn counter.
+/// Shared infrastructure the four memory tools hold a handle on —
+/// the store, the section loader (handle resolution + composed-section
+/// load), and the per-turn mutation counter.
 #[derive(Debug, Clone)]
 pub struct MemoryToolDeps {
     pub store: SharedMemoryStore,
-    pub session_cache: SessionMemoryCache,
+    pub(super) loader: MemorySectionLoader,
     pub(super) counter: Arc<MutationCounter>,
 }
 
 impl MemoryToolDeps {
-    /// Construct from the storage seam + the session cache. The
-    /// mutation counter is private to this module.
+    /// Construct from the shared section loader. The store handle is
+    /// pulled off the loader for the mutation / recall paths that talk
+    /// to storage directly; the mutation counter is private to this
+    /// module.
     #[must_use]
-    pub fn new(store: SharedMemoryStore, session_cache: SessionMemoryCache) -> Self {
+    pub fn new(loader: MemorySectionLoader) -> Self {
+        let store = loader.store().clone();
         Self {
             store,
-            session_cache,
+            loader,
             counter: Arc::new(MutationCounter::new()),
         }
     }
@@ -143,35 +148,53 @@ pub(super) fn store_to_tool_err(e: MemoryStoreError) -> ToolError {
         | MemoryStoreError::WrongAgent { .. }
         | MemoryStoreError::PinnedImmutable { .. }
         | MemoryStoreError::Parse(_) => ToolError::InvalidInput(e.to_string()),
-        MemoryStoreError::Db(_) => ToolError::Backend(e.to_string()),
+        MemoryStoreError::Db(_) | MemoryStoreError::Provider(_) => {
+            ToolError::Backend(e.to_string())
+        }
     }
+}
+
+/// If the current turn is a librarian-flagged resolution, close the
+/// contradiction with the mutation event id as the audit record.
+pub(super) async fn maybe_close_resolution(
+    deps: &MemoryToolDeps,
+    ctx: &ToolCallContext,
+    event_id: MemoryEventId,
+) -> Result<(), ToolError> {
+    if let RequestKindPayload::Resolution {
+        contradiction_event_id,
+    } = &ctx.kind_payload
+    {
+        deps.store
+            .resolve_contradiction(
+                *contradiction_event_id,
+                ResolutionOutcome::Mutation(event_id),
+            )
+            .await
+            .map_err(store_to_tool_err)?;
+    }
+    Ok(())
 }
 
 /// Resolve a session-scoped `M-NN` handle to its underlying memory id.
 ///
-/// Composes the section through the session cache if it is not already
-/// loaded — this is the same path the renderer takes, so a session
-/// that just rolled past TTL pays one cache reload, not an error.
+/// Delegates to the shared [`MemorySectionLoader`] so the renderer and
+/// the mutation tools cannot bind divergent values into the same cache
+/// entry. On cache miss the loader composes the section in-line; a
+/// session that just rolled past TTL pays one cache reload, not an
+/// error.
 pub(super) async fn resolve_handle(
     deps: &MemoryToolDeps,
     session: SessionId,
     agent: AgentId,
     handle: MemoryHandle,
 ) -> Result<MemoryId, ToolError> {
-    let store = deps.store.clone();
-    let section = deps
-        .session_cache
-        .get_or_load(session, agent, || async move {
-            let rows = store.list(agent).await.map_err(|e| {
-                warn!(error = %e, relay.agent.id = %agent, "memory_tool.list.error");
-                e
-            })?;
-            Ok::<_, MemoryStoreError>(compose_memory_section(&rows))
-        })
+    let resolved = deps
+        .loader
+        .resolve_handle(session, agent, handle)
         .await
-        .map_err(store_to_tool_err)?;
-
-    section.handles().resolve(handle).ok_or_else(|| {
+        .map_err(|e| ToolError::Backend(e.to_string()))?;
+    resolved.ok_or_else(|| {
         ToolError::InvalidInput(format!(
             "unknown memory handle {handle}; check the `## Memory` section in your system prompt for valid handles"
         ))

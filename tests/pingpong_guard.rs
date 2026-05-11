@@ -60,7 +60,7 @@ async fn agent_text_without_send_message_parks_as_no_egress() {
             content: Prompt::try_from("hi").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k1").expect("key"),
             kind: relay_rs::runtime::RequestKind::Normal,
-            kind_payload: None,
+            kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
         .expect("enqueue")

@@ -107,6 +107,12 @@ pub async fn build_harness(provider: Arc<ScriptedProvider>) -> WorkerHarness {
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let agent_store: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
     let dag: SharedDagBudget = Arc::new(PgDagBudget::new(db.pool.clone()));
+    let memory_store: relay_rs::memory::SharedMemoryStore =
+        Arc::new(relay_rs::memory::PgMemoryStore::new(
+            db.pool.clone(),
+            clock.clone(),
+            super::embedding::FakeEmbeddingProvider::shared(),
+        ));
 
     let provider: SharedProvider = provider;
     let memory: SharedMemory = Arc::new(StaticMemory::new("test"));
@@ -154,6 +160,7 @@ pub async fn build_harness(provider: Arc<ScriptedProvider>) -> WorkerHarness {
         sessions.clone(),
         dag.clone(),
         db.pool.clone(),
+        memory_store,
         cfg,
     )
     .spawn();
