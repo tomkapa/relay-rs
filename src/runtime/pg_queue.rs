@@ -163,12 +163,15 @@ impl fmt::Debug for PgPromptQueue {
 impl PromptQueue for PgPromptQueue {
     async fn enqueue(&self, req: NewPromptRequest) -> Result<EnqueueOutcome, PromptError> {
         let now = self.now();
-        let receiver = Participant::agent(req.receiver_agent_id);
+        // Reflection / Resolution sit in `(Agent, System)` sessions so their
+        // trace doesn't pollute the parent conversation; `receiver_agent_id`
+        // still drives worker dispatch.
+        let receiver = match req.kind {
+            RequestKind::Normal => Participant::agent(req.receiver_agent_id),
+            RequestKind::Reflection | RequestKind::Resolution => Participant::System,
+        };
         // §1: parse, don't validate. Normal sessions cannot host equal
         // participants; catch the violation before we hit Postgres.
-        // Reflection / Resolution rows reuse the agent on both sides
-        // because the job is the agent's own self-curation, so the
-        // self-session check only applies to Normal kinds.
         if req.kind == RequestKind::Normal && req.sender == receiver {
             return Err(PromptError::SelfSession);
         }

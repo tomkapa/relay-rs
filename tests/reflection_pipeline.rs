@@ -29,7 +29,7 @@ async fn enqueue_reflection_row(
     queue: &SharedPromptQueue,
     session: relay_rs::session::SessionId,
     agent_id: relay_rs::agents::AgentId,
-    since: PromptRequestId,
+    up_to: PromptRequestId,
     key: &str,
 ) -> PromptRequestId {
     let req = NewPromptRequest {
@@ -42,7 +42,7 @@ async fn enqueue_reflection_row(
         kind: RequestKind::Reflection,
         kind_payload: RequestKindPayload::Reflection {
             session_id: session,
-            since_turn_id: since,
+            up_to_turn_id: up_to,
         },
     };
     queue.enqueue(req).await.expect("enqueue").request_id()
@@ -72,10 +72,10 @@ async fn claim_returns_reflection_kind_and_payload() {
     match claimed.kind_payload {
         RequestKindPayload::Reflection {
             session_id,
-            since_turn_id,
+            up_to_turn_id,
         } => {
             assert_eq!(session_id, session);
-            assert_eq!(since_turn_id, since);
+            assert_eq!(up_to_turn_id, since);
         }
         other => panic!("unexpected payload {other:?}"),
     }
@@ -180,7 +180,10 @@ async fn scheduler_tick_enqueues_for_idle_session_with_unprocessed_turns() {
     )
     .bind(session)
     .bind(request_id)
-    .bind(serde_json::json!({"text": "old message"}))
+    .bind(serde_json::json!({
+        "role": "user",
+        "contents": [{"kind": "text", "value": "old message"}]
+    }))
     .bind(db.default_agent_id)
     .bind(stale_ts)
     .execute(&db.pool)
@@ -196,19 +199,20 @@ async fn scheduler_tick_enqueues_for_idle_session_with_unprocessed_turns() {
         Duration::from_millis(100),
         None,
     );
-    // Give the scheduler a chance to tick at least once. Production
-    // cadence is `REFLECTION_SCHEDULER_POLL_SECS`; tests cannot wait
-    // that long, so we poll Postgres until a reflection row appears (or
-    // a small wall-clock timeout fires as a safety net).
+    // Poll until the reflection row appears. The link from conversation to
+    // reflection row is `kind_payload.data.session_id`, not
+    // `prompt_requests.session_id` (which points at the reflection's own
+    // off-conversation session).
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut found = None;
     while std::time::Instant::now() < deadline {
         let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             "SELECT id FROM prompt_requests
-             WHERE session_id = $1 AND kind = 'reflection'
+             WHERE kind = 'reflection'
+               AND kind_payload->'data'->>'session_id' = $1::text
              LIMIT 1",
         )
-        .bind(session)
+        .bind(session.as_uuid().to_string())
         .fetch_optional(&db.pool)
         .await
         .expect("query");
@@ -263,7 +267,10 @@ async fn scheduler_does_not_duplicate_pending_reflection() {
     )
     .bind(session)
     .bind(request_id)
-    .bind(serde_json::json!({"text": "older"}))
+    .bind(serde_json::json!({
+        "role": "user",
+        "contents": [{"kind": "text", "value": "older"}]
+    }))
     .bind(db.default_agent_id)
     .bind(Utc::now() - chrono::Duration::seconds(60 * 60))
     .execute(&db.pool)

@@ -382,9 +382,17 @@ impl Worker {
                 // handled by `run_with_pingpong_guard`. This arm exists so
                 // the match stays exhaustive.
             }
-            RequestKindPayload::Reflection { .. } => {
+            RequestKindPayload::Reflection {
+                session_id: conversation_session,
+                up_to_turn_id,
+            } => {
                 if let Err(e) = self
-                    .write_reflection_checkpoint(claim.receiver_agent_id, claim.session)
+                    .write_reflection_checkpoint(
+                        claim.receiver_agent_id,
+                        *conversation_session,
+                        *up_to_turn_id,
+                        claim.session,
+                    )
                     .await
                 {
                     warn!(error = %e, "worker.reflect.checkpoint.error");
@@ -445,37 +453,37 @@ impl Worker {
         }
     }
 
-    /// Advance `reflection_checkpoints` to the latest message in the
-    /// session. Called after a successful reflection turn.
+    /// Advance the checkpoint to `up_to_turn_id` (the slice the model saw)
+    /// and append the just-finished reflection session id to the audit
+    /// array. Using the payload cursor — not "latest now" — keeps the
+    /// advance consistent with the slice and avoids skipping messages added
+    /// between enqueue and completion.
     async fn write_reflection_checkpoint(
         &self,
         agent: crate::agents::AgentId,
-        session: SessionId,
+        conversation_session: SessionId,
+        up_to_turn_id: PromptRequestId,
+        reflection_session: SessionId,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
-        let last_turn: Option<(PromptRequestId,)> = sqlx::query_as(
-            "SELECT request_id FROM session_messages
-             WHERE session_id = $1
-             ORDER BY seq DESC LIMIT 1",
-        )
-        .bind(session)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((last_turn_id,)) = last_turn else {
-            return Ok(());
-        };
         sqlx::query(
             "INSERT INTO reflection_checkpoints
-                 (agent_id, session_id, last_turn_id, reflection_event_id, created_at)
-             VALUES ($1, $2, $3, NULL, $4)
+                 (agent_id, session_id, last_turn_id, reflection_event_id,
+                  reflection_session_ids, created_at)
+             VALUES ($1, $2, $3, NULL, ARRAY[$4]::UUID[], $5)
              ON CONFLICT (agent_id, session_id) DO UPDATE
                  SET last_turn_id = EXCLUDED.last_turn_id,
                      reflection_event_id = EXCLUDED.reflection_event_id,
+                     reflection_session_ids = array_append(
+                         reflection_checkpoints.reflection_session_ids,
+                         $4
+                     ),
                      created_at = EXCLUDED.created_at",
         )
         .bind(agent)
-        .bind(session)
-        .bind(last_turn_id)
+        .bind(conversation_session)
+        .bind(up_to_turn_id)
+        .bind(reflection_session)
         .bind(now)
         .execute(&self.pool)
         .await?;

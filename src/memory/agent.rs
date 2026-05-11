@@ -147,7 +147,7 @@ impl Memory for AgentMemory {
         let core = core_arc.as_ref();
         let role_str = role.as_str();
         let memory_str = memory_section.text();
-        let separator = if memory_str.is_empty() { "" } else { "\n" };
+        let memory_sep = if memory_str.is_empty() { "" } else { "\n" };
 
         let mut out = String::with_capacity(
             CORE_TAG_OPEN.len()
@@ -156,7 +156,7 @@ impl Memory for AgentMemory {
                 + ROLE_TAG_OPEN.len()
                 + role_str.len()
                 + ROLE_TAG_CLOSE.len()
-                + separator.len()
+                + memory_sep.len()
                 + memory_str.len(),
         );
         out.push_str(CORE_TAG_OPEN);
@@ -165,7 +165,7 @@ impl Memory for AgentMemory {
         out.push_str(ROLE_TAG_OPEN);
         out.push_str(role_str);
         out.push_str(ROLE_TAG_CLOSE);
-        out.push_str(separator);
+        out.push_str(memory_sep);
         out.push_str(memory_str);
 
         Ok(Arc::from(out))

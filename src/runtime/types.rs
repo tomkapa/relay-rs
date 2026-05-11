@@ -263,8 +263,14 @@ crate::str_enum! {
 pub enum RequestKindPayload {
     Normal {},
     Reflection {
+        /// Conversation session this reflection covers — its
+        /// `reflection_checkpoints` row is the audit anchor.
         session_id: SessionId,
-        since_turn_id: PromptRequestId,
+        /// Cursor the scheduler captured at enqueue time. The conversation
+        /// slice carried in the prompt body spans `(previous checkpoint,
+        /// up_to_turn_id]`; on success the checkpoint is stamped to this
+        /// value so the next reflection picks up strictly after it.
+        up_to_turn_id: PromptRequestId,
     },
     Resolution {
         contradiction_event_id: ContradictionEventId,
