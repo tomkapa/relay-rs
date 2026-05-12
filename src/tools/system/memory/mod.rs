@@ -194,11 +194,12 @@ pub(super) async fn resolve_handle(
     deps: &MemoryToolDeps,
     session: SessionId,
     agent: AgentId,
+    kind_payload: &RequestKindPayload,
     handle: MemoryHandle,
 ) -> Result<MemoryId, ToolError> {
     let resolved = deps
         .loader
-        .resolve_handle(session, agent, handle)
+        .resolve_handle(session, agent, kind_payload, handle)
         .await
         .map_err(|e| ToolError::Backend(e.to_string()))?;
     resolved.ok_or_else(|| {

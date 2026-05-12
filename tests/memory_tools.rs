@@ -307,6 +307,7 @@ async fn handle_round_trips_through_session_cache() {
         .resolve_handle(
             f.session,
             f.agent_id,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
             MemoryHandle::try_from(1u32).expect("h"),
         )
         .await

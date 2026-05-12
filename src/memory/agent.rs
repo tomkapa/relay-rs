@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::agents::{AgentId, AgentPromptCache, SharedAgentStore};
-use crate::runtime::RequestKind;
+use crate::runtime::{RequestKind, RequestKindPayload};
 use crate::session::SessionId;
 use crate::types::Participant;
 
@@ -105,17 +105,21 @@ impl AgentMemory {
         &self,
         session: SessionId,
         agent: AgentId,
+        kind_payload: &RequestKindPayload,
         handle: MemoryHandle,
     ) -> Result<Option<MemoryId>, MemoryError> {
-        self.loader.resolve_handle(session, agent, handle).await
+        self.loader
+            .resolve_handle(session, agent, kind_payload, handle)
+            .await
     }
 
     async fn composed_section(
         &self,
         session: SessionId,
         agent: AgentId,
+        kind_payload: &RequestKindPayload,
     ) -> Result<Arc<MemorySection>, MemoryError> {
-        self.loader.load(session, agent).await
+        self.loader.load(session, agent, kind_payload).await
     }
 }
 
@@ -131,7 +135,7 @@ impl Memory for AgentMemory {
         &self,
         session: SessionId,
         viewer: Participant,
-        kind: RequestKind,
+        kind_payload: &RequestKindPayload,
     ) -> Result<Arc<str>, MemoryError> {
         // Workers only run for agent receivers; a Human viewer is a wiring bug.
         let agent_id = viewer.agent_id().ok_or_else(|| {
@@ -141,9 +145,11 @@ impl Memory for AgentMemory {
             .prompt_cache
             .get_or_load(agent_id, &self.agents)
             .await?;
-        let memory_section = self.composed_section(session, agent_id).await?;
+        let memory_section = self
+            .composed_section(session, agent_id, kind_payload)
+            .await?;
 
-        let core_arc = self.cores.for_kind(kind);
+        let core_arc = self.cores.for_kind(kind_payload.kind());
         let core = core_arc.as_ref();
         let role_str = role.as_str();
         let memory_str = memory_section.text();

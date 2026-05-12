@@ -43,7 +43,7 @@ impl Agent {
     ) -> Result<Option<String>, AgentError> {
         self.hooks().before_turn(ctx).await?.into_result()?;
         let response = self
-            .send_one_turn(ctx.session_id, viewer, kind, cancel)
+            .send_one_turn(ctx.session_id, viewer, kind, kind_payload, cancel)
             .await?;
         self.hooks()
             .after_turn(ctx, &response)
@@ -129,9 +129,12 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         kind: RequestKind,
+        kind_payload: &RequestKindPayload,
         cancel: &CancellationToken,
     ) -> Result<ChatResponse, AgentError> {
-        let request = self.build_chat_request(session, viewer, kind).await?;
+        let request = self
+            .build_chat_request(session, viewer, kind, kind_payload)
+            .await?;
         self.call_provider(request, self.provider_timeout(), cancel)
             .await
     }
@@ -178,6 +181,7 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         kind: RequestKind,
+        kind_payload: &RequestKindPayload,
     ) -> Result<ChatRequest, AgentError> {
         let span = tracing::Span::current();
         let own = self.sessions().snapshot(session, viewer).await?;
@@ -204,7 +208,10 @@ impl Agent {
         messages.extend(parent);
         messages.extend(own);
 
-        let system = self.memory().system_prompt(session, viewer, kind).await?;
+        let system = self
+            .memory()
+            .system_prompt(session, viewer, kind_payload)
+            .await?;
         span.record("relay.system_prompt.bytes", system.len());
         span.record("relay.messages.count", messages.len());
 

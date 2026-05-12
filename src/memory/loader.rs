@@ -18,9 +18,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::agents::AgentId;
+use crate::memory::ContradictionEventId;
 use crate::provider::{
     ChatMessage, EmbeddingProvider, SharedEmbeddingProvider, UserContent, embed_one,
 };
+use crate::runtime::RequestKindPayload;
 use crate::session::{SessionId, SharedSessionStore};
 use crate::types::Participant;
 
@@ -90,20 +92,37 @@ impl MemorySectionLoader {
     /// failure. The stable layer renders regardless. Errors short-circuit
     /// only when the store's `list` call itself fails — that's a backend
     /// outage that the caller has to surface.
+    ///
+    /// `kind_payload` selects per-kind composition. For
+    /// `RequestKindPayload::Resolution { contradiction_event_id }` the
+    /// loader reserves `M-1` / `M-2` for the flagged pair (delivered to
+    /// the model via the user prompt body) and the layered selections
+    /// mint `M-3..` with the pair-side rows deduped from the rendered
+    /// text. Every other variant goes through the default composer.
     pub async fn load(
         &self,
         session: SessionId,
         agent: AgentId,
+        kind_payload: &RequestKindPayload,
     ) -> Result<Arc<MemorySection>, MemoryError> {
         let store = self.store.clone();
         let sessions = self.sessions.clone();
         let embeddings = self.embeddings.clone();
+        // Cheap variant probe — the DB lookup happens inside the closure
+        // so cache hits skip it entirely.
+        let contradiction = match kind_payload {
+            RequestKindPayload::Resolution {
+                contradiction_event_id,
+            } => Some(*contradiction_event_id),
+            _ => None,
+        };
         self.cache
             .get_or_load(session, agent, || async move {
                 let rows = store
                     .list(agent)
                     .await
                     .map_err(|e| MemoryError::Backend(e.to_string()))?;
+                let reserved = resolve_reserved_pair(&*store, contradiction).await?;
 
                 let viewer = Participant::Agent { agent_id: agent };
                 let opening = match sessions.snapshot(session, viewer).await {
@@ -127,7 +146,7 @@ impl MemorySectionLoader {
                 };
                 let contextual_refs: Vec<&MemoryRow> = contextual_rows.iter().collect();
 
-                Ok::<_, MemoryError>(compose_memory_section(&rows, &contextual_refs))
+                Ok::<_, MemoryError>(compose_memory_section(&rows, &contextual_refs, &reserved))
             })
             .await
     }
@@ -140,11 +159,32 @@ impl MemorySectionLoader {
         &self,
         session: SessionId,
         agent: AgentId,
+        kind_payload: &RequestKindPayload,
         handle: MemoryHandle,
     ) -> Result<Option<MemoryId>, MemoryError> {
-        let section = self.load(session, agent).await?;
+        let section = self.load(session, agent, kind_payload).await?;
         Ok(section.resolve_handle(handle))
     }
+}
+
+/// Read the contradiction row and return `[memory_a, memory_b]` in
+/// column order — the composer's reserved-handle binding. `None` for the
+/// id, or a row that has gone missing between detection and the
+/// resolution turn, both yield an empty vector; the composer then renders
+/// the layered section without reservations and the model degrades to a
+/// no-action close.
+async fn resolve_reserved_pair(
+    store: &dyn MemoryStore,
+    contradiction: Option<ContradictionEventId>,
+) -> Result<Vec<MemoryId>, MemoryError> {
+    let Some(id) = contradiction else {
+        return Ok(Vec::new());
+    };
+    let row = store
+        .read_contradiction(id)
+        .await
+        .map_err(|e| MemoryError::Backend(e.to_string()))?;
+    Ok(row.map_or_else(Vec::new, |r| vec![r.memory_a, r.memory_b]))
 }
 
 /// First user-role message in `messages`, concatenated `Text` blocks

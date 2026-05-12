@@ -18,6 +18,7 @@
 //! each unresolved contradiction event, enqueues a `RequestKind::Resolution`
 //! job that the worker pool dispatches to the agent's resolution path.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,8 @@ use crate::clock::SharedClock;
 use crate::runtime::{
     IdempotencyKey, NewPromptRequest, RequestKind, RequestKindPayload, SharedPromptQueue,
 };
-use crate::types::{Participant, Prompt};
+use crate::tools::truncate_from_start;
+use crate::types::{PROMPT_MAX_BYTES, Participant, Prompt};
 
 use super::limits::{
     CONTRADICTION_SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, LIBRARIAN_BATCH_LIMIT,
@@ -39,8 +41,10 @@ use super::limits::{
 };
 use super::scheduled_task::ScheduledTask;
 use super::store::{
-    MemoryMutation, MutationSource, PairCandidate, SharedMemoryStore, ValidationSource,
+    ContradictionEventRow, MemoryMutation, MemoryRow, MutationSource, PairCandidate,
+    SharedMemoryStore, ValidationSource,
 };
+use super::types::MemoryId;
 
 /// Summary of a single sweep's work — exposed for tests and observability.
 #[derive(Debug, Default, Clone)]
@@ -320,8 +324,9 @@ impl SchedulerInner {
             let key = IdempotencyKey::try_from(format!("resolve-{}", ev.id))
                 .expect("invariant: contradiction key fits cap");
             let viewer = Participant::agent(agent);
-            let content = Prompt::try_from("(resolution)")
-                .expect("invariant: resolution placeholder is valid");
+            let (row_a, row_b) =
+                tokio::try_join!(self.store.get(ev.memory_a), self.store.get(ev.memory_b))?;
+            let content = build_resolution_prompt(&ev, row_a.as_ref(), row_b.as_ref());
             let req = NewPromptRequest {
                 session: None,
                 sender: viewer,
@@ -352,6 +357,88 @@ impl SchedulerInner {
     }
 }
 
+/// Render the resolution turn's user prompt body: the two flagged
+/// memories with their provenance, plus the librarian's reason.
+///
+/// Handles are fixed by convention — `M-1` for `memory_a`, `M-2` for
+/// `memory_b` — matching the reserved-handle binding the
+/// [`MemorySectionLoader`](super::loader::MemorySectionLoader) produces
+/// for the same `contradiction_event_id`. A memory that was forgotten
+/// between detection and enqueue renders as `[no longer exists]`; the
+/// model's natural reply is then a plain-text no-action close.
+///
+/// Oversized renders trim the body from the head while preserving the
+/// fixed framing header, matching
+/// [`super::reflection_scheduler::build_reflection_prompt`]'s shape.
+fn build_resolution_prompt(
+    ev: &ContradictionEventRow,
+    a: Option<&MemoryRow>,
+    b: Option<&MemoryRow>,
+) -> Prompt {
+    const HEADER: &str = "Two of your memories were flagged as contradicting. \
+        Decide what to do.\n\n";
+    const NOTICE: &str = "[earlier content trimmed to fit prompt cap]\n";
+
+    let mut body = String::new();
+    let _ = writeln!(body, "Reason flagged: {}", ev.reason);
+    body.push('\n');
+    render_pair_entry(&mut body, "Memory A (M-1)", ev.memory_a, a);
+    body.push('\n');
+    render_pair_entry(&mut body, "Memory B (M-2)", ev.memory_b, b);
+
+    let cap = PROMPT_MAX_BYTES;
+    let out = if HEADER.len() + body.len() <= cap {
+        let mut s = String::with_capacity(HEADER.len() + body.len());
+        s.push_str(HEADER);
+        s.push_str(&body);
+        s
+    } else {
+        let max_body = cap.saturating_sub(HEADER.len() + NOTICE.len());
+        let trimmed = truncate_from_start(&body, max_body);
+        let mut s = String::with_capacity(HEADER.len() + NOTICE.len() + trimmed.len());
+        s.push_str(HEADER);
+        s.push_str(NOTICE);
+        s.push_str(trimmed);
+        s
+    };
+    Prompt::try_from(out).expect("invariant: body trimmed to Prompt cap")
+}
+
+fn render_pair_entry(buf: &mut String, label: &str, id: MemoryId, row: Option<&MemoryRow>) {
+    let _ = writeln!(buf, "{label}:");
+    let _ = writeln!(buf, "  Id: {id}");
+    let Some(r) = row else {
+        let _ = writeln!(
+            buf,
+            "  [no longer exists — likely forgotten before resolution]"
+        );
+        return;
+    };
+    let _ = writeln!(buf, "  Content: {}", r.content.as_str());
+    let _ = writeln!(
+        buf,
+        "  Kind: {kind}   State: {state}   Pinned: {pinned}",
+        kind = r.kind.as_str(),
+        state = r.state.as_str(),
+        pinned = r.pinned,
+    );
+    let _ = writeln!(buf, "  Created: {}", r.created_at.to_rfc3339());
+    let _ = writeln!(
+        buf,
+        "  Last validated: {}",
+        r.last_validated_at.to_rfc3339()
+    );
+    let _ = writeln!(buf, "  Access count: {}", r.access_count);
+    match r.source_turn_id {
+        Some(turn) => {
+            let _ = writeln!(buf, "  Source turn: {turn}");
+        }
+        None => {
+            buf.push_str("  Source turn: (operator note or librarian merge)\n");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +456,92 @@ mod tests {
         assert!(contradicts("ship on Friday", "don't ship on Friday"));
         assert!(!contradicts("ship on Friday", "ship on Friday"));
         assert!(!contradicts("never ship on Friday", "don't ship on Friday"));
+    }
+
+    use super::super::store::ContradictionEventRow;
+    use super::super::types::{MemoryContent, MemoryKind, MemoryState};
+    use chrono::TimeZone;
+
+    fn fixture_row(id: MemoryId, content: &str, kind: MemoryKind, state: MemoryState) -> MemoryRow {
+        MemoryRow {
+            id,
+            agent_id: AgentId::new(),
+            kind,
+            content: MemoryContent::try_from(content).expect("valid"),
+            state,
+            pinned: false,
+            source_turn_id: None,
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            last_validated_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            last_accessed_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            access_count: 3,
+        }
+    }
+
+    fn fixture_event(a: MemoryId, b: MemoryId, reason: &str) -> ContradictionEventRow {
+        ContradictionEventRow {
+            id: crate::memory::ContradictionEventId::new(),
+            agent_id: AgentId::new(),
+            memory_a: a,
+            memory_b: b,
+            reason: reason.into(),
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            resolved_at: None,
+            resolution_event_id: None,
+            resolution_reason: None,
+        }
+    }
+
+    #[test]
+    fn resolution_prompt_renders_both_memories_with_provenance() {
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let row_a = fixture_row(
+            a,
+            "ship on Friday",
+            MemoryKind::Procedure,
+            MemoryState::Held,
+        );
+        let row_b = fixture_row(
+            b,
+            "don't ship on Friday",
+            MemoryKind::Procedure,
+            MemoryState::Tentative,
+        );
+        let ev = fixture_event(a, b, "high similarity with opposing cues");
+
+        let prompt = build_resolution_prompt(&ev, Some(&row_a), Some(&row_b));
+        let s = prompt.as_str();
+
+        assert!(s.contains("Reason flagged: high similarity"));
+        assert!(s.contains("Memory A (M-1):"));
+        assert!(s.contains("Memory B (M-2):"));
+        assert!(s.contains("ship on Friday"));
+        assert!(s.contains("don't ship on Friday"));
+        assert!(s.contains("Kind: procedure"));
+        assert!(s.contains("State: held"));
+        assert!(s.contains("State: tentative"));
+        assert!(s.contains("Source turn: (operator note or librarian merge)"));
+    }
+
+    #[test]
+    fn resolution_prompt_degrades_when_memory_missing() {
+        // A memory forgotten between detection and the resolution turn
+        // renders a placeholder line. The model's natural reply is then
+        // a no-action close.
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let row_a = fixture_row(a, "still here", MemoryKind::Other, MemoryState::Held);
+        let ev = fixture_event(a, b, "flagged");
+
+        let prompt = build_resolution_prompt(&ev, Some(&row_a), None);
+        let s = prompt.as_str();
+        assert!(s.contains("Memory A (M-1):"));
+        assert!(s.contains("Memory B (M-2):"));
+        assert!(s.contains("still here"));
+        assert!(
+            s.contains("[no longer exists"),
+            "missing memory placeholder rendered: {s}"
+        );
     }
 }

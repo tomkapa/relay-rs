@@ -199,10 +199,10 @@ If the mechanical sweep produced unresolved contradiction events for an agent, a
 
 - The agent's role block (identity preserved — resolution speaks with the agent's voice).
 - A resolution-specific core prompt — bounded, single-job: "given memory A and memory B (which contradict), keep, update, or forget."
-- Inputs: the two memories, their provenance, no other memory state, no conversation context.
-- Output: structured tool calls (`memory_update` or `memory_forget`) or "no action — both correct in different contexts," which marks the contradiction event resolved without a write.
+- Inputs: the two memories and their provenance arrive as the resolution turn's **user prompt body** (handles `M-1` and `M-2`, fixed by `contradiction_events` column order). The agent's standard `<memory>` block continues to render the stable + contextual layers at `M-3..` so related memories can inform the decision; the pair-side rows are deduped from the layered text to avoid two renderings of the same memory. No conversation history from the parent session — the resolution session is its own (Agent, System) pair with `parent_session_id = NULL`.
+- Output: structured tool calls (`memory_update` or `memory_forget` against `M-1`/`M-2`) or "no action — both correct in different contexts," which marks the contradiction event resolved without a write. The agent may use `recall`, `web_search`, `web_fetch`, or `send_message` (to ask a human) during the turn before committing.
 
-This isolation is deliberate. The agent's job for the resolution turn is solving one contradiction. Bringing in conversation history, recent memories, or other open contradictions would add noise and dilute the focus.
+This isolation is deliberate. The agent's job for the resolution turn is solving one contradiction; pulling in conversation history or other open contradictions would dilute the focus. Memory state is retained — surfacing related memories is more often help than noise, and the pair is the highlighted subject via the user prompt body.
 
 ### 1.9 Operator authority
 

@@ -148,19 +148,26 @@ const REFLECTION_CORE_PROMPT: &str = "You are reflecting on a recent conversatio
     worth carrying forward across sessions\", emit no tool calls and \
     end the turn.";
 
-/// `<core>` block injected for `RequestKind::Resolution` turns. The
-/// model receives a librarian-flagged contradiction pair and decides to
-/// update one, forget one, or close with no action. It may also use
-/// `web_search`, `web_fetch`, `recall`, or `send_message` to gather
-/// evidence (or ask a human) before deciding.
-const RESOLUTION_CORE_PROMPT: &str = "You are resolving a contradiction in your memory. Two memories \
-    were flagged as conflicting; read them carefully and decide what to do.\n\
+/// `<core>` block injected for `RequestKind::Resolution` turns.
+///
+/// The two flagged memories arrive in the user prompt body as `M-1`
+/// (memory A) and `M-2` (memory B), with their provenance. The agent's
+/// standard `<memory>` block still renders the stable + contextual
+/// layers at `M-3..` so related memories can inform the decision. The
+/// model decides to update one, forget one, or close with no action,
+/// and may use `web_search`, `web_fetch`, `recall`, or `send_message`
+/// to gather evidence before committing.
+const RESOLUTION_CORE_PROMPT: &str = "You are resolving a contradiction in your memory. The two \
+    flagged memories arrive in the incoming user message as M-1 and M-2 with \
+    their provenance (kind, state, pinned, created/validated timestamps, \
+    source turn). Your `<memory>` block below lists other related memories \
+    at M-3 and beyond that may help you judge the conflict.\n\
     \n\
-    Use `memory_update` to revise one memory or `memory_forget` to drop one \
-    when one of them is wrong. If both are correct in different contexts and \
-    neither needs mutating, end the turn with a short plain-text \
-    explanation — the system records the no-action close automatically using \
-    your final reply as the rationale. You may also use `recall`, \
+    Use `memory_update` on M-1 or M-2 to revise the one that is wrong, or \
+    `memory_forget` to drop it. If both are correct in different contexts \
+    and neither needs mutating, end the turn with a short plain-text \
+    explanation — the system records the no-action close automatically \
+    using your final reply as the rationale. You may also use `recall`, \
     `web_search`, `web_fetch`, or `send_message` to gather evidence or ask \
     a human for clarification before deciding.\n\
     \n\

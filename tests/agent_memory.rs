@@ -74,7 +74,11 @@ async fn assembles_core_then_role_in_order() {
     let viewer = Participant::agent(db.default_agent_id);
     let prompt = f
         .memory
-        .system_prompt(session, viewer, relay_rs::runtime::RequestKind::Normal)
+        .system_prompt(
+            session,
+            viewer,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
+        )
         .await
         .expect("system prompt");
 
@@ -106,7 +110,7 @@ async fn empty_memory_skips_memory_section() {
         .system_prompt(
             session,
             Participant::agent(db.default_agent_id),
-            relay_rs::runtime::RequestKind::Normal,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
         )
         .await
         .expect("system prompt");
@@ -142,7 +146,7 @@ async fn renders_memory_section_after_role() {
         .system_prompt(
             session,
             Participant::agent(agent_id),
-            relay_rs::runtime::RequestKind::Normal,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
         )
         .await
         .expect("system prompt");
@@ -176,7 +180,11 @@ async fn frozen_during_session_returns_identical_prompt() {
 
     let first = f
         .memory
-        .system_prompt(session, viewer, relay_rs::runtime::RequestKind::Normal)
+        .system_prompt(
+            session,
+            viewer,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
+        )
         .await
         .expect("first");
 
@@ -194,7 +202,11 @@ async fn frozen_during_session_returns_identical_prompt() {
 
     let second = f
         .memory
-        .system_prompt(session, viewer, relay_rs::runtime::RequestKind::Normal)
+        .system_prompt(
+            session,
+            viewer,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
+        )
         .await
         .expect("second");
 
@@ -236,7 +248,7 @@ async fn resolve_handle_round_trips_to_memory_id() {
         .system_prompt(
             session,
             Participant::agent(agent_id),
-            relay_rs::runtime::RequestKind::Normal,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
         )
         .await
         .expect("compose");
@@ -244,7 +256,12 @@ async fn resolve_handle_round_trips_to_memory_id() {
     let handle = MemoryHandle::try_from(1u32).expect("valid");
     let resolved = f
         .memory
-        .resolve_handle(session, agent_id, handle)
+        .resolve_handle(
+            session,
+            agent_id,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
+            handle,
+        )
         .await
         .expect("resolve");
     assert_eq!(resolved, Some(outcome.memory_id));
@@ -252,7 +269,12 @@ async fn resolve_handle_round_trips_to_memory_id() {
     let stranger = MemoryHandle::try_from(999u32).expect("valid");
     let missing = f
         .memory
-        .resolve_handle(session, agent_id, stranger)
+        .resolve_handle(
+            session,
+            agent_id,
+            &relay_rs::runtime::RequestKindPayload::Normal {},
+            stranger,
+        )
         .await
         .expect("resolve missing");
     assert_eq!(missing, None);
