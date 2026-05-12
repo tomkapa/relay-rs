@@ -18,6 +18,16 @@ pub const MEMORY_CONTENT_MAX_BYTES: usize = 4096;
 /// in human-readable form without bloating the table.
 pub const CONTRADICTION_REASON_MAX_BYTES: usize = 1024;
 
+/// Maximum bytes of the free-text `evidence` accompanying a validation
+/// event (`validation_events.detail`).
+///
+/// Sized to match the column's `octet_length(detail) BETWEEN 1 AND 1024`
+/// CHECK in migration 9. The agent supplies a short citation
+/// (web-search snippet, peer-agent quote, human reply) when validating;
+/// the operator audit reads this verbatim when assessing whether the
+/// validation was real fact-checking or rubber-stamping.
+pub const VALIDATION_EVIDENCE_MAX_BYTES: usize = 1024;
+
 /// Hard cap on the number of materialized memory rows held per agent.
 ///
 /// Keeps the renderer's stable + contextual layer bounded and gives the

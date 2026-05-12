@@ -31,6 +31,12 @@ crate::uuid_newtype! {
     pub ContradictionEventId
 }
 
+crate::uuid_newtype! {
+    /// Opaque identifier for a row in `validation_events`. The validation
+    /// log is append-only; ids surface only in the operator audit view.
+    pub ValidationEventId
+}
+
 crate::str_enum! {
     /// What the memory is about (doc/memory.md §1.2). The label list below
     /// is the single source of truth — the column `CHECK` constraint, the

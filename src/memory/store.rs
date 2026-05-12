@@ -22,7 +22,7 @@ use crate::provider::ProviderError;
 use crate::runtime::PromptRequestId;
 use crate::types::ParseError;
 
-use super::limits::CONTRADICTION_REASON_MAX_BYTES;
+use super::limits::{CONTRADICTION_REASON_MAX_BYTES, VALIDATION_EVIDENCE_MAX_BYTES};
 use super::types::{
     MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState, MutationKind,
     MutationSourceKind,
@@ -356,12 +356,14 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     /// Stamp an independent-signal validation for the memory. Promotes the
     /// row's state per the lifecycle rules (Tentative → Held on first
     /// validation; Held → Validated on second). The journal is updated to
-    /// reflect any state change so replay is faithful.
+    /// reflect any state change so replay is faithful. Only the operator
+    /// origin bypasses pin protection; agent and librarian origins against
+    /// a pinned row return [`MemoryStoreError::PinnedImmutable`].
     async fn record_validation(
         &self,
         agent: AgentId,
         memory: MemoryId,
-        source: ValidationSource,
+        origin: ValidationOrigin,
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError>;
 
@@ -499,7 +501,50 @@ pub enum ResolutionOutcome {
     NoAction { reason: ResolutionReason },
 }
 
-/// Origin of a [`MemoryStore::record_validation`] call.
+/// Free-text evidence persisted on the `validation_events.detail` column.
+/// Smart constructor at the boundary so the column's
+/// 1..=`VALIDATION_EVIDENCE_MAX_BYTES` length invariant is encoded in the
+/// type.
+#[derive(Debug, Clone)]
+pub struct MemoryEvidence(String);
+
+impl MemoryEvidence {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for MemoryEvidence {
+    type Error = ParseError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let len = value.len();
+        if len == 0 {
+            return Err(ParseError::Empty {
+                field: "memory_evidence",
+            });
+        }
+        if len > VALIDATION_EVIDENCE_MAX_BYTES {
+            return Err(ParseError::TooLong {
+                field: "memory_evidence",
+                max: VALIDATION_EVIDENCE_MAX_BYTES,
+                got: len,
+            });
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Wire label persisted on `validation_events.source`.
+///
+/// Internal to the store; callers reach `record_validation` through
+/// [`ValidationOrigin`], which encodes the audit/journal pairing as a
+/// single invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationSource {
     /// Cross-session re-write: the librarian found the same content emerging
@@ -520,6 +565,43 @@ impl ValidationSource {
             Self::CrossSessionRewrite => "cross_session_rewrite",
             Self::ExternalConfirmation => "external_confirmation",
             Self::OperatorEndorsement => "operator_endorsement",
+        }
+    }
+}
+
+/// Origin of a [`MemoryStore::record_validation`] call.
+///
+/// Pairs the audit signal ([`ValidationSource`]) with the journal Update
+/// event's provenance ([`MutationSource`]) so a caller cannot accidentally
+/// emit an invalid combination — e.g. `OperatorEndorsement` attributed to
+/// a `Turn(_)`. The store derives both labels from this single enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationOrigin {
+    /// Agent-driven external confirmation during a turn (web_search,
+    /// web_fetch, peer reply, human-via-send_message).
+    Agent(PromptRequestId),
+    /// Operator endorsement via `manager_note`. Bypasses pin protection.
+    Operator,
+    /// Mechanical cross-session-rewrite signal from the librarian.
+    Librarian,
+}
+
+impl ValidationOrigin {
+    #[must_use]
+    pub const fn source(self) -> ValidationSource {
+        match self {
+            Self::Agent(_) => ValidationSource::ExternalConfirmation,
+            Self::Operator => ValidationSource::OperatorEndorsement,
+            Self::Librarian => ValidationSource::CrossSessionRewrite,
+        }
+    }
+
+    #[must_use]
+    pub const fn mutation_source(self) -> MutationSource {
+        match self {
+            Self::Agent(id) => MutationSource::Turn(id),
+            Self::Operator => MutationSource::Operator,
+            Self::Librarian => MutationSource::Librarian,
         }
     }
 }

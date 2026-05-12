@@ -412,7 +412,7 @@ async fn prompt_requests_kind_defaults_to_normal() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn record_validation_promotes_state() {
-    use relay_rs::memory::ValidationSource;
+    use relay_rs::memory::ValidationOrigin;
 
     let db = TestDb::fresh().await;
     let s = store(&db);
@@ -434,7 +434,7 @@ async fn record_validation_promotes_state() {
         .record_validation(
             db.default_agent_id,
             outcome.memory_id,
-            ValidationSource::CrossSessionRewrite,
+            ValidationOrigin::Librarian,
             Some("librarian dedup match"),
         )
         .await
@@ -446,7 +446,7 @@ async fn record_validation_promotes_state() {
         .record_validation(
             db.default_agent_id,
             outcome.memory_id,
-            ValidationSource::OperatorEndorsement,
+            ValidationOrigin::Operator,
             None,
         )
         .await

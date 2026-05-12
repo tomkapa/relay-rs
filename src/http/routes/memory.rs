@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::agents::AgentId;
 use crate::memory::{
     MemoryContent, MemoryEventId, MemoryEventPayload, MemoryId, MemoryKind, MemoryMutation,
-    MemoryRow, MemoryState, MutationKind, MutationSource, MutationSourceKind, ValidationSource,
+    MemoryRow, MemoryState, MutationKind, MutationSource, MutationSourceKind, ValidationOrigin,
 };
 
 use super::super::error::HttpError;
@@ -126,7 +126,7 @@ async fn create_memory_note(
             .record_validation(
                 agent,
                 outcome.memory_id,
-                ValidationSource::OperatorEndorsement,
+                ValidationOrigin::Operator,
                 Some("operator note"),
             )
             .await

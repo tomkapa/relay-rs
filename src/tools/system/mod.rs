@@ -8,8 +8,9 @@
 //!   (cross-session read scoped to the caller's DAG). Both consume
 //!   [`super::ToolCallContext`] via `execute_with_ctx`.
 //! * **Memory** — [`MemoryWriteTool`], [`MemoryUpdateTool`],
-//!   [`MemoryForgetTool`], [`RecallTool`]. The three mutation tools share
-//!   a per-turn cap via [`MemoryToolDeps`]; `recall` carries its own.
+//!   [`MemoryForgetTool`], [`MemoryValidateTool`], [`RecallTool`]. The
+//!   four journal-writing tools share a per-turn cap via
+//!   [`MemoryToolDeps`]; `recall` carries its own.
 //! * **Built-in capabilities** — [`WebFetchTool`] and [`WebSearchTool`].
 //!
 //! Registration lives in the composition root (`src/app.rs`) — there is
@@ -24,7 +25,10 @@ mod web_fetch;
 mod web_search;
 
 pub use get_session::GetSessionTool;
-pub use memory::{MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool, RecallTool};
+pub use memory::{
+    MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool,
+    RecallTool,
+};
 pub use send_message::SendMessageTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;

@@ -44,9 +44,10 @@ pub use session_cache::SessionMemoryCache;
 // --- storage --------------------------------------------------------------
 pub use pg_store::PgMemoryStore;
 pub use store::{
-    ContradictionEventRow, MemoryEvent, MemoryEventPayload, MemoryMutation, MemoryRow, MemoryStore,
-    MemoryStoreError, MutationOutcome, MutationSource, PairCandidate, ResolutionOutcome,
-    ResolutionReason, ScoredMemoryRow, SearchFilter, SharedMemoryStore, ValidationSource,
+    ContradictionEventRow, MemoryEvent, MemoryEventPayload, MemoryEvidence, MemoryMutation,
+    MemoryRow, MemoryStore, MemoryStoreError, MutationOutcome, MutationSource, PairCandidate,
+    ResolutionOutcome, ResolutionReason, ScoredMemoryRow, SearchFilter, SharedMemoryStore,
+    ValidationOrigin, ValidationSource,
 };
 
 // --- background work -----------------------------------------------------
@@ -56,7 +57,7 @@ pub use reflection_scheduler::ReflectionScheduler;
 // --- newtypes / value types ----------------------------------------------
 pub use types::{
     ContradictionEventId, MemoryContent, MemoryEventId, MemoryHandle, MemoryId, MemoryKind,
-    MemoryState, MutationKind, MutationSourceKind, RecallLimit,
+    MemoryState, MutationKind, MutationSourceKind, RecallLimit, ValidationEventId,
 };
 
 // --- caps / tunables ------------------------------------------------------
@@ -69,4 +70,5 @@ pub use limits::{
     RECALL_DEFAULT_RESULTS, RECALL_MAX_RESULTS, REFLECTION_IDLE_TIMEOUT_SECS,
     REFLECTION_SCHEDULER_BATCH_LIMIT, REFLECTION_SCHEDULER_POLL_SECS, SESSION_MEMORY_CACHE_CAP,
     SESSION_MEMORY_CACHE_TTL_SECS, STABLE_LAYER_MAX_BYTES, VALIDATION_DECAY,
+    VALIDATION_EVIDENCE_MAX_BYTES,
 };

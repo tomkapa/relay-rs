@@ -42,8 +42,8 @@ use crate::runtime::{
 };
 use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::system::{
-    GetSessionTool, MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool,
-    RecallTool, SendMessageTool, WebFetchTool, WebSearchTool,
+    GetSessionTool, MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool,
+    MemoryWriteTool, RecallTool, SendMessageTool, WebFetchTool, WebSearchTool,
 };
 use crate::tools::{ToolBox, ToolRegistry};
 
@@ -322,6 +322,7 @@ impl Collaborators {
             .with(Arc::new(MemoryWriteTool::new(memory_tools.clone())))
             .with(Arc::new(MemoryUpdateTool::new(memory_tools.clone())))
             .with(Arc::new(MemoryForgetTool::new(memory_tools.clone())))
+            .with(Arc::new(MemoryValidateTool::new(memory_tools.clone())))
             .with(Arc::new(RecallTool::new(memory_tools, embedding_provider)))
             .build();
 

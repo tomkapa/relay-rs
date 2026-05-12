@@ -23,11 +23,11 @@ use super::limits::{MAX_EVENTS_PER_PAGE, MAX_MEMORIES_PER_AGENT, MAX_SIMILAR_PAI
 use super::store::{
     ContradictionEventRow, MemoryEvent, MemoryEventPayload, MemoryMutation, MemoryRow, MemoryStore,
     MemoryStoreError, MutationOutcome, MutationSource, PairCandidate, ResolutionOutcome,
-    ScoredMemoryRow, SearchFilter, ValidationSource,
+    ScoredMemoryRow, SearchFilter, ValidationOrigin,
 };
 use super::types::{
     ContradictionEventId, MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState,
-    MutationKind, MutationSourceKind,
+    MutationKind, MutationSourceKind, ValidationEventId,
 };
 use super::vector;
 
@@ -385,23 +385,24 @@ impl MemoryStore for PgMemoryStore {
         &self,
         agent: AgentId,
         memory: MemoryId,
-        source: ValidationSource,
+        origin: ValidationOrigin,
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError> {
         let now = self.now();
         let mut tx = self.pool.begin().await?;
+        let wrapping_source = origin.mutation_source();
 
-        let prior = lock_existing(&mut tx, agent, memory, MutationSource::Librarian).await?;
+        let prior = lock_existing(&mut tx, agent, memory, wrapping_source).await?;
 
         sqlx::query(
             "INSERT INTO validation_events
                  (id, agent_id, memory_id, source, detail, created_at)
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
-        .bind(uuid::Uuid::new_v4())
+        .bind(ValidationEventId::new())
         .bind(agent)
         .bind(memory)
-        .bind(source.as_str())
+        .bind(origin.source().as_str())
         .bind(detail)
         .bind(now)
         .execute(&mut *tx)
@@ -429,7 +430,7 @@ impl MemoryStore for PgMemoryStore {
             MemoryEventId::new(),
             agent,
             memory,
-            MutationSource::Librarian,
+            wrapping_source,
             now,
             &payload,
         )

@@ -12,6 +12,9 @@
 //!   state to `Tentative`. Pinned rows reject agent edits.
 //! - [`MemoryForgetTool`] (`memory_forget`) — drops the materialized row;
 //!   the journal keeps the event so the operator can revert.
+//! - [`MemoryValidateTool`] (`memory_validate`) — records that
+//!   independent evidence confirms an existing memory; advances the
+//!   validation clock without changing content.
 //! - [`RecallTool`] (`recall`) — embedding-driven retrieval against the
 //!   agent's existing memories.
 //!
@@ -35,11 +38,13 @@ use super::super::traits::{ToolCallContext, ToolError};
 mod forget;
 mod recall;
 mod update;
+mod validate;
 mod write;
 
 pub use forget::MemoryForgetTool;
 pub use recall::RecallTool;
 pub use update::MemoryUpdateTool;
+pub use validate::MemoryValidateTool;
 pub use write::MemoryWriteTool;
 
 /// Per-turn call counter shared by the memory tools.
@@ -50,9 +55,11 @@ pub use write::MemoryWriteTool;
 /// processes — older counters were already enforced live, so clearing does
 /// not retroactively let a turn exceed the cap.
 ///
-/// The mutation tools share one counter (combined `write`+`update`+`forget`
-/// cap); `recall` holds its own with a separate cap so the model can read
-/// memory without spending its mutation budget.
+/// The mutation tools share one counter (combined
+/// `write`+`update`+`forget`+`validate` cap — each writes to the journal
+/// and is rate-bound by the same per-turn budget); `recall` holds its own
+/// with a separate cap so the model can read memory without spending its
+/// mutation budget.
 #[derive(Debug)]
 pub(super) struct PerTurnCallCounter {
     inner: Mutex<HashMap<PromptRequestId, usize>>,

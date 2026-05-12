@@ -21,7 +21,7 @@ use relay_rs::memory::{
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::tools::system::{
-    MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryWriteTool,
+    MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool,
 };
 use relay_rs::tools::{Tool, ToolCallContext, ToolError};
 use relay_rs::types::Participant;
@@ -181,6 +181,78 @@ async fn memory_update_pinned_row_rejects_agent_call() {
         )
         .await
         .expect_err("agent edit blocked");
+    assert!(matches!(err, ToolError::InvalidInput(_)), "got {err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_validate_promotes_state_without_content_change() {
+    let db = TestDb::fresh().await;
+    let f = fixture(&db).await;
+    let written = f
+        .store
+        .apply(MemoryMutation::Write {
+            agent: f.agent_id,
+            kind: MemoryKind::Identity,
+            content: MemoryContent::try_from("deploy mondays").expect("c"),
+            state: MemoryState::Tentative,
+            pinned: false,
+            source: MutationSource::Operator,
+        })
+        .await
+        .expect("seed");
+
+    let validate = MemoryValidateTool::new(f.deps.clone());
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let out = validate
+        .execute_with_ctx(
+            json!({
+                "handle": "M-1",
+                "evidence": "web_search confirmed Monday deploy cadence on the team wiki"
+            }),
+            &ctx(&f, request),
+        )
+        .await
+        .expect("validate");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["memory_id"], written.memory_id.as_uuid().to_string());
+    assert_eq!(parsed["state"], "held");
+
+    let row = f
+        .store
+        .get(written.memory_id)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(row.content.as_str(), "deploy mondays");
+    assert_eq!(row.state, MemoryState::Held);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_validate_rejects_pinned_row() {
+    let db = TestDb::fresh().await;
+    let f = fixture(&db).await;
+    let _ = f
+        .store
+        .apply(MemoryMutation::Write {
+            agent: f.agent_id,
+            kind: MemoryKind::Identity,
+            content: MemoryContent::try_from("pinned belief").expect("c"),
+            state: MemoryState::Core,
+            pinned: true,
+            source: MutationSource::Operator,
+        })
+        .await
+        .expect("seed pinned");
+
+    let validate = MemoryValidateTool::new(f.deps.clone());
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let err = validate
+        .execute_with_ctx(
+            json!({"handle": "M-1", "evidence": "external source agrees"}),
+            &ctx(&f, request),
+        )
+        .await
+        .expect_err("pinned validate blocked");
     assert!(matches!(err, ToolError::InvalidInput(_)), "got {err:?}");
 }
 

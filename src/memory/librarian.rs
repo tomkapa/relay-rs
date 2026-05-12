@@ -42,7 +42,7 @@ use super::limits::{
 use super::scheduled_task::ScheduledTask;
 use super::store::{
     ContradictionEventRow, MemoryMutation, MemoryRow, MutationSource, PairCandidate,
-    SharedMemoryStore, ValidationSource,
+    SharedMemoryStore, ValidationOrigin,
 };
 use super::types::MemoryId;
 
@@ -91,7 +91,7 @@ pub async fn run_librarian_sweep(
                 .record_validation(
                     agent,
                     keep.id,
-                    ValidationSource::CrossSessionRewrite,
+                    ValidationOrigin::Librarian,
                     Some("librarian dedup match"),
                 )
                 .await?;
