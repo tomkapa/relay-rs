@@ -381,6 +381,68 @@ impl MemoryStore for PgMemoryStore {
         Ok(demoted)
     }
 
+    async fn mature_tentative(
+        &self,
+        agent: AgentId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, MemoryStoreError> {
+        let now = self.now();
+        let mut tx = self.pool.begin().await?;
+
+        // Pinned rows are excluded for symmetry with decay_validated —
+        // pinning is an authority signal, so the operator has already
+        // chosen the state.
+        let sql = format!(
+            "SELECT {MEMORY_ROW_COLUMNS} FROM agent_memories
+             WHERE agent_id = $1 AND state = 'tentative' AND pinned = FALSE
+               AND created_at < $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM contradiction_events ce
+                   WHERE ce.resolved_at IS NULL
+                     AND (ce.memory_a = agent_memories.id
+                          OR ce.memory_b = agent_memories.id)
+               )
+             FOR UPDATE",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(agent)
+            .bind(cutoff)
+            .fetch_all(&mut *tx)
+            .await?;
+
+        let mut matured = 0usize;
+        for row in rows {
+            let parsed = decode_memory_row(&row)?;
+            let payload = MemoryEventPayload::Update {
+                before: parsed.content.clone(),
+                after: parsed.content.clone(),
+                kind: parsed.kind,
+                state: MemoryState::Held,
+                pinned: parsed.pinned,
+            };
+            insert_event(
+                &mut tx,
+                MemoryEventId::new(),
+                parsed.agent_id,
+                parsed.id,
+                MutationSource::Librarian,
+                now,
+                &payload,
+            )
+            .await?;
+            // State only — last_validated_at stays put. Maturation is
+            // absence-of-refutation, not independent verification.
+            sqlx::query("UPDATE agent_memories SET state = 'held' WHERE id = $1")
+                .bind(parsed.id)
+                .execute(&mut *tx)
+                .await?;
+            matured += 1;
+        }
+
+        tx.commit().await?;
+        Ok(matured)
+    }
+
     async fn record_validation(
         &self,
         agent: AgentId,

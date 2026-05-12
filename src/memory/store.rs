@@ -353,6 +353,21 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
         cutoff: DateTime<Utc>,
     ) -> Result<usize, MemoryStoreError>;
 
+    /// Passive time-survival promotion (doc/memory.md §1.8). Promote
+    /// non-pinned `Tentative` rows whose `created_at` is older than
+    /// `cutoff` and which are not referenced by any unresolved row in
+    /// `contradiction_events` to `Held` via the journal. Returns the
+    /// count of rows promoted.
+    ///
+    /// `last_validated_at` is NOT advanced — maturation is "absence of
+    /// refutation," not independent evidence; the validation clock stays
+    /// reserved for [`record_validation`].
+    async fn mature_tentative(
+        &self,
+        agent: AgentId,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, MemoryStoreError>;
+
     /// Stamp an independent-signal validation for the memory. Promotes the
     /// row's state per the lifecycle rules (Tentative → Held on first
     /// validation; Held → Validated on second). The journal is updated to
@@ -544,13 +559,16 @@ impl TryFrom<String> for MemoryEvidence {
 ///
 /// Internal to the store; callers reach `record_validation` through
 /// [`ValidationOrigin`], which encodes the audit/journal pairing as a
-/// single invariant.
+/// single invariant. Per doc/memory.md §1.7, validation only advances on
+/// genuinely independent signals — the librarian's mechanical dedup is no
+/// longer a validation source (a same-session re-emergence is self-
+/// citation; a cross-session re-emergence is typically just the prior
+/// memory being loaded into the new session's stable layer and re-stated).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationSource {
-    /// Cross-session re-write: the librarian found the same content emerging
-    /// in a different session.
-    CrossSessionRewrite,
-    /// External confirmation: an agent's own follow-up turn confirmed it.
+    /// External confirmation: an agent's own follow-up turn confirmed it
+    /// (web_search / web_fetch / peer-agent reply / human via
+    /// send_message / user affirmation in the current turn).
     ExternalConfirmation,
     /// Operator endorsement: a `manager_note` flagged the memory as
     /// validated.
@@ -562,7 +580,6 @@ impl ValidationSource {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CrossSessionRewrite => "cross_session_rewrite",
             Self::ExternalConfirmation => "external_confirmation",
             Self::OperatorEndorsement => "operator_endorsement",
         }
@@ -578,12 +595,10 @@ impl ValidationSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationOrigin {
     /// Agent-driven external confirmation during a turn (web_search,
-    /// web_fetch, peer reply, human-via-send_message).
+    /// web_fetch, peer reply, human-via-send_message, user affirmation).
     Agent(PromptRequestId),
     /// Operator endorsement via `manager_note`. Bypasses pin protection.
     Operator,
-    /// Mechanical cross-session-rewrite signal from the librarian.
-    Librarian,
 }
 
 impl ValidationOrigin {
@@ -592,7 +607,6 @@ impl ValidationOrigin {
         match self {
             Self::Agent(_) => ValidationSource::ExternalConfirmation,
             Self::Operator => ValidationSource::OperatorEndorsement,
-            Self::Librarian => ValidationSource::CrossSessionRewrite,
         }
     }
 
@@ -601,7 +615,6 @@ impl ValidationOrigin {
         match self {
             Self::Agent(id) => MutationSource::Turn(id),
             Self::Operator => MutationSource::Operator,
-            Self::Librarian => MutationSource::Librarian,
         }
     }
 }

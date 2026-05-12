@@ -150,6 +150,19 @@ pub const MAX_SIMILAR_PAIRS_PER_AGENT: usize = 256;
 /// hasn't seen evidence of a memory in a while stops trusting it.
 pub const VALIDATION_DECAY: chrono::Duration = chrono::Duration::seconds(60 * 60 * 24 * 30);
 
+/// Age threshold for passive `Tentative → Held` maturation (doc/memory.md §1.8).
+///
+/// State-only promotion — `last_validated_at` is *not* advanced; only the
+/// state field moves. The promotion is one-step: `Tentative → Held`. Reaching
+/// `Validated` still requires an independent signal (`memory_validate`,
+/// operator endorsement).
+///
+/// Long enough that a fresh write survives normal "the user changed their
+/// mind in the next reply" churn before hardening; short enough that
+/// internal-only beliefs (preferences the agent cannot externally verify)
+/// can leave `Tentative` before they decay out under quota.
+pub const MATURATION_WINDOW: chrono::Duration = chrono::Duration::seconds(60 * 60 * 24 * 7);
+
 /// Polling cadence for the librarian sweep.
 ///
 /// Sized longer than the reflection cadence — librarian work is heavier

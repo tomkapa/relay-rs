@@ -4,13 +4,20 @@
 //! The mechanical sweep ([`run_librarian_sweep`]) runs no LLM:
 //!
 //! 1. *Dedup* — pairs above [`DEDUP_SIMILARITY_THRESHOLD`] merge into the
-//!    higher-state, older-provenance copy. The other side is forgotten;
-//!    a `cross_session_rewrite` validation event lands on the survivor.
-//! 2. *Decay* — [`MemoryStore::decay_validated`] demotes Validated rows
+//!    higher-state, older-provenance copy. The other side is forgotten.
+//!    The merge does NOT emit a validation event: cross-session memory
+//!    loading (the second session typically had the first's row in its
+//!    stable layer) makes re-emergence too contaminated to count as
+//!    independent evidence (doc/memory.md §1.7).
+//! 2. *Maturation* — [`MemoryStore::mature_tentative`] promotes long-lived
+//!    Tentative rows (older than [`MATURATION_WINDOW`], not entangled in
+//!    an unresolved contradiction) to Held. State only — the validation
+//!    clock stays reserved for genuinely independent signals.
+//! 3. *Decay* — [`MemoryStore::decay_validated`] demotes Validated rows
 //!    whose `last_validated_at` is older than [`VALIDATION_DECAY`].
-//! 3. *Eviction* — when over [`MAX_MEMORIES_PER_AGENT`], the lowest-scored
+//! 4. *Eviction* — when over [`MAX_MEMORIES_PER_AGENT`], the lowest-scored
 //!    non-pinned rows are forgotten.
-//! 4. *Contradiction detection* — pairs at
+//! 5. *Contradiction detection* — pairs at
 //!    [`CONTRADICTION_SIMILARITY_THRESHOLD`] with opposing textual
 //!    signals get a `contradiction_events` row.
 //!
@@ -37,12 +44,13 @@ use crate::types::{PROMPT_MAX_BYTES, Participant, Prompt};
 
 use super::limits::{
     CONTRADICTION_SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, LIBRARIAN_BATCH_LIMIT,
-    LIBRARIAN_POLL_SECS, MAX_MEMORIES_PER_AGENT, MAX_SIMILAR_PAIRS_PER_AGENT, VALIDATION_DECAY,
+    LIBRARIAN_POLL_SECS, MATURATION_WINDOW, MAX_MEMORIES_PER_AGENT, MAX_SIMILAR_PAIRS_PER_AGENT,
+    VALIDATION_DECAY,
 };
 use super::scheduled_task::ScheduledTask;
 use super::store::{
     ContradictionEventRow, MemoryMutation, MemoryRow, MutationSource, PairCandidate,
-    SharedMemoryStore, ValidationOrigin,
+    SharedMemoryStore,
 };
 use super::types::MemoryId;
 
@@ -50,6 +58,7 @@ use super::types::MemoryId;
 #[derive(Debug, Default, Clone)]
 pub struct LibrarianSweepReport {
     pub deduped: usize,
+    pub matured: usize,
     pub demoted: usize,
     pub evicted: usize,
     pub contradictions_flagged: usize,
@@ -82,46 +91,37 @@ pub async fn run_librarian_sweep(
         if forgotten.contains(&pair.a.id) || forgotten.contains(&pair.b.id) {
             continue;
         }
-        let (keep, drop_) = pick_dedup_winner(&pair);
-        // A duplicate from a different session is an independent re-write
-        // signal — record_validation handles both the journal write and
-        // the state promotion atomically.
-        if keep.source_turn_id != drop_.source_turn_id {
-            store
-                .record_validation(
-                    agent,
-                    keep.id,
-                    ValidationOrigin::Librarian,
-                    Some("librarian dedup match"),
-                )
-                .await?;
-        }
+        let loser = pick_dedup_loser(&pair);
         // Pinned losers survive the merge — the Librarian source never
         // bypasses pin protection, but skipping early avoids a wasted
         // `PinnedImmutable` error and is the spec'd behaviour.
-        if drop_.pinned {
+        if loser.pinned {
             continue;
         }
         store
             .apply(MemoryMutation::Forget {
                 agent,
-                target: drop_.id,
+                target: loser.id,
                 source: MutationSource::Librarian,
             })
             .await?;
-        forgotten.insert(drop_.id);
+        forgotten.insert(loser.id);
         report.deduped += 1;
     }
 
-    // 2. Decay — bump down stale Validated rows.
-    let cutoff = now - VALIDATION_DECAY;
-    report.demoted = store.decay_validated(agent, cutoff).await?;
+    // 2. Maturation — promote long-lived Tentative rows to Held.
+    let maturation_cutoff = now - MATURATION_WINDOW;
+    report.matured = store.mature_tentative(agent, maturation_cutoff).await?;
 
-    // 3. Eviction — bring per-agent count under quota.
+    // 3. Decay — bump down stale Validated rows.
+    let decay_cutoff = now - VALIDATION_DECAY;
+    report.demoted = store.decay_validated(agent, decay_cutoff).await?;
+
+    // 4. Eviction — bring per-agent count under quota.
     let evicted = store.evict_overflow(agent, MAX_MEMORIES_PER_AGENT).await?;
     report.evicted = evicted.len();
 
-    // 4. Contradiction detection — pairs with high similarity but
+    // 5. Contradiction detection — pairs with high similarity but
     // opposing textual cues.
     let contradiction_pairs = store
         .similar_pairs(
@@ -154,9 +154,10 @@ pub async fn run_librarian_sweep(
     Ok(report)
 }
 
-/// Pick the winner of a dedup pair: higher state priority wins, ties
-/// broken by older `created_at`, then by smaller `id` for determinism.
-fn pick_dedup_winner(pair: &PairCandidate) -> (&super::store::MemoryRow, &super::store::MemoryRow) {
+/// Pick the loser of a dedup pair — the row that should be forgotten.
+/// Winner is the higher state priority; ties break to older `created_at`,
+/// then smaller `id` for determinism.
+fn pick_dedup_loser(pair: &PairCandidate) -> &super::store::MemoryRow {
     let prio_a = pair.a.state.priority();
     let prio_b = pair.b.state.priority();
     let a_wins = match prio_a.cmp(&prio_b) {
@@ -168,11 +169,7 @@ fn pick_dedup_winner(pair: &PairCandidate) -> (&super::store::MemoryRow, &super:
             std::cmp::Ordering::Equal => pair.a.id.as_uuid() < pair.b.id.as_uuid(),
         },
     };
-    if a_wins {
-        (&pair.a, &pair.b)
-    } else {
-        (&pair.b, &pair.a)
-    }
+    if a_wins { &pair.b } else { &pair.a }
 }
 
 /// Heuristic: does the textual content of `a` and `b` look like opposing
@@ -282,6 +279,7 @@ impl SchedulerInner {
                     info!(
                         relay.agent.id = %agent,
                         relay.librarian.deduped = report.deduped,
+                        relay.librarian.matured = report.matured,
                         relay.librarian.demoted = report.demoted,
                         relay.librarian.evicted = report.evicted,
                         relay.librarian.contradictions = report.contradictions_flagged,

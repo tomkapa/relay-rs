@@ -139,9 +139,14 @@ const REFLECTION_CORE_PROMPT: &str = "You are reflecting on a recent conversatio
     independently meaningful when read in isolation.\n\
     \n\
     Use the memory mutation tools as needed; you may also `recall` to \
-    check whether a similar memory already exists before writing. When \
-    you have nothing more to do, end the turn with a brief plain-text \
-    sign-off (no tool call) and the loop will stop.\n\
+    check whether a similar memory already exists before writing. If \
+    `recall` surfaces a memory that says the same thing you were about \
+    to write, prefer `memory_update` over `memory_write` so you don't \
+    create a duplicate. If the user explicitly affirmed an existing \
+    memory in this conversation, call `memory_validate` with the user's \
+    exact words as `evidence`. When you have nothing more to do, end \
+    the turn with a brief plain-text sign-off (no tool call) and the \
+    loop will stop.\n\
     \n\
     Be conservative. Most conversations need zero or one new memories. \
     If nothing in the conversation crossed the threshold of \"this is \

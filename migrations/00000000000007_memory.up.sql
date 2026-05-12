@@ -160,6 +160,18 @@ CREATE INDEX contradiction_events_unresolved_idx
     ON contradiction_events (agent_id, created_at)
     WHERE resolved_at IS NULL;
 
+-- Per-memory lookup of unresolved entanglement: the librarian's
+-- maturation step (doc/memory.md §1.8) probes per row whether a tentative
+-- memory is on either side of an unresolved contradiction. Two partial
+-- indexes (one per side) let that NOT EXISTS subquery land on an index
+-- rather than scan the table per outer row.
+CREATE INDEX contradiction_events_unresolved_memory_a_idx
+    ON contradiction_events (memory_a)
+    WHERE resolved_at IS NULL;
+CREATE INDEX contradiction_events_unresolved_memory_b_idx
+    ON contradiction_events (memory_b)
+    WHERE resolved_at IS NULL;
+
 -- ───────────────────────────────────────────────────────────────────────────
 -- reflection_checkpoints — per (agent, session). The reflection scheduler
 -- (Phase 4) finds (agent_id, session_id) pairs whose latest turn is past

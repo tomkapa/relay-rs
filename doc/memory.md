@@ -160,8 +160,8 @@ A new memory enters the system as `tentative`.
 
 Promotion:
 
-- *tentative → held* — the memory survives one librarian sweep without being merged out and is not contradicted within a configurable age threshold.
-- *held → validated* — an *independent* signal confirms the memory: an independent re-write in a different session, an external confirmation event, or an operator endorsement.
+- *tentative → held* — two paths. *Active*: an independent signal confirms the memory (see the validation clock below). *Passive*: the memory survives the configurable maturation window (`MATURATION_WINDOW`, currently 7 days) without being merged out, forgotten, or entangled in an unresolved contradiction. Passive maturation runs in the librarian's mechanical sweep and is **state-only** — `last_validated_at` is not advanced.
+- *held → validated* — an *independent* signal confirms the memory: an external confirmation event, or an operator endorsement. Passive time-survival does not reach `validated`; that rung is reserved for genuine independent evidence.
 
 Demotion:
 
@@ -172,9 +172,10 @@ Pinned memories are exempt from every demotion path. A signal that contradicts a
 
 The validation clock — `last_validated_at` — advances ONLY on independent signals:
 
-- Cross-session re-write (the same content emerging in a separate session, not a self-citation in a dream).
-- External confirmation (web search, peer agent, human).
+- External confirmation (web search, peer agent, human, or the user affirming in the current turn — captured by the agent via `memory_validate` with the supporting quote as evidence).
 - Operator endorsement via `manager_note`.
+
+Cross-session re-emergence is **not** a validation signal, even though the same content appearing in a different session is suggestive. The reason: every session loads the agent's stable + contextual memory layers, so a memory minted in session S1 is typically already in session S2's system prompt by the time S2's reflection might re-emit it. The re-emergence is then self-citation with extra steps, not independent re-derivation. The librarian still dedups same-content rows (the loser is forgotten), but the survivor's validation clock does not move.
 
 Mere reading into context does NOT advance validation. A memory that's read constantly but never re-validated lives (because of the access counter) but does not promote (because validation requires independent evidence).
 
@@ -186,10 +187,11 @@ The librarian runs on a schedule, per agent. It has two phases:
 
 Pure SQL plus embedding operations:
 
-- *Dedup* — pairs with cosine similarity above a threshold are merged, keeping the higher-state and older-provenance copy.
+- *Dedup* — pairs with cosine similarity above a threshold are merged, keeping the higher-state and older-provenance copy. The loser is forgotten; the survivor's validation clock is not touched (cross-session re-emergence is not an independent signal — see §1.7).
+- *Maturation* — non-pinned `tentative` rows older than `MATURATION_WINDOW` (currently 7 days) that are not referenced by any unresolved `contradiction_events` row promote to `held`. State only — `last_validated_at` does not move. This is the passive path that lets internal-only beliefs (preferences, identity traits the agent cannot externally verify) leave `tentative` before they decay out under quota.
 - *Decay* — `last_validated_at` thresholds drop confidence; state demotes when buckets cross.
 - *Eviction* — when an agent is over its memory quota, lowest-score non-pinned memories are forgotten (forget event in the journal).
-- *Contradiction detection* — pairs with high embedding similarity but textually opposed signals get written as `contradiction_events` rows. Detection only — no resolution.
+- *Contradiction detection* — pairs with high embedding similarity but textually opposed signals get written as `contradiction_events` rows. Detection only — no resolution. Session-blind by design: if the agent is internally inconsistent across two writes (whatever their origin), the resolution turn is the right place to clean it up.
 
 #### Resolution turn (LLM, focused)
 
@@ -223,7 +225,8 @@ The structural separations above kill the catastrophic drift modes. Smaller defe
 - *Decay* — `last_validated_at` ages mechanically, no LLM cost.
 - *Quarantine* — `tentative` cannot promote until a librarian sweep confirms it survives dedup and contradiction.
 - *Anti-self-reinforcement* — reflection sees user-facing conversation, not its own previous reasoning.
-- *Independent-signal-only validation* — self-citation in a dream does not advance the validation clock.
+- *Independent-signal-only validation* — neither self-citation in a dream nor cross-session re-emergence (which is typically just the prior memory being loaded into the new session's stable layer and re-stated) advances the validation clock. Only external confirmation and operator endorsement do.
+- *Passive maturation only reaches `held`* — long-lived tentative memories promote to `held` without independent evidence, but `validated` stays reserved for real signal. The two-rung ladder keeps "I think this is true" and "this has been verified" distinguishable.
 - *Journal as truth* — every mutation is replayable and revertable.
 - *Per-agent quota* — hard cap on memory rows; eviction forces real curation rather than hoarding.
 

@@ -17,7 +17,7 @@ use relay_rs::clock::SystemClock;
 use relay_rs::memory::{
     MemoryContent, MemoryEventPayload, MemoryId, MemoryKind, MemoryMutation, MemoryState,
     MemoryStore, MemoryStoreError, MutationKind, MutationSource, MutationSourceKind, PgMemoryStore,
-    ResolutionOutcome, ResolutionReason,
+    ResolutionOutcome, ResolutionReason, run_librarian_sweep,
 };
 use relay_rs::runtime::{PromptRequestId, RequestKind};
 
@@ -430,18 +430,19 @@ async fn record_validation_promotes_state() {
         .await
         .expect("write");
 
+    // First validation promotes Tentative -> Held.
     let row = s
         .record_validation(
             db.default_agent_id,
             outcome.memory_id,
-            ValidationOrigin::Librarian,
-            Some("librarian dedup match"),
+            ValidationOrigin::Operator,
+            Some("operator endorsement"),
         )
         .await
         .expect("record");
     assert_eq!(row.state, MemoryState::Held);
 
-    // Second validation promotes Held -> Validated
+    // Second validation promotes Held -> Validated.
     let row = s
         .record_validation(
             db.default_agent_id,
@@ -452,6 +453,209 @@ async fn record_validation_promotes_state() {
         .await
         .expect("record");
     assert_eq!(row.state, MemoryState::Validated);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mature_promotes_long_lived_tentative_to_held() {
+    // Tentative row past the maturation window with no unresolved
+    // contradiction promotes to Held; last_validated_at stays put (the
+    // validation clock is reserved for independent signals).
+    let db = TestDb::fresh().await;
+    let s = store(&db);
+
+    let outcome = s
+        .apply(write(
+            &db,
+            MemoryKind::Identity,
+            "I default to terse replies",
+            MemoryState::Tentative,
+            false,
+        ))
+        .await
+        .expect("write");
+
+    let before = s.get(outcome.memory_id).await.expect("get").expect("row");
+    assert_eq!(before.state, MemoryState::Tentative);
+
+    // Cutoff in the future treats every row as "old enough".
+    let future = chrono::Utc::now() + chrono::Duration::seconds(1);
+    let promoted = s
+        .mature_tentative(db.default_agent_id, future)
+        .await
+        .expect("mature");
+    assert_eq!(promoted, 1);
+
+    let after = s.get(outcome.memory_id).await.expect("get").expect("row");
+    assert_eq!(after.state, MemoryState::Held);
+    assert_eq!(
+        after.last_validated_at, before.last_validated_at,
+        "maturation must not advance the validation clock",
+    );
+
+    // Journal carries an Update event with state=Held and Librarian source.
+    let events = s.list_events(db.default_agent_id).await.expect("events");
+    let last = events.last().expect("at least one event");
+    assert_eq!(last.mutation_kind(), MutationKind::Update);
+    let MemoryEventPayload::Update {
+        before: payload_before,
+        after: payload_after,
+        state,
+        ..
+    } = &last.payload
+    else {
+        panic!("expected Update payload, got {:?}", last.payload);
+    };
+    assert_eq!(payload_before.as_str(), "I default to terse replies");
+    assert_eq!(payload_after.as_str(), "I default to terse replies");
+    assert_eq!(*state, MemoryState::Held);
+    assert_eq!(last.source.kind(), MutationSourceKind::Librarian);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mature_skips_recent_tentative() {
+    let db = TestDb::fresh().await;
+    let s = store(&db);
+
+    let outcome = s
+        .apply(write(
+            &db,
+            MemoryKind::Identity,
+            "fresh tentative",
+            MemoryState::Tentative,
+            false,
+        ))
+        .await
+        .expect("write");
+
+    // Cutoff in the past — every row is "too young" to promote.
+    let past = chrono::Utc::now() - chrono::Duration::days(30);
+    let promoted = s
+        .mature_tentative(db.default_agent_id, past)
+        .await
+        .expect("mature");
+    assert_eq!(promoted, 0);
+
+    let row = s.get(outcome.memory_id).await.expect("get").expect("row");
+    assert_eq!(row.state, MemoryState::Tentative);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mature_skips_rows_with_unresolved_contradiction() {
+    // A tentative row entangled in an unresolved contradiction stays put.
+    // The resolution turn is the path forward, not passive maturation.
+    let db = TestDb::fresh().await;
+    let s = store(&db);
+
+    let a = s
+        .apply(write(
+            &db,
+            MemoryKind::Identity,
+            "ship on Friday",
+            MemoryState::Tentative,
+            false,
+        ))
+        .await
+        .expect("a");
+    let b = s
+        .apply(write(
+            &db,
+            MemoryKind::Identity,
+            "don't ship on Friday",
+            MemoryState::Tentative,
+            false,
+        ))
+        .await
+        .expect("b");
+
+    s.record_contradiction(db.default_agent_id, a.memory_id, b.memory_id, "test")
+        .await
+        .expect("contradiction");
+
+    let future = chrono::Utc::now() + chrono::Duration::seconds(1);
+    let promoted = s
+        .mature_tentative(db.default_agent_id, future)
+        .await
+        .expect("mature");
+    assert_eq!(promoted, 0);
+
+    for id in [a.memory_id, b.memory_id] {
+        let row = s.get(id).await.expect("get").expect("row");
+        assert_eq!(row.state, MemoryState::Tentative);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn librarian_sweep_dedup_does_not_emit_validation() {
+    // Two identical-content rows trip dedup (similarity = 1 from the fake
+    // embedding). The sweep merges them — the loser is forgotten — but
+    // does NOT emit a `validation_events` row: cross-session re-emergence
+    // is too contaminated by memory loading to count as independent
+    // evidence (doc/memory.md §1.7).
+    let db = TestDb::fresh().await;
+    let s = store(&db);
+
+    s.apply(write(
+        &db,
+        MemoryKind::Identity,
+        "I prefer terse replies.",
+        MemoryState::Held,
+        false,
+    ))
+    .await
+    .expect("a");
+    s.apply(write(
+        &db,
+        MemoryKind::Identity,
+        "I prefer terse replies.",
+        MemoryState::Held,
+        false,
+    ))
+    .await
+    .expect("b");
+
+    let now = chrono::Utc::now();
+    let report = run_librarian_sweep(s.as_ref(), db.default_agent_id, now)
+        .await
+        .expect("sweep");
+    assert_eq!(report.deduped, 1, "one duplicate should be merged");
+
+    let validation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM validation_events WHERE agent_id = $1")
+            .bind(db.default_agent_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("count validation_events");
+    assert_eq!(
+        validation_count, 0,
+        "librarian dedup must not produce a validation_events row",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mature_skips_pinned_rows() {
+    let db = TestDb::fresh().await;
+    let s = store(&db);
+
+    let outcome = s
+        .apply(write(
+            &db,
+            MemoryKind::Identity,
+            "pinned tentative",
+            MemoryState::Tentative,
+            true,
+        ))
+        .await
+        .expect("write");
+
+    let future = chrono::Utc::now() + chrono::Duration::seconds(1);
+    let promoted = s
+        .mature_tentative(db.default_agent_id, future)
+        .await
+        .expect("mature");
+    assert_eq!(promoted, 0);
+
+    let row = s.get(outcome.memory_id).await.expect("get").expect("row");
+    assert_eq!(row.state, MemoryState::Tentative);
 }
 
 #[tokio::test(flavor = "multi_thread")]

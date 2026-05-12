@@ -11,8 +11,10 @@
 --    `Tentative → Held → Validated` promotion clock (doc/memory.md §1.7).
 --    Every entry advances `agent_memories.last_validated_at` (and bumps
 --    state when thresholds cross). Per §1.7 the validation clock advances
---    only on independent signals: cross-session re-write, external
---    confirmation, operator endorsement.
+--    only on independent signals: external confirmation, operator endorsement.
+--    Passive `tentative → held` maturation (doc/memory.md §1.8) is driven
+--    by the librarian via the journal instead — no `validation_events`
+--    row, no `last_validated_at` bump.
 --
 -- 3. `agent_memories` gains an explicit `forgotten_at` (held in the
 --    journal as a `forget` event already; this column lets the librarian
@@ -41,26 +43,27 @@ ALTER TABLE memory_events
 
 -- ───────────────────────────────────────────────────────────────────────────
 -- validation_events — independent-signal log that drives the validation
--- clock. The librarian (Phase 6) inserts rows for cross-session re-write
--- detection; the operator endorsement path (Phase 8) inserts rows on
--- pinned `manager_note` writes; future external-confirmation paths fold
--- into the same shape. The materialized memory's `last_validated_at` is
--- bumped to `created_at` on insert, plus a state promotion if the
--- threshold crosses.
+-- clock. The agent (via `memory_validate`) inserts rows when an external
+-- signal — a `web_search` / `web_fetch` result, a peer-agent reply, a
+-- human reached via `send_message`, or the user affirming in the current
+-- turn — confirms an existing memory; the operator endorsement path
+-- inserts rows on pinned `manager_note` writes. The materialized memory's
+-- `last_validated_at` is bumped to `created_at` on insert, plus a state
+-- promotion if the threshold crosses.
 -- ───────────────────────────────────────────────────────────────────────────
 CREATE TABLE validation_events (
     id            UUID PRIMARY KEY,
     agent_id      UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     memory_id     UUID NOT NULL REFERENCES agent_memories(id) ON DELETE CASCADE,
     -- Source of the independent signal. Constraints:
-    --   `cross_session_rewrite`  — librarian dedup found a same-content
-    --                              pair from a different session.
     --   `external_confirmation`  — agent's own follow-up confirmed it
-    --                              (recall + web_search + reply path).
+    --                              (recall + web_search / web_fetch /
+    --                              send_message reply / user affirmation
+    --                              in the current turn).
     --   `operator_endorsement`   — manager_note path validated/pinned
     --                              the row.
     source        TEXT NOT NULL CHECK (
-                      source IN ('cross_session_rewrite', 'external_confirmation', 'operator_endorsement')
+                      source IN ('external_confirmation', 'operator_endorsement')
                   ),
     detail        TEXT NULL CHECK (detail IS NULL OR octet_length(detail) BETWEEN 1 AND 1024),
     created_at    TIMESTAMPTZ NOT NULL
