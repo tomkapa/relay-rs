@@ -145,8 +145,6 @@ Reflection does NOT see the prior reflection turn's reasoning or tool calls. The
 ```
 reflection_core   (binary constant — replaces the normal core for reflection)
 role              (same per-agent column as normal — identity preserved)
-[optional]
-reflection_role   (optional per-agent column — role-specific reflection guidance)
 memory:
   stable layer    (same assembly as normal turns)
   contextual      (top-K against the new turns being reflected on)

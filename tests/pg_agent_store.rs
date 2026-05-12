@@ -30,7 +30,6 @@ fn new_agent(name: &str, prompt: &str, is_default: bool) -> NewAgent {
     NewAgent {
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
-        reflection_role: None,
         is_default,
     }
 }
@@ -155,7 +154,6 @@ async fn update_promotes_to_default_atomically() {
             AgentUpdate {
                 name: None,
                 system_prompt: None,
-                reflection_role: None,
                 is_default: Some(true),
             },
         )
@@ -180,7 +178,6 @@ async fn update_cannot_demote_only_default() {
             AgentUpdate {
                 name: None,
                 system_prompt: None,
-                reflection_role: None,
                 is_default: Some(false),
             },
         )
@@ -204,7 +201,6 @@ async fn update_changes_name_and_prompt() {
             AgentUpdate {
                 name: Some(AgentName::try_from("renamed").expect("name")),
                 system_prompt: Some(AgentSystemPrompt::try_from("rolled-out v2").expect("prompt")),
-                reflection_role: None,
                 is_default: None,
             },
         )

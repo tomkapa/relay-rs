@@ -69,8 +69,8 @@ impl PgAgentStore {
         let id = AgentId::new();
         sqlx::query(
             "INSERT INTO agents \
-                 (id, name, system_prompt, reflection_role, is_default, created_at, updated_at) \
-             VALUES ($1, $2, $3, NULL, TRUE, $4, $4)",
+                 (id, name, system_prompt, is_default, created_at, updated_at) \
+             VALUES ($1, $2, $3, TRUE, $4, $4)",
         )
         .bind(id)
         .bind(seed.name.as_str())
@@ -111,18 +111,12 @@ impl AgentStore for PgAgentStore {
         let id = AgentId::new();
         sqlx::query(
             "INSERT INTO agents \
-                 (id, name, system_prompt, reflection_role, is_default, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+                 (id, name, system_prompt, is_default, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $5)",
         )
         .bind(id)
         .bind(payload.name.as_str())
         .bind(payload.system_prompt.as_str())
-        .bind(
-            payload
-                .reflection_role
-                .as_ref()
-                .map(AgentSystemPrompt::as_str),
-        )
         .bind(payload.is_default)
         .bind(now)
         .execute(&mut *tx)
@@ -134,7 +128,6 @@ impl AgentStore for PgAgentStore {
             id,
             name: payload.name,
             system_prompt: payload.system_prompt,
-            reflection_role: payload.reflection_role,
             is_default: payload.is_default,
             created_at: now,
             updated_at: now,
@@ -143,7 +136,7 @@ impl AgentStore for PgAgentStore {
 
     async fn list(&self) -> Result<Vec<AgentRecord>, AgentStoreError> {
         let rows = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, name, system_prompt, reflection_role, is_default, created_at, updated_at \
+            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
              FROM agents ORDER BY created_at ASC",
         )
         .fetch_all(&self.pool)
@@ -153,7 +146,7 @@ impl AgentStore for PgAgentStore {
 
     async fn read(&self, id: AgentId) -> Result<AgentRecord, AgentStoreError> {
         let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, name, system_prompt, reflection_role, is_default, created_at, updated_at \
+            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
              FROM agents WHERE id = $1",
         )
         .bind(id)
@@ -172,7 +165,7 @@ impl AgentStore for PgAgentStore {
         let mut tx = self.pool.begin().await?;
 
         let existing: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, name, system_prompt, reflection_role, is_default, created_at, updated_at \
+            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
              FROM agents WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -195,9 +188,6 @@ impl AgentStore for PgAgentStore {
         if let Some(system_prompt) = payload.system_prompt {
             current.system_prompt = system_prompt;
         }
-        if let Some(reflection_role) = payload.reflection_role {
-            current.reflection_role = reflection_role;
-        }
 
         // Promote: clear the old default in the same transaction, then set the
         // flag on this row. No-op if this row is already the default.
@@ -216,19 +206,12 @@ impl AgentStore for PgAgentStore {
 
         sqlx::query(
             "UPDATE agents \
-             SET name = $2, system_prompt = $3, reflection_role = $4, \
-                 is_default = $5, updated_at = $6 \
+             SET name = $2, system_prompt = $3, is_default = $4, updated_at = $5 \
              WHERE id = $1",
         )
         .bind(id)
         .bind(current.name.as_str())
         .bind(current.system_prompt.as_str())
-        .bind(
-            current
-                .reflection_role
-                .as_ref()
-                .map(AgentSystemPrompt::as_str),
-        )
         .bind(current.is_default)
         .bind(now)
         .execute(&mut *tx)
@@ -280,7 +263,6 @@ struct AgentRow {
     id: AgentId,
     name: String,
     system_prompt: String,
-    reflection_role: Option<String>,
     is_default: bool,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -290,15 +272,10 @@ impl TryFrom<AgentRow> for AgentRecord {
     type Error = AgentStoreError;
 
     fn try_from(row: AgentRow) -> Result<Self, Self::Error> {
-        let reflection_role = row
-            .reflection_role
-            .map(AgentSystemPrompt::try_from)
-            .transpose()?;
         Ok(Self {
             id: row.id,
             name: AgentName::try_from(row.name)?,
             system_prompt: AgentSystemPrompt::try_from(row.system_prompt)?,
-            reflection_role,
             is_default: row.is_default,
             created_at: row.created_at,
             updated_at: row.updated_at,

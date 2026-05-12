@@ -148,7 +148,6 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
                 "You translate phrases into French. Reply via send_message.",
             )
             .expect("prompt"),
-            reflection_role: None,
             is_default: false,
         })
         .await

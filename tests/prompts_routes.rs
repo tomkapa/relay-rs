@@ -103,7 +103,6 @@ impl PromptsHarness {
             .create(NewAgent {
                 name: AgentName::try_from(name).expect("name"),
                 system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
-                reflection_role: None,
                 is_default: false,
             })
             .await
