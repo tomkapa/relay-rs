@@ -7,7 +7,7 @@ use crate::clock::SharedClock;
 use crate::hook::{HookChain, TurnContext};
 use crate::memory::SharedMemory;
 use crate::provider::{ChatMessage, SharedProvider, UserContent};
-use crate::runtime::{PromptRequestId, RequestKind, RequestKindPayload};
+use crate::runtime::{PromptRequestId, RequestKindPayload};
 use crate::session::{SessionError, SessionId, SharedSessionStore};
 use crate::tools::ToolBox;
 use crate::types::{
@@ -123,7 +123,7 @@ impl Agent {
         fields(
             relay.session.id = %session,
             relay.viewer = %viewer,
-            relay.request.kind = kind.as_str(),
+            relay.request.kind = kind_payload.kind().as_str(),
             relay.provider = self.provider.name(),
             relay.model = %self.model,
             relay.batch_size = prompts.len(),
@@ -138,7 +138,6 @@ impl Agent {
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
-        kind: RequestKind,
         kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -149,7 +148,6 @@ impl Agent {
                 viewer,
                 prompts,
                 request_id,
-                kind,
                 &kind_payload,
                 cancel,
                 observer,
@@ -166,7 +164,6 @@ impl Agent {
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
-        kind: RequestKind,
         kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -195,7 +192,6 @@ impl Agent {
             viewer,
             counterpart,
             request_id,
-            kind,
             kind_payload,
             cancel,
             observer,
@@ -206,14 +202,13 @@ impl Agent {
     /// Continue an existing reply from where it left off. Used by the worker's
     /// ping-pong guard between retries — the prompt was already appended on
     /// the first `reply` call.
-    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         skip_all,
         name = "agent.resume",
         fields(
             relay.session.id = %session,
             relay.viewer = %viewer,
-            relay.request.kind = kind.as_str(),
+            relay.request.kind = kind_payload.kind().as_str(),
             relay.provider = self.provider.name(),
             relay.model = %self.model,
             relay.max_turns = self.max_turns.get(),
@@ -226,7 +221,6 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         request_id: PromptRequestId,
-        kind: RequestKind,
         kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -238,7 +232,6 @@ impl Agent {
                 viewer,
                 counterpart,
                 request_id,
-                kind,
                 &kind_payload,
                 cancel,
                 observer,
@@ -255,7 +248,6 @@ impl Agent {
         viewer: Participant,
         counterpart: Participant,
         request_id: PromptRequestId,
-        kind: RequestKind,
         kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -294,7 +286,6 @@ impl Agent {
                     viewer_as_sender,
                     root_request_id,
                     request_id,
-                    kind,
                     kind_payload,
                     &mut send_message_calls,
                     &cancel,

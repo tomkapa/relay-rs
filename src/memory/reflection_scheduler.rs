@@ -235,7 +235,6 @@ impl SchedulerInner {
             parent_session: None,
             content,
             idempotency_key: key,
-            kind: RequestKind::Reflection,
             kind_payload: RequestKindPayload::Reflection {
                 session_id: c.session_id,
                 up_to_turn_id: c.last_turn_id,

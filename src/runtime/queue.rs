@@ -18,8 +18,8 @@ use crate::types::{Participant, Prompt};
 use super::error::{LeaseTimingError, PromptError};
 use super::limits::{LEASE_HEARTBEAT_INTERVAL, LEASE_TTL};
 use super::types::{
-    FailureReason, IdempotencyKey, PromptRequestId, RequestKind, RequestKindPayload, RequestStatus,
-    TurnSeq, WorkerId,
+    FailureReason, IdempotencyKey, PromptRequestId, RequestKindPayload, RequestStatus, TurnSeq,
+    WorkerId,
 };
 
 /// Co-validated lease timing.
@@ -156,14 +156,14 @@ pub struct NewPromptRequest {
     pub parent_session: Option<SessionId>,
     pub content: Prompt,
     pub idempotency_key: IdempotencyKey,
-    /// Job kind (doc/memory.md §2.1). Defaults to [`RequestKind::Normal`]
-    /// for HTTP-triggered prompts; the reflection scheduler enqueues with
-    /// [`RequestKind::Reflection`] and the librarian enqueues with
-    /// [`RequestKind::Resolution`].
-    pub kind: RequestKind,
-    /// Kind-specific payload — must agree with `kind`. Every kind has its
-    /// own variant; `Normal` is an empty struct today but the symmetry
-    /// keeps the queue / worker / agent surfaces variant-agnostic.
+    /// Kind-specific payload — the job kind itself (doc/memory.md §2.1)
+    /// is its variant discriminator, read via
+    /// [`RequestKindPayload::kind`]. HTTP-triggered prompts default to
+    /// [`RequestKindPayload::Normal`]; the reflection scheduler and
+    /// librarian construct the `Reflection` / `Resolution` variants.
+    /// Carrying the whole enum (not a separate `kind` scalar) makes
+    /// `(kind, payload)` agreement true by construction — no runtime
+    /// cross-check at the insert boundary.
     pub kind_payload: RequestKindPayload,
 }
 
@@ -186,7 +186,6 @@ impl NewPromptRequest {
             parent_session,
             content,
             idempotency_key,
-            kind: RequestKind::Normal,
             kind_payload: RequestKindPayload::Normal {},
         }
     }
@@ -257,15 +256,13 @@ pub struct ClaimedSession {
     pub prompts: Vec<ClaimedPrompt>,
     pub lease: LeaseToken,
     pub traceparent: Option<String>,
-    /// The job kind for this batch — every drained row in `prompts`
-    /// shares it because the queue groups by `(session, kind)` per claim.
-    /// Drives worker dispatch (Normal → `agent.reply_batch`, Reflection
-    /// → `agent.reflect`).
-    pub kind: RequestKind,
-    /// Kind-specific payload from the first drained row. The worker
-    /// pattern-matches on this for kind-specific post-turn dispatch
-    /// (reflection checkpoint, no-action contradiction close); the
-    /// `Normal` arm is a no-op today.
+    /// Kind-specific payload from the first drained row. The whole batch
+    /// shares one variant because the queue groups by `(session, kind)`
+    /// per claim, so this single value carries both the job kind (via
+    /// [`RequestKindPayload::kind`]) and any per-variant metadata the
+    /// worker needs for kind-specific post-turn dispatch (reflection
+    /// checkpoint, no-action contradiction close). The `Normal` arm is
+    /// a no-op today.
     pub kind_payload: RequestKindPayload,
 }
 

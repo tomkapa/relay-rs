@@ -1,0 +1,55 @@
+meta {
+  name: POST /agents/{id}/memory/events/{event}/revert — undo a mutation
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{base_url}}/agents/{{created_agent_id}}/memory/events/{{memory_event_id}}/revert
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Operator revert (doc/memory.md §1.9). Appends an inverse event to the
+  journal — the materialized view recomputes from the journal, so the
+  effect is observable on the next `GET /agents/{id}/memory` without any
+  destructive in-place edit.
+
+  Inverse semantics:
+   - revert of a `write`  → the row is forgotten (`{ "removed": true }`).
+   - revert of an `update` → the row's content reverts to
+     `content_before`.
+   - revert of a `forget` → the row is restored with the pre-forget
+     content and state.
+
+  Response is one of:
+  ```
+  // row-restored / row-updated:
+  { "id": "<uuid>", "kind": ..., "state": ..., "content": ..., ... }
+  // row-removed:
+  { "removed": true }
+  ```
+
+  Run `05 - List Memory Events` first so `memory_event_id` is bound.
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("response is a row or a removed marker", function() {
+    const json = res.getBody();
+    if (json.removed !== undefined) {
+      expect(json.removed).to.equal(true);
+    } else {
+      expect(json.id).to.be.a("string");
+      expect(json.content).to.be.a("string");
+    }
+  });
+}

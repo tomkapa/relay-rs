@@ -166,13 +166,14 @@ impl PromptQueue for PgPromptQueue {
         // Reflection / Resolution sit in `(Agent, System)` sessions so their
         // trace doesn't pollute the parent conversation; `receiver_agent_id`
         // still drives worker dispatch.
-        let receiver = match req.kind {
+        let kind = req.kind_payload.kind();
+        let receiver = match kind {
             RequestKind::Normal => Participant::agent(req.receiver_agent_id),
             RequestKind::Reflection | RequestKind::Resolution => Participant::System,
         };
         // §1: parse, don't validate. Normal sessions cannot host equal
         // participants; catch the violation before we hit Postgres.
-        if req.kind == RequestKind::Normal && req.sender == receiver {
+        if kind == RequestKind::Normal && req.sender == receiver {
             return Err(PromptError::SelfSession);
         }
 
@@ -362,16 +363,16 @@ impl PromptQueue for PgPromptQueue {
         }
 
         // Drain pending rows for the session: flip them to processing, stamp the
-        // turn_seq, bump attempts. `receiver_agent_id`, `traceparent`, `kind`
-        // and `kind_payload` are returned so the worker can resolve the right
+        // turn_seq, bump attempts. `receiver_agent_id`, `traceparent`, and
+        // `kind_payload` are returned so the worker can resolve the right
         // Agent from the registry, attach its `handle_claim` span to the
-        // producer's trace, and dispatch on job kind.
+        // producer's trace, and dispatch on job kind. The kind itself is the
+        // payload's variant discriminator — no separate column read.
         let drained: Vec<(
             PromptRequestId,
             String,
             crate::agents::AgentId,
             Option<String>,
-            RequestKind,
             sqlx::types::Json<RequestKindPayload>,
         )> = sqlx::query_as(
             "UPDATE prompt_requests
@@ -380,7 +381,7 @@ impl PromptQueue for PgPromptQueue {
                  attempts = attempts + 1,
                  updated_at = $3
              WHERE session_id = $4 AND status = $5
-             RETURNING id, content, receiver_agent_id, traceparent, kind, kind_payload",
+             RETURNING id, content, receiver_agent_id, traceparent, kind_payload",
         )
         .bind(RequestStatus::Processing)
         .bind(next_seq)
@@ -406,14 +407,15 @@ impl PromptQueue for PgPromptQueue {
         // Resolution rows in the same drain (the per-agent serialization
         // predicate above forbids it).
         let receiver_agent_id = drained[0].2;
-        let kind = drained[0].4;
-        for (_, _, rcv, _, k, _) in &drained[1..] {
+        let kind = drained[0].4.0.kind();
+        for (_, _, rcv, _, p) in &drained[1..] {
             assert_eq!(
                 *rcv, receiver_agent_id,
                 "invariant: drained prompts for one session must share receiver_agent_id"
             );
             assert_eq!(
-                *k, kind,
+                p.0.kind(),
+                kind,
                 "invariant: drained prompts for one session must share kind"
             );
         }
@@ -425,13 +427,13 @@ impl PromptQueue for PgPromptQueue {
         // producers we still anchor to the first one rather than spawning
         // an orphan span; the divergence shows up as multiple inbound
         // links in Honeycomb, which is the right way to surface it.
-        let traceparent = drained.iter().find_map(|(_, _, _, tp, _, _)| tp.clone());
+        let traceparent = drained.iter().find_map(|(_, _, _, tp, _)| tp.clone());
         // Every drained row in a claim shares a kind (§6 above), and every
         // row carries a payload (NOT NULL column) — pull from the first.
-        let kind_payload = drained[0].5.0.clone();
+        let kind_payload = drained[0].4.0.clone();
 
         let mut prompts = Vec::with_capacity(drained.len());
-        for (request_id, content, _, _, _, _) in drained {
+        for (request_id, content, _, _, _) in drained {
             let parsed = Prompt::try_from(content)?;
             prompts.push(ClaimedPrompt {
                 request_id,
@@ -447,7 +449,6 @@ impl PromptQueue for PgPromptQueue {
             prompts,
             lease,
             traceparent,
-            kind,
             kind_payload,
         }))
     }
@@ -607,13 +608,9 @@ async fn insert_prompt_request(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), PromptError> {
     let traceparent = propagation::current_traceparent();
-    // §6: kind and payload must agree — every kind has a payload variant,
-    // so this is unconditional.
-    assert_eq!(
-        req.kind_payload.kind(),
-        req.kind,
-        "invariant: NewPromptRequest.kind_payload variant must match kind"
-    );
+    // The (kind, payload) pair is now true by construction: the kind is the
+    // payload's variant discriminator, so no runtime cross-check is needed.
+    let kind = req.kind_payload.kind();
     let payload_json = serde_json::to_value(&req.kind_payload)
         .expect("invariant: RequestKindPayload serialises infallibly via serde_json");
 
@@ -642,7 +639,7 @@ async fn insert_prompt_request(
     .bind(req.receiver_agent_id)
     .bind(root_request_id)
     .bind(traceparent)
-    .bind(req.kind)
+    .bind(kind)
     .bind(payload_json)
     .bind(now)
     .execute(&mut **tx)

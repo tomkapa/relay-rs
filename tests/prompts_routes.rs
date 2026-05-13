@@ -161,7 +161,6 @@ async fn followup_with_session_id_routes_to_session_agent() {
             parent_session: None,
             content: Prompt::try_from("hi").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-root").expect("key"),
-            kind: relay_rs::runtime::RequestKind::Normal,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await

@@ -88,16 +88,7 @@ impl Tool for MemoryUpdateTool {
     fn input_schema(&self) -> Arc<Value> {
         self.input_schema.clone()
     }
-    async fn execute(&self, _input: Value) -> Result<String, ToolError> {
-        Err(ToolError::InvalidInput(
-            "memory_update requires per-call context; invoke via execute_with_ctx".into(),
-        ))
-    }
-    async fn execute_with_ctx(
-        &self,
-        input: Value,
-        ctx: &ToolCallContext,
-    ) -> Result<String, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError> {
         let parsed: Input = serde_json::from_value(input)?;
         let agent = expect_agent(ctx)?;
         check_cap(&self.deps.counter, ctx.request_id)?;

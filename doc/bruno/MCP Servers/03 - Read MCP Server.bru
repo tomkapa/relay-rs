@@ -1,24 +1,17 @@
 meta {
-  name: PUT /mcp-servers/{id} — disable or replace config
+  name: GET /mcp-servers/{id} — read one MCP server, including discovered_tools
   type: http
-  seq: 9
+  seq: 3
 }
 
-put {
+get {
   url: {{base_url}}/mcp-servers/{{mcp_server_id}}
-  body: json
+  body: none
   auth: none
 }
 
 headers {
-  Content-Type: application/json
   Accept: application/json
-}
-
-body:json {
-  {
-    "enabled": false
-  }
 }
 
 tests {
@@ -26,8 +19,8 @@ tests {
     expect(res.status).to.equal(200);
   });
 
-  test("enabled flipped", function() {
+  test("id matches", function() {
     const json = res.getBody();
-    expect(json.enabled).to.equal(false);
+    expect(json.id).to.equal(bru.getVar("mcp_server_id"));
   });
 }

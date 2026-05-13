@@ -91,7 +91,7 @@ async fn memory_write_creates_tentative_row() {
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
 
     let out = tool
-        .execute_with_ctx(
+        .execute(
             json!({"kind": "self", "content": "I default to terse replies."}),
             &ctx(&f, request),
         )
@@ -135,7 +135,7 @@ async fn memory_update_resolves_handle_and_resets_state() {
     let update = MemoryUpdateTool::new(f.deps.clone());
     // The tool resolves M-1 via the session cache it shares.
     let out = update
-        .execute_with_ctx(
+        .execute(
             json!({"handle": "M-1", "content": "revised"}),
             &ctx(&f, request),
         )
@@ -175,7 +175,7 @@ async fn memory_update_pinned_row_rejects_agent_call() {
     let update = MemoryUpdateTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let err = update
-        .execute_with_ctx(
+        .execute(
             json!({"handle": "M-1", "content": "agent attempt"}),
             &ctx(&f, request),
         )
@@ -204,7 +204,7 @@ async fn memory_validate_promotes_state_without_content_change() {
     let validate = MemoryValidateTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let out = validate
-        .execute_with_ctx(
+        .execute(
             json!({
                 "handle": "M-1",
                 "evidence": "web_search confirmed Monday deploy cadence on the team wiki"
@@ -247,7 +247,7 @@ async fn memory_validate_rejects_pinned_row() {
     let validate = MemoryValidateTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let err = validate
-        .execute_with_ctx(
+        .execute(
             json!({"handle": "M-1", "evidence": "external source agrees"}),
             &ctx(&f, request),
         )
@@ -276,7 +276,7 @@ async fn memory_forget_removes_row() {
     let forget = MemoryForgetTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let out = forget
-        .execute_with_ctx(json!({"handle": "M-1"}), &ctx(&f, request))
+        .execute(json!({"handle": "M-1"}), &ctx(&f, request))
         .await
         .expect("forget");
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
@@ -295,7 +295,7 @@ async fn unknown_handle_surfaces_invalid_input() {
     let update = MemoryUpdateTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let err = update
-        .execute_with_ctx(
+        .execute(
             json!({"handle": "M-99", "content": "nope"}),
             &ctx(&f, request),
         )
@@ -314,7 +314,7 @@ async fn per_turn_cap_blocks_overflow_within_one_request_id() {
     // The first MAX_MEMORY_MUTATIONS_PER_TURN writes succeed.
     for i in 0..MAX_MEMORY_MUTATIONS_PER_TURN {
         write
-            .execute_with_ctx(
+            .execute(
                 json!({"kind": "self", "content": format!("memory {i}")}),
                 &ctx(&f, request),
             )
@@ -322,7 +322,7 @@ async fn per_turn_cap_blocks_overflow_within_one_request_id() {
             .expect("under cap");
     }
     let err = write
-        .execute_with_ctx(
+        .execute(
             json!({"kind": "self", "content": "one too many"}),
             &ctx(&f, request),
         )
@@ -336,7 +336,7 @@ async fn per_turn_cap_blocks_overflow_within_one_request_id() {
     // A different request id has its own quota.
     let new_req = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     write
-        .execute_with_ctx(
+        .execute(
             json!({"kind": "self", "content": "fresh turn"}),
             &ctx(&f, new_req),
         )
@@ -453,7 +453,7 @@ async fn memory_update_with_resolution_target_closes_contradiction() {
     let update = MemoryUpdateTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let _ = update
-        .execute_with_ctx(
+        .execute(
             json!({"handle": "M-1", "content": "ship on Friday after standup"}),
             &ctx_with_target(&f, request, target),
         )
@@ -483,7 +483,7 @@ async fn memory_forget_with_resolution_target_closes_contradiction() {
     let forget = MemoryForgetTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let _ = forget
-        .execute_with_ctx(
+        .execute(
             json!({"handle": "M-1"}),
             &ctx_with_target(&f, request, target),
         )
@@ -510,7 +510,7 @@ async fn memory_update_without_resolution_target_leaves_contradiction_open() {
     let update = MemoryUpdateTool::new(f.deps.clone());
     let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
     let _ = update
-        .execute_with_ctx(
+        .execute(
             json!({"handle": "M-1", "content": "unrelated tweak"}),
             &ctx(&f, request),
         )

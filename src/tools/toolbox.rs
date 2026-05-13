@@ -140,7 +140,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::tools::{Tool, ToolError, ToolRegistry};
+    use crate::tools::{Tool, ToolCallContext, ToolError, ToolRegistry};
     use crate::types::ToolName;
 
     #[derive(Debug)]
@@ -167,7 +167,11 @@ mod tests {
         fn input_schema(&self) -> Arc<Value> {
             Arc::new(json!({"type":"object"}))
         }
-        async fn execute(&self, _input: Value) -> Result<String, ToolError> {
+        async fn execute(
+            &self,
+            _input: Value,
+            _ctx: &ToolCallContext,
+        ) -> Result<String, ToolError> {
             Ok(self.body.into())
         }
     }

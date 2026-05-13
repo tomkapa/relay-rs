@@ -1,7 +1,7 @@
 meta {
   name: Multi-Agent Scenario — delegate translation to a specialist
   type: http
-  seq: 20
+  seq: 1
 }
 
 post {
@@ -55,7 +55,7 @@ docs {
   The seeded default agent serves as the coordinator. No mutation of
   the default; nothing else in this collection breaks.
 
-  ## What you'll see on `04 - Thread Stream.bru`
+  ## What you'll see on `Threads / Thread Stream.bru`
 
   Open it after this request returns and click Send to watch the
   DAG-wide SSE fan-in:
@@ -70,8 +70,8 @@ docs {
    - terminal `done` chunk when the DAG drains (step 8). The handler
      closes the SSE connection after forwarding it.
 
-  See also `17 - List Threads.bru` (channel feed) and
-  `18 - Thread Messages.bru` (flat history of every session in this
+  See also `Threads / List Threads.bru` (channel feed) and
+  `Threads / Thread Messages.bru` (flat history of every session in this
   DAG, useful for refetch-and-dedupe on reconnect).
 
   ## Failure modes
@@ -142,7 +142,7 @@ script:post-response {
       "  request_id (== DAG root) = " + json.request_id + "\n" +
       "  session_id (human↔agent) = " + json.session_id + "\n" +
       "  translator_id            = " + bru.getVar("translator_id") + "\n" +
-      "→ Open '04 - Thread Stream.bru' and click Send to watch the conversation."
+      "→ Open 'Threads / 03 - Thread Stream.bru' and click Send to watch the conversation."
   );
 }
 

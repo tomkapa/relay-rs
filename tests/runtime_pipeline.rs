@@ -195,7 +195,6 @@ fn req(
         parent_session: None,
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
-        kind: relay_rs::runtime::RequestKind::Normal,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }
@@ -212,7 +211,6 @@ fn req_root(agent_id: relay_rs::agents::AgentId, content: &str, key: &str) -> Ne
         parent_session: None,
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
-        kind: relay_rs::runtime::RequestKind::Normal,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }

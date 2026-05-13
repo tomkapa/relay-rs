@@ -564,19 +564,7 @@ impl Tool for SendMessageTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, _input: Value) -> Result<String, ToolError> {
-        // `send_message` only makes sense with caller context — refuse
-        // unguarded calls so a misuse does not silently produce text.
-        Err(ToolError::InvalidInput(
-            "send_message requires per-call context; invoke via execute_with_ctx".into(),
-        ))
-    }
-
-    async fn execute_with_ctx(
-        &self,
-        input: Value,
-        ctx: &ToolCallContext,
-    ) -> Result<String, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError> {
         let parsed: SendMessageInput = serde_json::from_value(input)?;
         let out = self.handle(parsed, ctx).await?;
         let body = serde_json::to_string(&out)?;

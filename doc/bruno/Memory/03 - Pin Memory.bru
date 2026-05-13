@@ -1,0 +1,41 @@
+meta {
+  name: POST /agents/{id}/memory/{memory}/pin — operator pin
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/agents/{{created_agent_id}}/memory/{{memory_id}}/pin
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Pins a memory (doc/memory.md §1.9). Pinned rows are immutable to the
+  agent — `memory_update` / `memory_forget` calls reject, and the
+  librarian's decay/eviction sweeps skip them. A signal that contradicts
+  a pinned memory is journaled for operator review rather than changing
+  its state (§1.7).
+
+  Returns 200 with the updated row. Idempotent — pinning an already-
+  pinned row is a no-op that still returns the current state.
+
+  Run `02 - Create Operator Note` first (or `01 - List Memory`) so
+  `memory_id` is bound in the env.
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("row is pinned", function() {
+    const json = res.getBody();
+    expect(json.id).to.equal(bru.getVar("memory_id"));
+    expect(json.pinned).to.equal(true);
+  });
+}

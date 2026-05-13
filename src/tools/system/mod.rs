@@ -6,7 +6,7 @@
 //! * **Communication** — [`SendMessageTool`] (the only delivery mechanism
 //!   for messages between participants) and [`GetSessionTool`]
 //!   (cross-session read scoped to the caller's DAG). Both consume
-//!   [`super::ToolCallContext`] via `execute_with_ctx`.
+//!   [`super::ToolCallContext`].
 //! * **Memory** — [`MemoryWriteTool`], [`MemoryUpdateTool`],
 //!   [`MemoryForgetTool`], [`MemoryValidateTool`], [`RecallTool`]. The
 //!   four journal-writing tools share a per-turn cap via

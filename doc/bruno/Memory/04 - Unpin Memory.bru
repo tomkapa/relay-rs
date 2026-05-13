@@ -1,0 +1,35 @@
+meta {
+  name: POST /agents/{id}/memory/{memory}/unpin — operator unpin
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/agents/{{created_agent_id}}/memory/{{memory_id}}/unpin
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Unpins a memory (doc/memory.md §1.9), restoring it to the normal
+  decay/eviction/agent-mutation path. Idempotent — unpinning an
+  already-unpinned row returns the current state without error.
+
+  Run `03 - Pin Memory` first so the flag transition is observable.
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("row is no longer pinned", function() {
+    const json = res.getBody();
+    expect(json.id).to.equal(bru.getVar("memory_id"));
+    expect(json.pinned).to.equal(false);
+  });
+}

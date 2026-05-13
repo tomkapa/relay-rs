@@ -239,7 +239,7 @@ async fn unpin_memory(
 #[serde(untagged)]
 enum RevertResponse {
     Row(MemoryRowResponse),
-    Removed { memory_id: MemoryId, removed: bool },
+    Removed { removed: bool },
 }
 
 async fn revert_event(
@@ -254,10 +254,7 @@ async fn revert_event(
         .await
         .map_err(|e| HttpError::BadRequest(e.to_string()))?;
     Ok(Json(row.map_or_else(
-        || RevertResponse::Removed {
-            memory_id: MemoryId::from(Uuid::nil()),
-            removed: true,
-        },
+        || RevertResponse::Removed { removed: true },
         |r| RevertResponse::Row(r.into()),
     )))
 }

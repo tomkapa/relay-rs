@@ -1,0 +1,73 @@
+meta {
+  name: GET /agents/{id}/memory — list memory rows
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/agents/{{created_agent_id}}/memory
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  Operator audit view (doc/memory.md §1.9): every row in the agent's
+  materialized memory, regardless of state. Returns a flat array; rows
+  carry `id`, `kind` (self/other/procedure/open), `state`
+  (core/validated/held/tentative), `pinned`, `content`, plus the
+  timestamps and `access_count` the librarian and decay logic key off:
+
+  ```
+  {
+    "id": "<uuid>",
+    "agent_id": "<uuid>",
+    "kind": "self" | "other" | "procedure" | "open",
+    "content": "<string>",
+    "state": "core" | "validated" | "held" | "tentative",
+    "pinned": <bool>,
+    "created_at": "<iso8601>",
+    "last_validated_at": "<iso8601>",
+    "last_accessed_at": "<iso8601>",
+    "access_count": <bigint>
+  }
+  ```
+
+  Run `Agents / 01 - Create Agent` first (or set `created_agent_id`
+  manually) so the path variable resolves. The post-response script
+  saves the first row's id as `memory_id` so the pin/unpin/revert
+  requests in this folder can pick it up.
+}
+
+script:post-response {
+  const rows = res.getBody();
+  if (Array.isArray(rows) && rows.length > 0) {
+    bru.setVar("memory_id", rows[0].id);
+  }
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("response is an array", function() {
+    const json = res.getBody();
+    expect(json).to.be.an("array");
+  });
+
+  test("rows carry the documented shape (when present)", function() {
+    const json = res.getBody();
+    if (json.length === 0) return;
+    const row = json[0];
+    expect(row.id).to.be.a("string");
+    expect(row.kind).to.be.oneOf(["self", "other", "procedure", "open"]);
+    expect(row.state).to.be.oneOf(["core", "validated", "held", "tentative"]);
+    expect(row.pinned).to.be.a("boolean");
+    expect(row.content).to.be.a("string");
+    expect(row.access_count).to.be.a("number");
+  });
+}

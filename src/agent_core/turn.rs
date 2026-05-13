@@ -35,7 +35,6 @@ impl Agent {
         viewer_as_sender: MessageSender,
         root_request_id: PromptRequestId,
         request_id: PromptRequestId,
-        kind: RequestKind,
         kind_payload: &RequestKindPayload,
         send_message_calls: &mut usize,
         cancel: &CancellationToken,
@@ -43,7 +42,7 @@ impl Agent {
     ) -> Result<Option<String>, AgentError> {
         self.hooks().before_turn(ctx).await?.into_result()?;
         let response = self
-            .send_one_turn(ctx.session_id, viewer, kind, kind_payload, cancel)
+            .send_one_turn(ctx.session_id, viewer, kind_payload, cancel)
             .await?;
         self.hooks()
             .after_turn(ctx, &response)
@@ -104,7 +103,7 @@ impl Agent {
                 ctx,
                 &tool_calls,
                 self.tools(),
-                kind,
+                kind_payload.kind(),
                 &tool_ctx,
                 cancel,
                 observer,
@@ -128,12 +127,11 @@ impl Agent {
         &self,
         session: SessionId,
         viewer: Participant,
-        kind: RequestKind,
         kind_payload: &RequestKindPayload,
         cancel: &CancellationToken,
     ) -> Result<ChatResponse, AgentError> {
         let request = self
-            .build_chat_request(session, viewer, kind, kind_payload)
+            .build_chat_request(session, viewer, kind_payload)
             .await?;
         self.call_provider(request, self.provider_timeout(), cancel)
             .await
@@ -180,9 +178,9 @@ impl Agent {
         &self,
         session: SessionId,
         viewer: Participant,
-        kind: RequestKind,
         kind_payload: &RequestKindPayload,
     ) -> Result<ChatRequest, AgentError> {
+        let kind = kind_payload.kind();
         let span = tracing::Span::current();
         let own = self.sessions().snapshot(session, viewer).await?;
         assert!(
@@ -301,7 +299,7 @@ impl Agent {
             );
         };
 
-        let exec = tool.execute_with_ctx(call.input.clone(), tool_ctx);
+        let exec = tool.execute(call.input.clone(), tool_ctx);
         let outcome = tokio::select! {
             biased;
             () = cancel.cancelled() => return error_result(id, "cancelled".into()),

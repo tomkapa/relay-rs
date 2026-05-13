@@ -39,7 +39,6 @@ async fn enqueue_reflection_row(
         parent_session: None,
         content: Prompt::try_from("(reflection)").expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
-        kind: RequestKind::Reflection,
         kind_payload: RequestKindPayload::Reflection {
             session_id: session,
             up_to_turn_id: up_to,
@@ -68,7 +67,7 @@ async fn claim_returns_reflection_kind_and_payload() {
         .await
         .expect("claim")
         .expect("some");
-    assert_eq!(claimed.kind, RequestKind::Reflection);
+    assert_eq!(claimed.kind_payload.kind(), RequestKind::Reflection);
     match claimed.kind_payload {
         RequestKindPayload::Reflection {
             session_id,
@@ -104,7 +103,7 @@ async fn per_agent_serialization_skips_session_with_in_flight_reflection() {
         .await
         .expect("claim")
         .expect("some");
-    assert_eq!(first.kind, RequestKind::Reflection);
+    assert_eq!(first.kind_payload.kind(), RequestKind::Reflection);
 
     // A normal prompt on a different session for the SAME agent should
     // claim fine — only memory-mutating kinds are serialised per agent.
@@ -132,7 +131,7 @@ async fn per_agent_serialization_skips_session_with_in_flight_reflection() {
         .await
         .expect("claim normal")
         .expect("normal claimed");
-    assert_eq!(claim.kind, RequestKind::Normal);
+    assert_eq!(claim.kind_payload.kind(), RequestKind::Normal);
     assert_eq!(claim.session, outcome.session());
 
     // BUT: a second reflection on a different session for the same

@@ -271,7 +271,7 @@ impl Worker {
         let heartbeat = self.spawn_heartbeat(receipt.clone());
         let cancel_watcher = self.spawn_cancel_watcher(receipt.clone(), cancel.clone());
 
-        match claim.kind {
+        match claim.kind_payload.kind() {
             RequestKind::Normal => {
                 let observer: SharedTurnObserver = Arc::new(FanOutObserver {
                     sink: self.sink.clone(),
@@ -334,7 +334,6 @@ impl Worker {
                 viewer,
                 prompts,
                 request_id,
-                claim.kind,
                 claim.kind_payload.clone(),
                 cancel,
                 None,
@@ -351,18 +350,18 @@ impl Worker {
                 info!(
                     relay.session.id = %claim.session,
                     relay.agent.id = %claim.receiver_agent_id,
-                    relay.request.kind = claim.kind.as_str(),
+                    relay.request.kind = claim.kind_payload.kind().as_str(),
                     relay.send_message.calls = reply.send_message_calls(),
                     "worker.background.ok",
                 );
             }
             Ok(Err(e)) => {
-                warn!(error = %e, relay.request.kind = claim.kind.as_str(), "worker.background.error");
+                warn!(error = %e, relay.request.kind = claim.kind_payload.kind().as_str(), "worker.background.error");
                 self.finalise(receipt, FailureReason::Provider(e.to_string()))
                     .await;
             }
             Err(_elapsed) => {
-                warn!(relay.session.id = %claim.session, relay.request.kind = claim.kind.as_str(), "worker.background.timeout");
+                warn!(relay.session.id = %claim.session, relay.request.kind = claim.kind_payload.kind().as_str(), "worker.background.timeout");
                 self.finalise(receipt, FailureReason::Timeout).await;
             }
         }
@@ -597,7 +596,6 @@ impl Worker {
                     session,
                     viewer,
                     request_id,
-                    RequestKind::Normal,
                     RequestKindPayload::Normal {},
                     cancel,
                     Some(observer),
@@ -612,7 +610,6 @@ impl Worker {
                     viewer,
                     prompts,
                     request_id,
-                    RequestKind::Normal,
                     RequestKindPayload::Normal {},
                     cancel,
                     Some(observer),

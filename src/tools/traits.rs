@@ -45,9 +45,9 @@ pub enum ToolError {
 
 /// Per-call context passed to tools that need to know who's calling them.
 ///
-/// Threaded by the agent loop into [`Tool::execute_with_ctx`]. Most tools
-/// (`web_fetch`, `web_search`, MCP tools) ignore it and fall through to
-/// [`Tool::execute`]. System tools (`send_message`, `get_session`) consume it.
+/// Threaded by the agent loop into [`Tool::execute`]. Most tools
+/// (`web_fetch`, `web_search`, MCP tools) ignore it; system tools
+/// (`send_message`, `get_session`, memory tools) consume it.
 #[derive(Debug, Clone)]
 pub struct ToolCallContext {
     /// The session that produced this tool call.
@@ -96,18 +96,10 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     /// agent does not re-allocate it every turn.
     fn input_schema(&self) -> Arc<Value>;
 
-    async fn execute(&self, input: Value) -> Result<String, ToolError>;
-
-    /// Context-aware variant. Default falls through to `execute` so existing
-    /// tools (web_fetch, web_search, MCP wrappers) need no change. System
-    /// tools — `send_message`, `get_session` — override to consume `ctx`.
-    async fn execute_with_ctx(
-        &self,
-        input: Value,
-        _ctx: &ToolCallContext,
-    ) -> Result<String, ToolError> {
-        self.execute(input).await
-    }
+    /// Invoke the tool. Stateless tools (`web_fetch`, `web_search`, MCP
+    /// wrappers) ignore `ctx`; system tools (`send_message`, `get_session`,
+    /// memory tools) consume it for authorship, scoping, and per-turn caps.
+    async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError>;
 
     /// Modes (request kinds) this tool participates in. Defaults to
     /// every mode — opt out only when a tool is genuinely meaningless

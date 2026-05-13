@@ -154,7 +154,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::tools::traits::{Tool, ToolError};
+    use crate::tools::traits::{Tool, ToolCallContext, ToolError};
 
     #[derive(Debug)]
     struct FakeTool {
@@ -189,7 +189,11 @@ mod tests {
         fn input_schema(&self) -> Arc<Value> {
             self.schema.clone()
         }
-        async fn execute(&self, _input: Value) -> Result<String, ToolError> {
+        async fn execute(
+            &self,
+            _input: Value,
+            _ctx: &ToolCallContext,
+        ) -> Result<String, ToolError> {
             Ok("ok".into())
         }
         fn modes(&self) -> RequestKindModes {

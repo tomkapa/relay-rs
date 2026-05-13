@@ -36,9 +36,7 @@ use tracing::{debug, info, warn};
 
 use crate::agents::AgentId;
 use crate::clock::SharedClock;
-use crate::runtime::{
-    IdempotencyKey, NewPromptRequest, RequestKind, RequestKindPayload, SharedPromptQueue,
-};
+use crate::runtime::{IdempotencyKey, NewPromptRequest, RequestKindPayload, SharedPromptQueue};
 use crate::tools::truncate_from_start;
 use crate::types::{PROMPT_MAX_BYTES, Participant, Prompt};
 
@@ -332,7 +330,6 @@ impl SchedulerInner {
                 parent_session: None,
                 content,
                 idempotency_key: key,
-                kind: RequestKind::Resolution,
                 kind_payload: RequestKindPayload::Resolution {
                     contradiction_event_id: ev.id,
                 },

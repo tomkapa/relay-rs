@@ -1,0 +1,76 @@
+meta {
+  name: POST /agents/{id}/memory — operator note (manager_note)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/agents/{{created_agent_id}}/memory
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "kind": "self",
+    "content": "You default to terse replies unless the human asks for more depth.",
+    "state": "validated",
+    "pinned": false
+  }
+}
+
+docs {
+  Operator-authored memory write (doc/memory.md §1.9). Lands in the same
+  journal as agent-driven `memory_write` calls but with
+  `MutationSource::Operator`, which:
+
+   - bypasses the pinned-immunity check (operators can update pinned
+     rows; agents can't), and
+   - fires a `validation_events` row when `state` is `validated` or
+     `core` — operator endorsement is one of the two independent
+     validation signals (§1.7), so `last_validated_at` advances.
+
+  Body fields:
+   - `kind` — one of `self` | `other` | `procedure` | `open`.
+   - `content` — the memory body. One or two sentences; capped at
+     `MEMORY_CONTENT_MAX_BYTES` (4096).
+   - `state` (optional) — defaults to `held`. Set `validated` or `core`
+     for an immediately-trusted note. `tentative` is unusual for an
+     operator path but accepted.
+   - `pinned` (optional, default `false`) — when `true`, the row is
+     immutable to the agent. Operators can still update/unpin via the
+     pin/unpin endpoints.
+
+  Returns 201 with the freshly-materialised row. The post-response
+  script stashes `memory_id` so the pin / unpin / revert requests below
+  can pick it up. Re-running this request creates a new row each click —
+  the operator surface has no idempotency key.
+}
+
+script:post-response {
+  const json = res.getBody();
+  if (json && json.id) {
+    bru.setVar("memory_id", json.id);
+  }
+}
+
+tests {
+  test("201 Created", function() {
+    expect(res.status).to.equal(201);
+  });
+
+  test("row shape", function() {
+    const json = res.getBody();
+    expect(json.id).to.be.a("string");
+    expect(json.agent_id).to.be.a("string");
+    expect(json.kind).to.equal("self");
+    expect(json.state).to.be.oneOf(["core", "validated", "held", "tentative"]);
+    expect(json.pinned).to.be.a("boolean");
+    expect(json.content).to.be.a("string");
+  });
+}
