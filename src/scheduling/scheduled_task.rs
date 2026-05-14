@@ -1,8 +1,18 @@
-//! Shared background-task scaffolding for the memory schedulers.
+// Lint conflict: `unreachable_pub` and `clippy::redundant_pub_crate` are
+// mutually exclusive for cross-module-reused items inside a `pub(crate)`
+// module. The struct is `pub(crate)` because the memory subsystem
+// (`memory::reflection_scheduler` / `memory::librarian`) reuses it; that
+// makes `pub` "unreachable" outside the crate but `redundant_pub_crate`
+// considers `pub(crate)` redundant inside a non-`pub` module. Choose
+// the lint that better describes intent and silence the other.
+#![allow(clippy::redundant_pub_crate)]
+
+//! Shared background-task scaffolding for the schedulers in this crate.
 //!
-//! Both [`ReflectionScheduler`](super::reflection_scheduler::ReflectionScheduler)
-//! and [`LibrarianScheduler`](super::librarian::LibrarianScheduler) follow
-//! the same shape: a spawned tokio task that ticks on a fixed cadence,
+//! [`ReflectionScheduler`](crate::memory::ReflectionScheduler),
+//! [`LibrarianScheduler`](crate::memory::LibrarianScheduler), and
+//! [`ScheduledTaskScheduler`](super::scheduler::ScheduledTaskScheduler) all
+//! follow the same shape: a spawned tokio task that ticks on a fixed cadence,
 //! exits on parent-token or owned-`DropGuard` cancellation, and forwards
 //! every tick error to a `tracing::warn!`. [`ScheduledTask`] owns that
 //! wiring; each scheduler reduces to one `tick()` closure and an event
@@ -21,7 +31,7 @@ use tracing::warn;
 /// Two cancellation paths fire together: the owned [`DropGuard`] cancels
 /// an internal child token on drop / explicit [`Self::shutdown`], and the
 /// optional parent token wires the loop into a process-wide Ctrl+C.
-pub(super) struct ScheduledTask {
+pub(crate) struct ScheduledTask {
     shutdown: DropGuard,
     handle: JoinHandle<()>,
     label: &'static str,
@@ -39,7 +49,7 @@ impl ScheduledTask {
     /// Spawn `tick` to run every `interval`. `label` rides on the
     /// per-iteration warn log (`{label}.tick.error`) so a wedged scheduler
     /// is identifiable in tracing.
-    pub(super) fn spawn<F, Fut, E>(
+    pub(crate) fn spawn<F, Fut, E>(
         label: &'static str,
         interval: Duration,
         parent: Option<CancellationToken>,
@@ -73,7 +83,7 @@ impl ScheduledTask {
     }
 
     /// Cancel and join. Idempotent.
-    pub(super) async fn shutdown(self) {
+    pub(crate) async fn shutdown(self) {
         drop(self.shutdown);
         if let Err(e) = self.handle.await {
             warn!(error = %e, scheduler = self.label, "scheduled_task.join.error");

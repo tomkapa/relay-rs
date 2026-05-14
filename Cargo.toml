@@ -26,6 +26,13 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 # time::OffsetDateTime). We prefer chrono because the CLAUDE.md §11 sample names it
 # directly; rolling our own date crate is firmly over the 200-LOC bar. Owner: storage/.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# §8 (zero-dep bias): IANA timezone + DST handling for the scheduled_tasks
+# subsystem. chrono alone only knows UTC and fixed offsets, so "every 5am
+# Bangkok" with DST is not representable. chrono-tz embeds tzdata (~70KB), the
+# only practical Rust impl; rolling our own tzdata parser is well over 200
+# LOC and a known footgun. de-facto choice, lockstep-pinned with chrono.
+# Owner: scheduling/.
+chrono-tz = { version = "0.10", default-features = false, features = ["serde"] }
 claudius = { version = "0.25", default-features = false, features = ["rustls-tls"] }
 config = { version = "0.15", default-features = false }
 dotenvy = "0.15"

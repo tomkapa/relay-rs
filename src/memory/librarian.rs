@@ -40,12 +40,13 @@ use crate::runtime::{IdempotencyKey, NewPromptRequest, RequestKindPayload, Share
 use crate::tools::truncate_from_start;
 use crate::types::{PROMPT_MAX_BYTES, Participant, Prompt};
 
+use crate::scheduling::ScheduledTask;
+
 use super::limits::{
     CONTRADICTION_SIMILARITY_THRESHOLD, DEDUP_SIMILARITY_THRESHOLD, LIBRARIAN_BATCH_LIMIT,
     LIBRARIAN_POLL_SECS, MATURATION_WINDOW, MAX_MEMORIES_PER_AGENT, MAX_SIMILAR_PAIRS_PER_AGENT,
     VALIDATION_DECAY,
 };
-use super::scheduled_task::ScheduledTask;
 use super::store::{
     ContradictionEventRow, MemoryMutation, MemoryRow, MutationSource, PairCandidate,
     SharedMemoryStore,

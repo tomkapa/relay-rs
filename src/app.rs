@@ -40,10 +40,16 @@ use crate::runtime::{
     SharedPromptQueue, SharedResponseSink, SharedResponseSource, SharedThreadStream, WorkerConfig,
     WorkerPool, WorkerPoolHandle,
 };
+use crate::scheduling::{
+    DefaultTimezone, PgScheduledTaskStore, ScheduledTaskScheduler, SharedScheduledTaskStore,
+    Timezone,
+};
 use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::system::{
-    GetSessionTool, MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool,
-    MemoryWriteTool, RecallTool, SendMessageTool, WebFetchTool, WebSearchTool,
+    CancelScheduledTaskTool, GetSessionTool, ListScheduledTasksTool, MemoryForgetTool,
+    MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool, RecallTool,
+    SCHEDULING_CORE_PROMPT_SUPPLEMENT, ScheduleTaskTool, SendMessageTool, WebFetchTool,
+    WebSearchTool,
 };
 use crate::tools::{ToolBox, ToolRegistry};
 
@@ -198,6 +204,7 @@ pub struct Server {
     pub mcp_refresher: McpRefresher,
     pub reflection_scheduler: ReflectionScheduler,
     pub librarian_scheduler: LibrarianScheduler,
+    pub scheduling_scheduler: ScheduledTaskScheduler,
     pub http_addr: SocketAddr,
 }
 
@@ -219,6 +226,7 @@ struct Collaborators {
     responses: SharedResponseSource,
     mcp_store: SharedMcpServerStore,
     mcp_registry: Arc<McpRegistry>,
+    scheduled_tasks: SharedScheduledTaskStore,
 }
 
 impl Collaborators {
@@ -268,8 +276,9 @@ impl Collaborators {
             embedding_provider.clone(),
             session_memory_cache.clone(),
         );
+        let normal_core = format!("{CORE_SYSTEM_PROMPT}{SCHEDULING_CORE_PROMPT_SUPPLEMENT}");
         let cores = ModeCores {
-            normal: Arc::from(CORE_SYSTEM_PROMPT),
+            normal: Arc::<str>::from(normal_core),
             reflection: Arc::from(REFLECTION_CORE_PROMPT),
             resolution: Arc::from(RESOLUTION_CORE_PROMPT),
         };
@@ -283,6 +292,11 @@ impl Collaborators {
         let mcp_store: SharedMcpServerStore =
             Arc::new(PgMcpServerStore::new(pool.clone(), clock.clone()));
         let mcp_registry = McpRegistry::new(mcp_store.clone(), clock.clone());
+
+        let scheduled_tasks: SharedScheduledTaskStore =
+            Arc::new(PgScheduledTaskStore::new(pool.clone(), clock.clone()));
+        let default_tz =
+            DefaultTimezone::from_timezone(Timezone::from_tz(settings.default_timezone));
 
         // Queue, DAG budget, and response hub are built here so the
         // `send_message` system tool can hold them without a later
@@ -310,26 +324,20 @@ impl Collaborators {
         // `ToolCallContext::resolution_target`); the no-action close runs
         // post-turn in the worker.
         let memory_tools = MemoryToolDeps::new(memory_loader);
-        let builtin_tools = ToolRegistry::builder()
-            .with(Arc::new(WebFetchTool::new()?))
-            .with(Arc::new(WebSearchTool::new(
-                http,
-                settings.brave_search_api_key.clone(),
-            )))
-            .with(Arc::new(SendMessageTool::new(
-                sessions.clone(),
-                queue.clone(),
-                dag.clone(),
-                agents.clone(),
-                sink.clone(),
-            )))
-            .with(Arc::new(GetSessionTool::new(sessions.clone())))
-            .with(Arc::new(MemoryWriteTool::new(memory_tools.clone())))
-            .with(Arc::new(MemoryUpdateTool::new(memory_tools.clone())))
-            .with(Arc::new(MemoryForgetTool::new(memory_tools.clone())))
-            .with(Arc::new(MemoryValidateTool::new(memory_tools.clone())))
-            .with(Arc::new(RecallTool::new(memory_tools, embedding_provider)))
-            .build();
+        let builtin_tools = build_builtin_tools(BuiltinToolDeps {
+            http,
+            settings,
+            sessions: sessions.clone(),
+            queue: queue.clone(),
+            dag: dag.clone(),
+            agents: agents.clone(),
+            sink: sink.clone(),
+            memory_tools,
+            embedding_provider,
+            scheduled_tasks: scheduled_tasks.clone(),
+            default_tz,
+            clock: clock.clone(),
+        })?;
 
         // `memory_store` and `session_memory_cache` are not held on
         // `Collaborators`: they're cheap-clone handles already
@@ -352,12 +360,69 @@ impl Collaborators {
             responses,
             mcp_store,
             mcp_registry,
+            scheduled_tasks,
         })
     }
 
     fn toolbox(&self) -> ToolBox {
         ToolBox::new(self.builtin_tools.clone(), self.mcp_registry.clone())
     }
+}
+
+/// Aggregated handles passed to [`build_builtin_tools`]. Keeps the
+/// `Collaborators::new` body under the §4 line cap by lifting tool
+/// registration into its own function.
+struct BuiltinToolDeps<'a> {
+    http: Client,
+    settings: &'a Settings,
+    sessions: SharedSessionStore,
+    queue: SharedPromptQueue,
+    dag: SharedDagBudget,
+    agents: SharedAgentStore,
+    sink: SharedResponseSink,
+    memory_tools: MemoryToolDeps,
+    embedding_provider: SharedEmbeddingProvider,
+    scheduled_tasks: SharedScheduledTaskStore,
+    default_tz: DefaultTimezone,
+    clock: SharedClock,
+}
+
+/// Register every system tool into a [`ToolRegistry`]. Lives at the
+/// composition root so adding a tool is one new file in `tools/system/`
+/// + one `.with(...)` line here.
+fn build_builtin_tools(deps: BuiltinToolDeps<'_>) -> Result<ToolRegistry, AppError> {
+    Ok(ToolRegistry::builder()
+        .with(Arc::new(WebFetchTool::new()?))
+        .with(Arc::new(WebSearchTool::new(
+            deps.http,
+            deps.settings.brave_search_api_key.clone(),
+        )))
+        .with(Arc::new(SendMessageTool::new(
+            deps.sessions.clone(),
+            deps.queue.clone(),
+            deps.dag.clone(),
+            deps.agents.clone(),
+            deps.sink.clone(),
+        )))
+        .with(Arc::new(GetSessionTool::new(deps.sessions.clone())))
+        .with(Arc::new(MemoryWriteTool::new(deps.memory_tools.clone())))
+        .with(Arc::new(MemoryUpdateTool::new(deps.memory_tools.clone())))
+        .with(Arc::new(MemoryForgetTool::new(deps.memory_tools.clone())))
+        .with(Arc::new(MemoryValidateTool::new(deps.memory_tools.clone())))
+        .with(Arc::new(RecallTool::new(
+            deps.memory_tools,
+            deps.embedding_provider,
+        )))
+        .with(Arc::new(ScheduleTaskTool::new(
+            deps.scheduled_tasks.clone(),
+            deps.default_tz,
+            deps.clock,
+        )))
+        .with(Arc::new(ListScheduledTasksTool::new(
+            deps.scheduled_tasks.clone(),
+        )))
+        .with(Arc::new(CancelScheduledTaskTool::new(deps.scheduled_tasks)))
+        .build())
 }
 
 fn default_agent_seed() -> Result<DefaultAgentSeed, AppError> {
@@ -447,6 +512,16 @@ pub async fn build_server(
         cancel.clone(),
     );
 
+    // Scheduling — agent-driven scheduled tasks. Polls the
+    // `scheduled_tasks` table on a fixed cadence and enqueues a
+    // `prompt_requests` row for each due fire.
+    let scheduling_scheduler = ScheduledTaskScheduler::spawn(
+        pieces.scheduled_tasks.clone(),
+        pieces.queue.clone(),
+        pieces.clock.clone(),
+        cancel.clone(),
+    );
+
     // Single-process fan-in subscriber for the chat-UI thread stream. Owns
     // its own LISTEN connection on the shared pool; tied to the same cancel
     // token so a top-level shutdown winds the listener task down with the
@@ -476,6 +551,7 @@ pub async fn build_server(
         mcp_refresher,
         reflection_scheduler,
         librarian_scheduler,
+        scheduling_scheduler,
         http_addr: settings.http_addr,
     })
 }
@@ -490,6 +566,7 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
         mcp_refresher,
         reflection_scheduler,
         librarian_scheduler,
+        scheduling_scheduler,
         http_addr,
     } = server;
     let app = router(state);
@@ -512,6 +589,8 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
     info!("reflection_scheduler.shutdown.complete");
     librarian_scheduler.shutdown().await;
     info!("librarian_scheduler.shutdown.complete");
+    scheduling_scheduler.shutdown().await;
+    info!("scheduling_scheduler.shutdown.complete");
     mcp_refresher.shutdown().await;
     info!("mcp.refresher.shutdown.complete");
     workers.shutdown().await;

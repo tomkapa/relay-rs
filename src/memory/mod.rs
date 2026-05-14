@@ -21,7 +21,6 @@ mod limits;
 mod loader;
 mod pg_store;
 mod reflection_scheduler;
-mod scheduled_task;
 mod session_cache;
 mod r#static;
 mod store;

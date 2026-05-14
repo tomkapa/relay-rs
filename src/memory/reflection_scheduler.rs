@@ -32,10 +32,11 @@ use crate::session::SessionId;
 use crate::tools::truncate_from_start;
 use crate::types::{Participant, Prompt};
 
+use crate::scheduling::ScheduledTask;
+
 use super::limits::{
     REFLECTION_IDLE_TIMEOUT_SECS, REFLECTION_SCHEDULER_BATCH_LIMIT, REFLECTION_SCHEDULER_POLL_SECS,
 };
-use super::scheduled_task::ScheduledTask;
 
 #[derive(Debug)]
 pub struct ReflectionScheduler {

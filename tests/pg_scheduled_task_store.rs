@@ -1,0 +1,388 @@
+//! Trait-contract tests for [`relay_rs::scheduling::PgScheduledTaskStore`]:
+//! create + list round-trip, ownership-checked cancel, claim_due filter
+//! ordering, record_fired state advancement, and per-owner cap counting.
+//!
+//! Each test uses a fresh schema; tests use `SystemClock` since none of
+//! these operations are time-sensitive (the scheduler-end-to-end test in
+//! `scheduling_pipeline.rs` exercises the wall-clock path).
+
+#![allow(clippy::expect_used)]
+
+use std::sync::Arc;
+
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+use chrono_tz::Asia::Bangkok;
+use relay_rs::agents::{AgentId, AgentName, AgentStore, AgentSystemPrompt, NewAgent, PgAgentStore};
+use relay_rs::clock::SystemClock;
+use relay_rs::runtime::PromptRequestId;
+use relay_rs::scheduling::{
+    NewScheduledTask, PgScheduledTaskStore, ScheduleSpec, ScheduledPrompt, ScheduledTaskError,
+    ScheduledTaskName, ScheduledTaskState, ScheduledTaskStore, TimeOfDay, Timezone, Weekday,
+    Weekdays,
+};
+
+mod common;
+use common::pg::TestDb;
+
+fn store(db: &TestDb) -> Arc<PgScheduledTaskStore> {
+    Arc::new(PgScheduledTaskStore::new(
+        db.pool.clone(),
+        SystemClock::shared(),
+    ))
+}
+
+async fn extra_agent(db: &TestDb, name: &str) -> AgentId {
+    let agents = PgAgentStore::new(db.pool.clone(), SystemClock::shared());
+    let payload = NewAgent {
+        name: AgentName::try_from(name).expect("valid name"),
+        system_prompt: AgentSystemPrompt::try_from("p").expect("valid prompt"),
+        is_default: false,
+    };
+    agents.create(payload).await.expect("create agent").id
+}
+
+fn once_at(year: i32, month: u32, day: u32, hour: u32) -> ScheduleSpec {
+    ScheduleSpec::Once {
+        run_at: Utc
+            .with_ymd_and_hms(year, month, day, hour, 0, 0)
+            .single()
+            .expect("unambiguous"),
+    }
+}
+
+fn recurring_workdays_05_bkk() -> ScheduleSpec {
+    ScheduleSpec::Recurring {
+        weekdays: Weekdays::WORKDAYS,
+        time: TimeOfDay::try_new(5, 0).expect("HH:MM"),
+        tz: Timezone::from_tz(Bangkok),
+    }
+}
+
+fn new_task(owner: AgentId, name: &str, schedule: ScheduleSpec) -> NewScheduledTask {
+    let next = schedule.next_after(Utc::now());
+    NewScheduledTask {
+        owner_agent_id: owner,
+        name: ScheduledTaskName::try_from(name).expect("valid name"),
+        prompt: ScheduledPrompt::try_from("Summarize new email since last check.")
+            .expect("valid prompt"),
+        schedule,
+        next_run_at: next,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_round_trips_once_schedule() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let payload = new_task(
+        db.default_agent_id,
+        "drafts due tomorrow",
+        once_at(2030, 1, 1, 9),
+    );
+    let row = store.create(payload).await.expect("create");
+
+    assert_eq!(row.owner_agent_id, db.default_agent_id);
+    assert_eq!(row.name.as_str(), "drafts due tomorrow");
+    assert_eq!(row.state, ScheduledTaskState::Active);
+    assert!(row.next_run_at.is_some(), "Once in future has next_run_at");
+    assert!(row.last_fired_at.is_none());
+    assert!(row.last_request_id.is_none());
+    match row.schedule {
+        ScheduleSpec::Once { run_at } => {
+            assert_eq!(run_at.timestamp(), 1_893_488_400); // 2030-01-01T09:00Z
+        }
+        ScheduleSpec::Recurring { .. } => panic!("expected Once, got Recurring"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_round_trips_recurring_schedule() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let payload = new_task(
+        db.default_agent_id,
+        "morning email",
+        recurring_workdays_05_bkk(),
+    );
+    let row = store.create(payload).await.expect("create");
+
+    match row.schedule {
+        ScheduleSpec::Recurring { weekdays, time, tz } => {
+            assert_eq!(weekdays.bits(), Weekdays::WORKDAYS.bits());
+            assert_eq!(time.hour(), 5);
+            assert_eq!(time.minute(), 0);
+            assert_eq!(tz.name(), "Asia/Bangkok");
+        }
+        ScheduleSpec::Once { .. } => panic!("expected Recurring, got Once"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_for_agent_returns_only_own_active_rows() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+    let other = extra_agent(&db, "other-agent").await;
+
+    // Two tasks for the default agent, one for the other agent.
+    let mine_a = store
+        .create(new_task(
+            db.default_agent_id,
+            "mine-a",
+            once_at(2030, 1, 1, 9),
+        ))
+        .await
+        .expect("ok")
+        .id;
+    let mine_b = store
+        .create(new_task(
+            db.default_agent_id,
+            "mine-b",
+            recurring_workdays_05_bkk(),
+        ))
+        .await
+        .expect("ok")
+        .id;
+    let _theirs = store
+        .create(new_task(other, "theirs", once_at(2030, 1, 1, 9)))
+        .await
+        .expect("ok")
+        .id;
+
+    let rows = store
+        .list_for_agent(db.default_agent_id)
+        .await
+        .expect("list");
+    let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(rows.len(), 2);
+    assert!(ids.contains(&mine_a));
+    assert!(ids.contains(&mine_b));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_excludes_cancelled_rows() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let kept = store
+        .create(new_task(
+            db.default_agent_id,
+            "kept",
+            once_at(2030, 1, 1, 9),
+        ))
+        .await
+        .expect("ok")
+        .id;
+    let dropped = store
+        .create(new_task(
+            db.default_agent_id,
+            "drop",
+            once_at(2030, 1, 1, 9),
+        ))
+        .await
+        .expect("ok")
+        .id;
+
+    store
+        .cancel(dropped, db.default_agent_id)
+        .await
+        .expect("cancel");
+
+    let rows = store
+        .list_for_agent(db.default_agent_id)
+        .await
+        .expect("list");
+    let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![kept]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_rejects_cross_owner() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+    let other = extra_agent(&db, "intruder").await;
+
+    let task = store
+        .create(new_task(db.default_agent_id, "t", once_at(2030, 1, 1, 9)))
+        .await
+        .expect("ok")
+        .id;
+
+    // Cross-owner attempts fold into NotFound so the tool seam cannot
+    // be used to probe for other agents' rows.
+    let err = store.cancel(task, other).await.expect_err("not owner");
+    assert!(matches!(err, ScheduledTaskError::NotFound(_)));
+
+    // Original row still active — the failed cancel must not have flipped state.
+    let rows = store
+        .list_for_agent(db.default_agent_id)
+        .await
+        .expect("list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, ScheduledTaskState::Active);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_returns_not_found_for_missing_id() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let phantom = relay_rs::scheduling::ScheduledTaskId::new();
+    let err = store
+        .cancel(phantom, db.default_agent_id)
+        .await
+        .expect_err("missing");
+    assert!(matches!(err, ScheduledTaskError::NotFound(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_is_idempotent_on_already_cancelled() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let id = store
+        .create(new_task(db.default_agent_id, "t", once_at(2030, 1, 1, 9)))
+        .await
+        .expect("ok")
+        .id;
+    store.cancel(id, db.default_agent_id).await.expect("first");
+    // Second call against an already-cancelled row is a no-op (Ok).
+    store.cancel(id, db.default_agent_id).await.expect("second");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_due_returns_only_due_active_rows_in_order() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let now = Utc::now();
+    let earliest_due = now - ChronoDuration::seconds(120);
+    let later_due = now - ChronoDuration::seconds(30);
+    let future = now + ChronoDuration::days(7);
+
+    // Three rows: earliest due, later due, far-future (not due).
+    let early = insert_with_next_run(&store, db.default_agent_id, "early", earliest_due).await;
+    let later = insert_with_next_run(&store, db.default_agent_id, "later", later_due).await;
+    let _far = insert_with_next_run(&store, db.default_agent_id, "far", future).await;
+
+    // Cancelled row that is "due" — must be excluded.
+    let cancelled = insert_with_next_run(&store, db.default_agent_id, "cxl", earliest_due).await;
+    store
+        .cancel(cancelled, db.default_agent_id)
+        .await
+        .expect("cancel");
+
+    let claimed = store.claim_due(now, 10).await.expect("claim");
+    let ids: Vec<_> = claimed.iter().map(|r| r.id).collect();
+    assert_eq!(ids, vec![early, later]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_due_respects_limit() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let now = Utc::now();
+    let due = now - ChronoDuration::seconds(60);
+    for i in 0..5 {
+        insert_with_next_run(&store, db.default_agent_id, &format!("t-{i}"), due).await;
+    }
+
+    let claimed = store.claim_due(now, 2).await.expect("claim");
+    assert_eq!(claimed.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn record_fired_advances_when_next_is_some() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let now = Utc::now();
+    let id = insert_with_next_run(
+        &store,
+        db.default_agent_id,
+        "advance",
+        now - ChronoDuration::seconds(10),
+    )
+    .await;
+    let request_id = PromptRequestId::new();
+    let next = now + ChronoDuration::days(1);
+
+    store
+        .record_fired(id, request_id, now, Some(next))
+        .await
+        .expect("record_fired");
+
+    let row = store
+        .list_for_agent(db.default_agent_id)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|r| r.id == id)
+        .expect("present");
+    assert_eq!(row.state, ScheduledTaskState::Active);
+    assert_eq!(row.last_request_id, Some(request_id));
+    assert!(row.last_fired_at.is_some());
+    assert_eq!(
+        row.next_run_at.map(|t| t.timestamp()),
+        Some(next.timestamp())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn record_fired_marks_done_when_next_is_none() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let now = Utc::now();
+    let id = insert_with_next_run(
+        &store,
+        db.default_agent_id,
+        "exhausted",
+        now - ChronoDuration::seconds(10),
+    )
+    .await;
+    let request_id = PromptRequestId::new();
+
+    store
+        .record_fired(id, request_id, now, None)
+        .await
+        .expect("record_fired");
+
+    // list_for_agent filters to active rows only — Done row must not appear.
+    let rows = store
+        .list_for_agent(db.default_agent_id)
+        .await
+        .expect("list");
+    assert!(rows.iter().all(|r| r.id != id));
+
+    // And the row must not be claimable any more.
+    let later = now + ChronoDuration::days(365);
+    let claimed = store.claim_due(later, 100).await.expect("claim");
+    assert!(claimed.iter().all(|r| r.id != id));
+}
+
+/// Insert a task with an explicit `next_run_at` so claim_due / record_fired
+/// tests don't rely on `ScheduleSpec::next_after`'s wall-clock.
+async fn insert_with_next_run(
+    store: &Arc<PgScheduledTaskStore>,
+    owner: AgentId,
+    name: &str,
+    next_run_at: chrono::DateTime<Utc>,
+) -> relay_rs::scheduling::ScheduledTaskId {
+    let payload = NewScheduledTask {
+        owner_agent_id: owner,
+        name: ScheduledTaskName::try_from(name).expect("valid"),
+        prompt: ScheduledPrompt::try_from("body").expect("valid"),
+        // Recurring with a single weekday so the row is reusable across fires
+        // — content of `schedule` doesn't drive these tests.
+        schedule: ScheduleSpec::Recurring {
+            weekdays: Weekdays::try_from_iter([Weekday::Mon]).expect("non-empty"),
+            time: TimeOfDay::try_new(5, 0).expect("HH:MM"),
+            tz: Timezone::from_tz(Bangkok),
+        },
+        next_run_at: Some(next_run_at),
+    };
+    store.create(payload).await.expect("create").id
+}

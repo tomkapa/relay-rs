@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 
+use chrono_tz::Tz;
 use config::{Config, ConfigError, Environment};
 use serde::Deserialize;
 use thiserror::Error;
@@ -21,6 +23,9 @@ pub enum SettingsError {
 
     #[error("embedding configuration missing; set EMBEDDING_API_KEY and EMBEDDING_MODEL")]
     MissingEmbedding,
+
+    #[error("default timezone {raw:?} is not a valid IANA name")]
+    InvalidDefaultTimezone { raw: String },
 }
 
 /// Process-wide configuration loaded once at startup. Secrets are wrapped in
@@ -40,6 +45,11 @@ pub struct Settings {
     /// refuses to start without one. Decoupled from the chat provider so
     /// chat and embeddings can point at different vendors.
     pub embedding: EmbeddingSettings,
+    /// Process-wide fallback IANA timezone applied when an agent calls
+    /// `schedule_task` without specifying `tz`. Future: per-organisation
+    /// override loaded by id; until then the resolver hands every caller
+    /// this same value.
+    pub default_timezone: Tz,
 }
 
 /// Embedding-provider settings — `EMBEDDING_API_KEY` /
@@ -111,6 +121,13 @@ struct RawSettings {
     embedding_model: Option<String>,
     #[serde(default)]
     embedding_dimensions: Option<usize>,
+
+    #[serde(default = "default_timezone_raw")]
+    default_timezone: String,
+}
+
+fn default_timezone_raw() -> String {
+    "UTC".to_string()
 }
 
 fn default_model() -> ModelId {
@@ -155,6 +172,11 @@ impl TryFrom<RawSettings> for Settings {
             },
             _ => return Err(SettingsError::MissingEmbedding),
         };
+        let default_timezone = Tz::from_str(&raw.default_timezone).map_err(|_| {
+            SettingsError::InvalidDefaultTimezone {
+                raw: raw.default_timezone.clone(),
+            }
+        })?;
         Ok(Self {
             provider,
             brave_search_api_key: raw.brave_search_api_key,
@@ -162,6 +184,7 @@ impl TryFrom<RawSettings> for Settings {
             http_addr: raw.http_addr,
             database_url: raw.database_url,
             embedding,
+            default_timezone,
         })
     }
 }
@@ -209,6 +232,7 @@ mod tests {
             embedding_base_url: None,
             embedding_model: Some("text-embedding-3-small".to_string()),
             embedding_dimensions: None,
+            default_timezone: default_timezone_raw(),
         }
     }
 
@@ -246,6 +270,32 @@ mod tests {
         raw.anthropic_api_key = Some(secret("sk-ant"));
         let s = Settings::try_from(raw).expect("valid");
         assert_eq!(s.provider.name(), "anthropic");
+    }
+
+    #[test]
+    fn invalid_default_timezone_is_rejected() {
+        let mut raw = empty_raw();
+        raw.openai_api_key = Some(secret("sk-x"));
+        raw.default_timezone = "Mars/Olympus_Mons".to_string();
+        let err = Settings::try_from(raw).expect_err("expected error");
+        assert!(matches!(err, SettingsError::InvalidDefaultTimezone { .. }));
+    }
+
+    #[test]
+    fn default_timezone_defaults_to_utc() {
+        let mut raw = empty_raw();
+        raw.openai_api_key = Some(secret("sk-x"));
+        let s = Settings::try_from(raw).expect("valid");
+        assert_eq!(s.default_timezone, Tz::UTC);
+    }
+
+    #[test]
+    fn default_timezone_parses_iana_name() {
+        let mut raw = empty_raw();
+        raw.openai_api_key = Some(secret("sk-x"));
+        raw.default_timezone = "Asia/Bangkok".to_string();
+        let s = Settings::try_from(raw).expect("valid");
+        assert_eq!(s.default_timezone, chrono_tz::Asia::Bangkok);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod memory;
 pub mod observability;
 pub mod provider;
 pub mod runtime;
+pub mod scheduling;
 pub mod session;
 pub mod tools;
 pub mod types;
