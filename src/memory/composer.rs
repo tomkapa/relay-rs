@@ -208,10 +208,16 @@ fn bind_reserved_handles(reserved: &[MemoryId]) -> (HashMap<MemoryHandle, Memory
 }
 
 fn render_text(by_kind: &HashMap<MemoryKind, Vec<(MemoryHandle, &MemoryRow)>>) -> String {
-    let estimated = STABLE_LAYER_MAX_BYTES + CONTEXTUAL_LAYER_MAX_BYTES + 64;
+    let estimated = STABLE_LAYER_MAX_BYTES + CONTEXTUAL_LAYER_MAX_BYTES + 256;
     let mut buf = String::with_capacity(estimated);
     buf.push_str(MEMORY_TAG_OPEN);
     buf.push_str("## Memory\n");
+    buf.push_str(
+        "Facts you previously remembered. Each entry has an `M-NN` handle — \
+        pass it to `memory_update`, `memory_forget`, or `memory_validate` to \
+        revise the entry. Use `recall` to search for memories not listed \
+        below.\n",
+    );
 
     for kind in KIND_ORDER {
         let Some(entries) = by_kind.get(kind) else {
