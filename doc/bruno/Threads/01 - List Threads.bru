@@ -1,0 +1,66 @@
+meta {
+  name: GET /threads — channel feed
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/threads?limit=50
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+params:query {
+  limit: 50
+  ~before: 2030-01-01T00:00:00Z
+}
+
+docs {
+  Channel-feed view: one row per human-rooted DAG (i.e. each row in
+  `prompt_requests` where `id == root_request_id` and
+  `sender_kind = 'human'`). Each row carries:
+
+  - `root_request_id` / `root_session_id`
+  - `first_agent: { id, name }` — the receiver agent on the root prompt
+  - `preview` — first 280 characters of the human prompt content
+  - `reply_count` — number of `session_messages` rows across every
+    session in the DAG
+  - `last_activity_at` — `MAX(prompt_requests.created_at,
+    MAX(session_messages.created_at))` over the DAG
+  - `status` / `created_at`
+
+  Sorted by `last_activity_at DESC`. Pagination:
+  - `limit=N` (default 50, cap 100)
+  - `before=<ISO8601>` returns only threads with
+    `last_activity_at < before`. Uncomment the `~before` query param to
+    activate it.
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("response is an array", function() {
+    const json = res.getBody();
+    expect(json).to.be.an("array");
+  });
+
+  test("rows carry the documented shape", function() {
+    const json = res.getBody();
+    if (json.length === 0) return; // empty DB is valid
+    const row = json[0];
+    expect(row.root_request_id).to.be.a("string");
+    expect(row.root_session_id).to.be.a("string");
+    expect(row.first_agent).to.be.an("object");
+    expect(row.first_agent.id).to.be.a("string");
+    expect(row.first_agent.name).to.be.a("string");
+    expect(row.preview).to.be.a("string");
+    expect(row.reply_count).to.be.a("number");
+    expect(row.status).to.be.oneOf(["pending", "processing", "done", "failed"]);
+  });
+}

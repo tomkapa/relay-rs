@@ -64,6 +64,7 @@ fn req(session: SessionId, agent_id: AgentId, content: &str, key: &str) -> NewPr
         parent_session: None,
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
+        kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }
 

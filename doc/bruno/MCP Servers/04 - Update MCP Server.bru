@@ -1,0 +1,33 @@
+meta {
+  name: PUT /mcp-servers/{id} — disable or replace config
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{base_url}}/mcp-servers/{{mcp_server_id}}
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "enabled": false
+  }
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("enabled flipped", function() {
+    const json = res.getBody();
+    expect(json.enabled).to.equal(false);
+  });
+}

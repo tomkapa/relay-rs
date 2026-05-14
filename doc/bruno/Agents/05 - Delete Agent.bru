@@ -1,0 +1,32 @@
+meta {
+  name: DELETE /agents/{id} — remove an agent
+  type: http
+  seq: 5
+}
+
+delete {
+  url: {{base_url}}/agents/{{created_agent_id}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+docs {
+  204 on success.
+
+  Refusal cases (both 409 Conflict):
+  - The agent is currently flagged `is_default = TRUE` — promote another row
+    first.
+  - The agent is referenced by at least one session row. The FK
+    `sessions.agent_id` is `ON DELETE RESTRICT` so session history is
+    preserved. Delete the dependent sessions first, or keep the agent.
+}
+
+tests {
+  test("204 No Content", function() {
+    expect(res.status).to.equal(204);
+  });
+}

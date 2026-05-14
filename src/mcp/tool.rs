@@ -13,7 +13,7 @@ use serde_json::Value;
 use tracing::instrument;
 
 use crate::mcp::error::McpError;
-use crate::tools::{Tool, ToolError, truncate_to_char_boundary};
+use crate::tools::{Tool, ToolCallContext, ToolError, truncate_to_char_boundary};
 use crate::types::ToolName;
 
 use super::client::McpClient;
@@ -71,7 +71,7 @@ impl Tool for McpTool {
     }
 
     #[instrument(name = "tool.mcp", skip_all, fields(relay.tool = %self.name))]
-    async fn execute(&self, input: Value) -> Result<String, ToolError> {
+    async fn execute(&self, input: Value, _ctx: &ToolCallContext) -> Result<String, ToolError> {
         match self.client.call_tool(&self.remote_name, input).await {
             Ok(result) => Ok(render_result(&result)),
             Err(McpError::CallTimeout) => Err(ToolError::Upstream {

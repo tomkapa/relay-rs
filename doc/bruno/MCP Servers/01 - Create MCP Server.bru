@@ -1,0 +1,47 @@
+meta {
+  name: POST /mcp-servers — register an MCP server
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/mcp-servers
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "alias": "every",
+    "description": "modelcontextprotocol/server-everything via mcp-proxy",
+    "enabled": true,
+    "config": {
+      "type": "http",
+      "url": "http://localhost:9000/mcp",
+      "headers": {}
+    }
+  }
+}
+
+script:post-response {
+  const json = res.getBody();
+  bru.setVar("mcp_server_id", json.id);
+}
+
+tests {
+  test("201 Created", function() {
+    expect(res.status).to.equal(201);
+  });
+
+  test("id present", function() {
+    const json = res.getBody();
+    expect(json.id).to.be.a("string");
+    expect(json.alias).to.equal("every");
+    expect(json.enabled).to.equal(true);
+  });
+}

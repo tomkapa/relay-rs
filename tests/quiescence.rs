@@ -36,6 +36,7 @@ async fn enqueue_root(
         content: Prompt::try_from("hi").expect("prompt"),
         idempotency_key: IdempotencyKey::try_from(format!("k-{}", uuid::Uuid::new_v4()))
             .expect("key"),
+        kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     })
     .await
     .expect("enqueue")
@@ -129,6 +130,7 @@ async fn second_pending_row_still_blocks_quiescence() {
         parent_session: None,
         content: Prompt::try_from("again").expect("prompt"),
         idempotency_key: IdempotencyKey::try_from("second").expect("key"),
+        kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     })
     .await
     .expect("second enqueue");

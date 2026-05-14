@@ -1,0 +1,17 @@
+meta {
+  name: POST /requests/{id}/cancel — request cancellation
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/requests/{{request_id}}/cancel
+  body: none
+  auth: none
+}
+
+tests {
+  test("204 No Content", function() {
+    expect(res.status).to.equal(204);
+  });
+}

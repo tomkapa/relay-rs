@@ -1,0 +1,79 @@
+meta {
+  name: GET /agents/{id}/memory/events — journal feed
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{base_url}}/agents/{{created_agent_id}}/memory/events
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+params:query {
+  ~source: turn
+  ~mutation: write
+}
+
+docs {
+  Append-only journal of every mutation against this agent's memory
+  (doc/memory.md §1.9). The materialized `memories` table is recomputed
+  from this feed — every write, update, forget, and operator action
+  shows up here, regardless of source.
+
+  Each row:
+  ```
+  {
+    "id": "<event uuid>",
+    "agent_id": "<uuid>",
+    "mutation": "write" | "update" | "forget",
+    "target_memory_id": "<uuid>",
+    "content_before": <string | null>,
+    "content_after":  <string | null>,
+    "source": "turn" | "operator" | "librarian",
+    "source_turn_id": <uuid | null>,
+    "created_at": "<iso8601>"
+  }
+  ```
+
+  Optional filters (uncomment the `~` params to activate):
+   - `?source=turn|operator|librarian` — agent-driven, operator audit,
+     or librarian mechanical sweep.
+   - `?mutation=write|update|forget` — narrow to a single mutation kind.
+
+  The post-response script saves the first event id as
+  `memory_event_id` so `06 - Revert Memory Event` can target it.
+}
+
+script:post-response {
+  const rows = res.getBody();
+  if (Array.isArray(rows) && rows.length > 0) {
+    bru.setVar("memory_event_id", rows[0].id);
+  }
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("response is an array", function() {
+    const json = res.getBody();
+    expect(json).to.be.an("array");
+  });
+
+  test("rows carry the documented shape (when present)", function() {
+    const json = res.getBody();
+    if (json.length === 0) return;
+    const row = json[0];
+    expect(row.id).to.be.a("string");
+    expect(row.mutation).to.be.oneOf(["write", "update", "forget"]);
+    expect(row.source).to.be.oneOf(["turn", "operator", "librarian"]);
+    expect(row.target_memory_id).to.be.a("string");
+    expect(row.created_at).to.be.a("string");
+  });
+}

@@ -18,6 +18,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
+use sqlx::PgPool;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -40,7 +42,7 @@ use super::queue::{
     ClaimReceipt, ClaimedSession, LeaseTiming, SharedLeaseManager, SharedPromptQueue,
 };
 use super::response::{ResponseChunk, SharedResponseSink};
-use super::types::{FailureReason, PromptRequestId, WorkerId};
+use super::types::{FailureReason, PromptRequestId, RequestKind, RequestKindPayload, WorkerId};
 
 /// System nudge appended to the receiver's history when the agent emitted a
 /// turn without calling `send_message`.
@@ -101,6 +103,15 @@ pub struct WorkerPool {
     agents: SharedAgents,
     sessions: SharedSessionStore,
     dag: SharedDagBudget,
+    /// Direct pool handle used by the reflection dispatch path
+    /// ([`Agent::reflect`] reads `session_messages` and writes to
+    /// `reflection_checkpoints`). The normal-turn path goes through the
+    /// trait surfaces and never touches this.
+    pool: PgPool,
+    /// Memory store handle. The resolution dispatch path uses it to close
+    /// no-action contradictions (the mutation path closes inline via the
+    /// memory tools).
+    memory_store: crate::memory::SharedMemoryStore,
     cfg: WorkerConfig,
 }
 
@@ -114,6 +125,8 @@ impl WorkerPool {
         agents: SharedAgents,
         sessions: SharedSessionStore,
         dag: SharedDagBudget,
+        pool: PgPool,
+        memory_store: crate::memory::SharedMemoryStore,
         cfg: WorkerConfig,
     ) -> Self {
         Self {
@@ -123,6 +136,8 @@ impl WorkerPool {
             agents,
             sessions,
             dag,
+            pool,
+            memory_store,
             cfg,
         }
     }
@@ -145,6 +160,8 @@ impl WorkerPool {
                 agents: self.agents.clone(),
                 sessions: self.sessions.clone(),
                 dag: self.dag.clone(),
+                pool: self.pool.clone(),
+                memory_store: self.memory_store.clone(),
                 cfg: cfg.clone(),
                 shutdown: shutdown.clone(),
             };
@@ -167,6 +184,8 @@ struct Worker {
     agents: SharedAgents,
     sessions: SharedSessionStore,
     dag: SharedDagBudget,
+    pool: PgPool,
+    memory_store: crate::memory::SharedMemoryStore,
     cfg: WorkerConfig,
     shutdown: CancellationToken,
 }
@@ -251,13 +270,28 @@ impl Worker {
 
         let heartbeat = self.spawn_heartbeat(receipt.clone());
         let cancel_watcher = self.spawn_cancel_watcher(receipt.clone(), cancel.clone());
-        let observer: SharedTurnObserver = Arc::new(FanOutObserver {
-            sink: self.sink.clone(),
-            receipt: receipt.clone(),
-        });
 
-        self.run_with_pingpong_guard(&agent, &claim, prompts, cancel.clone(), observer, &receipt)
-            .await;
+        match claim.kind_payload.kind() {
+            RequestKind::Normal => {
+                let observer: SharedTurnObserver = Arc::new(FanOutObserver {
+                    sink: self.sink.clone(),
+                    receipt: receipt.clone(),
+                });
+                self.run_with_pingpong_guard(
+                    &agent,
+                    &claim,
+                    prompts,
+                    cancel.clone(),
+                    observer,
+                    &receipt,
+                )
+                .await;
+            }
+            RequestKind::Reflection | RequestKind::Resolution => {
+                self.run_background_kind(&agent, &claim, prompts, cancel.clone(), &receipt)
+                    .await;
+            }
+        }
 
         cancel_watcher.abort();
         let _ = cancel_watcher.await;
@@ -267,6 +301,192 @@ impl Worker {
         if let Err(e) = self.leases.release(receipt.lease()).await {
             warn!(error = %e, "worker.lease.release.error");
         }
+    }
+
+    /// Background kind dispatch (Reflection / Resolution).
+    ///
+    /// Routes through the same `agent.reply` path as a normal turn —
+    /// differences: no observer (no SSE), no ping-pong guard (the model
+    /// is free to end without a `send_message` call), and a single
+    /// kind-specific post-turn step ([`Self::post_turn_for_kind`]) that
+    /// matches on `claim.kind_payload`. Persists every LLM call into
+    /// `session_messages` like normal turns so token-usage and
+    /// behavioural traces are captured uniformly.
+    async fn run_background_kind(
+        &self,
+        agent: &Agent,
+        claim: &ClaimedSession,
+        prompts: Vec<Prompt>,
+        cancel: CancellationToken,
+        receipt: &Arc<ClaimReceipt>,
+    ) {
+        let viewer = Participant::agent(claim.receiver_agent_id);
+        let request_id = claim
+            .prompts
+            .first()
+            .expect("invariant: claim drains at least one prompt")
+            .request_id;
+
+        let outcome = timeout(
+            self.cfg.max_turn_duration,
+            agent.reply(
+                claim.session,
+                viewer,
+                prompts,
+                request_id,
+                claim.kind_payload.clone(),
+                cancel,
+                None,
+            ),
+        )
+        .await;
+
+        match outcome {
+            Ok(Ok(reply)) => {
+                if let Err(e) = self.queue.mark_done(receipt).await {
+                    warn!(error = %e, "worker.background.mark_done.error");
+                }
+                self.post_turn_for_kind(claim, &reply).await;
+                info!(
+                    relay.session.id = %claim.session,
+                    relay.agent.id = %claim.receiver_agent_id,
+                    relay.request.kind = claim.kind_payload.kind().as_str(),
+                    relay.send_message.calls = reply.send_message_calls(),
+                    "worker.background.ok",
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, relay.request.kind = claim.kind_payload.kind().as_str(), "worker.background.error");
+                self.finalise(receipt, FailureReason::Provider(e.to_string()))
+                    .await;
+            }
+            Err(_elapsed) => {
+                warn!(relay.session.id = %claim.session, relay.request.kind = claim.kind_payload.kind().as_str(), "worker.background.timeout");
+                self.finalise(receipt, FailureReason::Timeout).await;
+            }
+        }
+    }
+
+    /// Single kind-specific post-turn dispatcher — every variant of
+    /// [`RequestKindPayload`] gets its branch here. The exhaustive match
+    /// makes "I forgot to handle the new kind" a compile error rather
+    /// than a runtime no-op. Best-effort: every branch logs and proceeds
+    /// rather than failing the request, since the turn itself already
+    /// succeeded.
+    async fn post_turn_for_kind(&self, claim: &ClaimedSession, reply: &AgentReply) {
+        match &claim.kind_payload {
+            RequestKindPayload::Normal {} => {
+                // Nothing to do post-turn for normal claims; the success
+                // path is just `mark_done` + DAG quiescence emission, both
+                // handled by `run_with_pingpong_guard`. This arm exists so
+                // the match stays exhaustive.
+            }
+            RequestKindPayload::Reflection {
+                session_id: conversation_session,
+                up_to_turn_id,
+            } => {
+                if let Err(e) = self
+                    .write_reflection_checkpoint(
+                        claim.receiver_agent_id,
+                        *conversation_session,
+                        *up_to_turn_id,
+                        claim.session,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "worker.reflect.checkpoint.error");
+                }
+            }
+            RequestKindPayload::Resolution {
+                contradiction_event_id,
+            } => {
+                self.close_no_action_if_unresolved(*contradiction_event_id, reply.final_text())
+                    .await;
+            }
+        }
+    }
+
+    /// If the resolution turn ended without a mutation tool closing the
+    /// contradiction, stamp the row as a no-action close with the
+    /// assistant's final text as the rationale. Best-effort — failure to
+    /// close logs and proceeds (the librarian re-enqueues unresolved rows
+    /// on the next sweep).
+    async fn close_no_action_if_unresolved(
+        &self,
+        target: crate::memory::ContradictionEventId,
+        final_text: &str,
+    ) {
+        match self.memory_store.read_contradiction(target).await {
+            Ok(Some(row)) if row.resolved_at.is_none() => {
+                // The mutation path didn't close it — model chose no-action
+                // implicitly. Truncate the final text to fit the column cap;
+                // empty replies use a sentinel so we never violate the
+                // 1..=N length invariant.
+                let mut reason_raw = final_text.trim().to_string();
+                if reason_raw.is_empty() {
+                    reason_raw = "no-action (empty reply)".to_string();
+                }
+                if reason_raw.len() > crate::memory::CONTRADICTION_REASON_MAX_BYTES {
+                    crate::tools::truncate_to_char_boundary(
+                        &mut reason_raw,
+                        crate::memory::CONTRADICTION_REASON_MAX_BYTES,
+                    );
+                }
+                let reason = crate::memory::ResolutionReason::try_from(reason_raw)
+                    .expect("invariant: 1..=cap enforced by trim+sentinel+truncate");
+                if let Err(e) = self
+                    .memory_store
+                    .resolve_contradiction(
+                        target,
+                        crate::memory::ResolutionOutcome::NoAction { reason },
+                    )
+                    .await
+                {
+                    warn!(error = %e, relay.contradiction.id = %target, "worker.resolution.close.error");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, relay.contradiction.id = %target, "worker.resolution.read.error");
+            }
+        }
+    }
+
+    /// Advance the checkpoint to `up_to_turn_id` (the slice the model saw)
+    /// and append the just-finished reflection session id to the audit
+    /// array. Using the payload cursor — not "latest now" — keeps the
+    /// advance consistent with the slice and avoids skipping messages added
+    /// between enqueue and completion.
+    async fn write_reflection_checkpoint(
+        &self,
+        agent: crate::agents::AgentId,
+        conversation_session: SessionId,
+        up_to_turn_id: PromptRequestId,
+        reflection_session: SessionId,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO reflection_checkpoints
+                 (agent_id, session_id, last_turn_id, reflection_event_id,
+                  reflection_session_ids, created_at)
+             VALUES ($1, $2, $3, NULL, ARRAY[$4]::UUID[], $5)
+             ON CONFLICT (agent_id, session_id) DO UPDATE
+                 SET last_turn_id = EXCLUDED.last_turn_id,
+                     reflection_event_id = EXCLUDED.reflection_event_id,
+                     reflection_session_ids = array_append(
+                         reflection_checkpoints.reflection_session_ids,
+                         $4
+                     ),
+                     created_at = EXCLUDED.created_at",
+        )
+        .bind(agent)
+        .bind(conversation_session)
+        .bind(up_to_turn_id)
+        .bind(reflection_session)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn run_with_pingpong_guard(
@@ -372,13 +592,28 @@ impl Worker {
         if prompts_consumed {
             timeout(
                 self.cfg.max_turn_duration,
-                agent.resume(session, viewer, request_id, cancel, Some(observer)),
+                agent.resume(
+                    session,
+                    viewer,
+                    request_id,
+                    RequestKindPayload::Normal {},
+                    cancel,
+                    Some(observer),
+                ),
             )
             .await
         } else {
             timeout(
                 self.cfg.max_turn_duration,
-                agent.reply(session, viewer, prompts, request_id, cancel, Some(observer)),
+                agent.reply(
+                    session,
+                    viewer,
+                    prompts,
+                    request_id,
+                    RequestKindPayload::Normal {},
+                    cancel,
+                    Some(observer),
+                ),
             )
             .await
         }

@@ -3,7 +3,7 @@
 - [ ] Organization and user
 ## Agent core
 - [ ] Each agent has a subset of tools
-- [ ] Each agent has its own memory
+- [x] Each agent has its own memory
 ## Agent functionalities
 - [x] Agent can talk to each other
 - [ ] An observer agent, who periodly watch how agents communicate to archive the task to specify bottleneck to suggest improve.

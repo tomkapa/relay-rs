@@ -22,7 +22,7 @@ use relay_rs::provider::{
 };
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
-use relay_rs::tools::{SharedTool, Tool, ToolError, ToolRegistry};
+use relay_rs::tools::{SharedTool, Tool, ToolCallContext, ToolError, ToolRegistry};
 use relay_rs::types::{ModelId, Participant, Prompt, ToolName};
 
 mod common;
@@ -119,7 +119,7 @@ impl Tool for CountingTool {
     fn input_schema(&self) -> Arc<Value> {
         self.schema.clone()
     }
-    async fn execute(&self, _input: Value) -> Result<String, ToolError> {
+    async fn execute(&self, _input: Value, _ctx: &ToolCallContext) -> Result<String, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok("tool ran".into())
     }
@@ -179,6 +179,7 @@ async fn returns_text_when_no_tool_call() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )
@@ -207,6 +208,7 @@ async fn runs_tool_then_returns_text() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )
@@ -235,6 +237,7 @@ async fn unknown_tool_does_not_loop_forever() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )
@@ -264,6 +267,7 @@ async fn cancellation_short_circuits() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             cancel,
             None,
         )
@@ -290,6 +294,7 @@ async fn provider_specs_match_registered_tools() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
         )

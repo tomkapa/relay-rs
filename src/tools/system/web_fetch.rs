@@ -11,7 +11,7 @@ use tracing::instrument;
 use crate::types::ToolName;
 
 use super::super::limits::{FETCH_MAX_BODY_BYTES, FETCH_MAX_REDIRECTS, FETCH_TIMEOUT};
-use super::super::traits::{Tool, ToolError};
+use super::super::traits::{Tool, ToolCallContext, ToolError};
 use super::super::url::{FetchUrl, UrlError, check_host};
 
 /// Content-type prefixes treated as HTML for the markdown-conversion path.
@@ -102,7 +102,7 @@ impl Tool for WebFetchTool {
     }
 
     #[instrument(name = "tool.web_fetch", skip_all, fields(relay.tool = "web_fetch"))]
-    async fn execute(&self, input: Value) -> Result<String, ToolError> {
+    async fn execute(&self, input: Value, _ctx: &ToolCallContext) -> Result<String, ToolError> {
         let Input { url } = serde_json::from_value(input)
             .map_err(|e| ToolError::InvalidInput(format!("web_fetch: {e}")))?;
         let url = FetchUrl::try_from(url.as_str())?;

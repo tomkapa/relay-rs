@@ -222,8 +222,10 @@ macro_rules! str_enum {
             fn deserialize<D: ::serde::Deserializer<'de>>(
                 deserializer: D,
             ) -> ::std::result::Result<Self, D::Error> {
-                let raw = <&str as ::serde::Deserialize>::deserialize(deserializer)?;
-                Self::parse(raw).ok_or_else(|| {
+                // `String` rather than `&str` so deserializers that
+                // cannot borrow (e.g. `serde_json::Value`) still work.
+                let raw = <::std::string::String as ::serde::Deserialize>::deserialize(deserializer)?;
+                Self::parse(raw.as_str()).ok_or_else(|| {
                     <D::Error as ::serde::de::Error>::custom(
                         format!("unknown {} {raw:?}", stringify!($name))
                     )

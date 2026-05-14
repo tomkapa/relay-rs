@@ -1,0 +1,26 @@
+meta {
+  name: GET /agents/{id} — read one agent
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/agents/{{created_agent_id}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+tests {
+  test("200 OK", function() {
+    expect(res.status).to.equal(200);
+  });
+
+  test("id matches", function() {
+    const json = res.getBody();
+    expect(json.id).to.equal(bru.getVar("created_agent_id"));
+  });
+}

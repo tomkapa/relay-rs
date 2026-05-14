@@ -217,17 +217,7 @@ impl Tool for GetSessionTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, _input: Value) -> Result<String, ToolError> {
-        Err(ToolError::InvalidInput(
-            "get_session requires per-call context; invoke via execute_with_ctx".into(),
-        ))
-    }
-
-    async fn execute_with_ctx(
-        &self,
-        input: Value,
-        ctx: &ToolCallContext,
-    ) -> Result<String, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError> {
         let parsed: GetSessionInput = serde_json::from_value(input)?;
         let out = self.handle(parsed, ctx).await?;
         Ok(serde_json::to_string(&out)?)

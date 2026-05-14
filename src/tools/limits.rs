@@ -47,6 +47,24 @@ pub fn truncate_to_char_boundary(s: &mut String, target: usize) {
     s.truncate(cut);
 }
 
+/// Head-trimming counterpart to [`truncate_to_char_boundary`].
+///
+/// Drops bytes from the START of `s` until the result fits in `max_bytes`,
+/// stepping forward to the next UTF-8 boundary. Used by the reflection
+/// scheduler so the most recent turns survive when a transcript exceeds
+/// the prompt cap.
+#[must_use]
+pub fn truncate_from_start(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut idx = s.len() - max_bytes;
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    &s[idx..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::truncate_to_char_boundary;

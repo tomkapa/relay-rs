@@ -22,15 +22,22 @@ use crate::agents::AgentId;
 
 /// One end of a session.
 ///
-/// Constructed only via [`Self::human`] / [`Self::agent`] — there is no public
-/// field, so the only valid shapes are the two below. `Human` carries no payload
-/// today; expansion to `Human(UserId)` when auth lands is a one-line change to
-/// this enum and its `as_kind` mapping.
+/// Constructed only via [`Self::human`] / [`Self::agent`] / [`Self::system`] —
+/// there is no public field, so the only valid shapes are the three below.
+/// `System` is the synthetic singleton counterpart used by autonomous
+/// agent-only sessions (reflection, resolution per doc/memory.md §1.6, §1.8):
+/// the agent talks to itself for audit; the System side never speaks back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Participant {
     Human,
-    Agent { agent_id: AgentId },
+    Agent {
+        agent_id: AgentId,
+    },
+    /// Synthetic counterpart for reflection / resolution sessions. The agent
+    /// is paired with `System` so the canonical-pair invariant holds without
+    /// relaxing it for self-sessions; nobody on this side speaks.
+    System,
 }
 
 impl Participant {
@@ -46,20 +53,28 @@ impl Participant {
         Self::Agent { agent_id: id }
     }
 
+    /// The synthetic system end of a session — used for off-conversation
+    /// agent work (reflection, resolution).
+    #[must_use]
+    pub const fn system() -> Self {
+        Self::System
+    }
+
     /// Tag without payload — the value persisted in the `*_kind TEXT` column.
     #[must_use]
     pub const fn kind(self) -> ParticipantKind {
         match self {
             Self::Human => ParticipantKind::Human,
             Self::Agent { .. } => ParticipantKind::Agent,
+            Self::System => ParticipantKind::System,
         }
     }
 
-    /// `Some(id)` for the agent variant, `None` for human.
+    /// `Some(id)` for the agent variant, `None` for human or system.
     #[must_use]
     pub const fn agent_id(self) -> Option<AgentId> {
         match self {
-            Self::Human => None,
+            Self::Human | Self::System => None,
             Self::Agent { agent_id } => Some(agent_id),
         }
     }
@@ -74,6 +89,12 @@ impl Participant {
     #[must_use]
     pub const fn is_agent(self) -> bool {
         matches!(self, Self::Agent { .. })
+    }
+
+    /// True iff this is the synthetic system end.
+    #[must_use]
+    pub const fn is_system(self) -> bool {
+        matches!(self, Self::System)
     }
 
     /// Canonical ordering for session deduplication. Returns `(a, b)` such
@@ -94,21 +115,28 @@ impl Participant {
 
     /// Total ordering used to canonicalise pairs.
     ///
-    /// **`Agent` sorts before `Human`** so the Rust ordering matches the
-    /// Postgres CHECK constraint `sessions_participants_distinct`, which
-    /// uses tuple `<` and therefore the SQL string ordering of the
-    /// `participant_*_kind` column — `'agent' < 'human'` lexically. Two
-    /// `Agent` values then sort by their `AgentId`'s `Uuid` order. Both
-    /// sides agreeing on the canonical order is what makes the
+    /// Matches the Postgres CHECK constraint `sessions_participants_distinct`,
+    /// which uses tuple `<` and therefore the SQL string ordering of the
+    /// `participant_*_kind` column. Lex order on the kind labels is
+    /// `'agent' < 'human' < 'system'`, so Rust mirrors: `Agent < Human <
+    /// System`. Two `Agent` values then sort by their `AgentId`'s `Uuid`
+    /// order. Both sides agreeing on the canonical order is what makes the
     /// `sessions_dag_pair_unique` upsert idempotent across callers.
     pub fn canonical_cmp(lhs: &Self, rhs: &Self) -> Ordering {
-        match (lhs, rhs) {
-            (Self::Human, Self::Human) => Ordering::Equal,
-            (Self::Agent { .. }, Self::Human) => Ordering::Less,
-            (Self::Human, Self::Agent { .. }) => Ordering::Greater,
-            (Self::Agent { agent_id: a }, Self::Agent { agent_id: b }) => {
-                a.as_uuid().cmp(&b.as_uuid())
-            }
+        // Order each variant by lex of its kind label first; equal kinds
+        // tiebreak by payload (only Agent has one). Mirrors the Postgres
+        // tuple `<` on `(kind, agent_id)`.
+        let lk = lhs.kind().as_str();
+        let rk = rhs.kind().as_str();
+        match lk.cmp(rk) {
+            Ordering::Less => Ordering::Less,
+            Ordering::Greater => Ordering::Greater,
+            Ordering::Equal => match (lhs, rhs) {
+                (Self::Agent { agent_id: a }, Self::Agent { agent_id: b }) => {
+                    a.as_uuid().cmp(&b.as_uuid())
+                }
+                _ => Ordering::Equal,
+            },
         }
     }
 }
@@ -118,6 +146,7 @@ impl fmt::Display for Participant {
         match self {
             Self::Human => f.write_str("human"),
             Self::Agent { agent_id } => write!(f, "agent({agent_id})"),
+            Self::System => f.write_str("system"),
         }
     }
 }
@@ -127,8 +156,9 @@ crate::str_enum! {
     /// `*_kind` column `CHECK` constraint, the JSON `kind` discriminator on
     /// [`Participant`], and any future tracing attribute (`relay.participant.kind`).
     pub enum ParticipantKind {
-        Human => "human",
-        Agent => "agent",
+        Human  => "human",
+        Agent  => "agent",
+        System => "system",
     }
 }
 
@@ -151,12 +181,14 @@ pub enum MessageSender {
 
 impl MessageSender {
     /// Promote a participant into a sender. Lossless — a participant can always
-    /// send.
+    /// send (System "sends" only via worker-injected nudges; the variant maps
+    /// for completeness even though no agent-loop path constructs it).
     #[must_use]
     pub const fn from_participant(p: Participant) -> Self {
         match p {
             Participant::Human => Self::Human,
             Participant::Agent { agent_id } => Self::Agent { agent_id },
+            Participant::System => Self::System,
         }
     }
 
@@ -226,6 +258,7 @@ impl Participant {
     ) -> Result<Self, ParticipantDecodeError> {
         match (kind, agent_id) {
             (ParticipantKind::Human, None) => Ok(Self::Human),
+            (ParticipantKind::System, None) => Ok(Self::System),
             (ParticipantKind::Agent, Some(id)) => Ok(Self::Agent { agent_id: id }),
             _ => Err(ParticipantDecodeError::KindAgentMismatch),
         }
@@ -255,6 +288,7 @@ mod tests {
     fn kind_round_trips_via_str() {
         assert_eq!(ParticipantKind::Human.as_str(), "human");
         assert_eq!(ParticipantKind::Agent.as_str(), "agent");
+        assert_eq!(ParticipantKind::System.as_str(), "system");
         assert_eq!(
             ParticipantKind::parse("human"),
             Some(ParticipantKind::Human)
@@ -263,7 +297,33 @@ mod tests {
             ParticipantKind::parse("agent"),
             Some(ParticipantKind::Agent)
         );
+        assert_eq!(
+            ParticipantKind::parse("system"),
+            Some(ParticipantKind::System)
+        );
         assert_eq!(ParticipantKind::parse("nope"), None);
+    }
+
+    #[test]
+    fn canonical_pair_orders_agent_before_system() {
+        let s = Participant::system();
+        let a = agent(1);
+        assert_eq!(Participant::canonical_pair(a, s), Some((a, s)));
+        assert_eq!(Participant::canonical_pair(s, a), Some((a, s)));
+    }
+
+    #[test]
+    fn canonical_pair_orders_human_before_system() {
+        let h = Participant::human();
+        let s = Participant::system();
+        assert_eq!(Participant::canonical_pair(h, s), Some((h, s)));
+        assert_eq!(Participant::canonical_pair(s, h), Some((h, s)));
+    }
+
+    #[test]
+    fn canonical_pair_rejects_two_systems() {
+        let s = Participant::system();
+        assert_eq!(Participant::canonical_pair(s, s), None);
     }
 
     #[test]

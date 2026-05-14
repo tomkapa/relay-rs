@@ -103,6 +103,11 @@ pub struct SendMessageTool {
 
 const TOOL_NAME: &str = "send_message";
 
+/// Surfaced both at validation time (early reject) and from the dispatch
+/// match (defence in depth). System is the synthetic counterpart for
+/// reflection / resolution sessions and never receives deliveries.
+const ERR_SYSTEM_RECEIVER: &str = "send_message: cannot deliver to System";
+
 const TOOL_DESCRIPTION: &str = "Send a message to a participant. \
     Use this for ALL communication including replies to the human — plain \
     assistant text is not delivered. \
@@ -201,6 +206,11 @@ impl SendMessageTool {
             return Err(ToolError::InvalidInput(
                 "send_message: receiver equals caller".into(),
             ));
+        }
+
+        if input.receiver.is_system() {
+            set_outcome("invalid_input");
+            return Err(ToolError::InvalidInput(ERR_SYSTEM_RECEIVER.into()));
         }
 
         // Caller must be an agent — humans don't run tool calls. This also
@@ -413,6 +423,10 @@ impl SendMessageTool {
                 self.enqueue_for_agent(ctx, receiver_session, agent_id, content)
                     .await
             }
+            Participant::System => {
+                set_outcome("invalid_input");
+                Err(ToolError::InvalidInput(ERR_SYSTEM_RECEIVER.into()))
+            }
         }
     }
 
@@ -493,14 +507,14 @@ impl SendMessageTool {
             .expect("invariant: validate() rejects non-agent callers");
         let outcome = self
             .queue
-            .enqueue(NewPromptRequest {
-                session: Some(receiver_session),
-                sender: ctx.viewer,
+            .enqueue(NewPromptRequest::normal(
+                Some(receiver_session),
+                ctx.viewer,
                 receiver_agent_id,
-                parent_session: Some(ctx.session_id),
+                Some(ctx.session_id),
                 content,
-                idempotency_key: key,
-            })
+                key,
+            ))
             .await
             .map_err(|e| {
                 set_outcome("enqueue_failed");
@@ -550,19 +564,7 @@ impl Tool for SendMessageTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, _input: Value) -> Result<String, ToolError> {
-        // `send_message` only makes sense with caller context — refuse
-        // unguarded calls so a misuse does not silently produce text.
-        Err(ToolError::InvalidInput(
-            "send_message requires per-call context; invoke via execute_with_ctx".into(),
-        ))
-    }
-
-    async fn execute_with_ctx(
-        &self,
-        input: Value,
-        ctx: &ToolCallContext,
-    ) -> Result<String, ToolError> {
+    async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError> {
         let parsed: SendMessageInput = serde_json::from_value(input)?;
         let out = self.handle(parsed, ctx).await?;
         let body = serde_json::to_string(&out)?;

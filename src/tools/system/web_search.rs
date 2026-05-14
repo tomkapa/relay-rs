@@ -12,7 +12,7 @@ use crate::types::{ParseError, SecretString, ToolName};
 use super::super::limits::{
     SEARCH_DEFAULT_COUNT, SEARCH_MAX_COUNT, SEARCH_TIMEOUT, truncate_to_char_boundary,
 };
-use super::super::traits::{Tool, ToolError};
+use super::super::traits::{Tool, ToolCallContext, ToolError};
 
 const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
 const SEARCH_QUERY_MAX_BYTES: usize = 400;
@@ -203,7 +203,7 @@ impl Tool for WebSearchTool {
     }
 
     #[instrument(name = "tool.web_search", skip_all, fields(relay.tool = "web_search"))]
-    async fn execute(&self, input: Value) -> Result<String, ToolError> {
+    async fn execute(&self, input: Value, _ctx: &ToolCallContext) -> Result<String, ToolError> {
         let Input { query, count } = serde_json::from_value(input)
             .map_err(|e| ToolError::InvalidInput(format!("web_search: {e}")))?;
 

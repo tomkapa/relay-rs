@@ -18,7 +18,8 @@ use crate::types::{Participant, Prompt};
 use super::error::{LeaseTimingError, PromptError};
 use super::limits::{LEASE_HEARTBEAT_INTERVAL, LEASE_TTL};
 use super::types::{
-    FailureReason, IdempotencyKey, PromptRequestId, RequestStatus, TurnSeq, WorkerId,
+    FailureReason, IdempotencyKey, PromptRequestId, RequestKindPayload, RequestStatus, TurnSeq,
+    WorkerId,
 };
 
 /// Co-validated lease timing.
@@ -155,6 +156,39 @@ pub struct NewPromptRequest {
     pub parent_session: Option<SessionId>,
     pub content: Prompt,
     pub idempotency_key: IdempotencyKey,
+    /// Kind-specific payload — the job kind itself (doc/memory.md §2.1)
+    /// is its variant discriminator, read via
+    /// [`RequestKindPayload::kind`]. HTTP-triggered prompts default to
+    /// [`RequestKindPayload::Normal`]; the reflection scheduler and
+    /// librarian construct the `Reflection` / `Resolution` variants.
+    /// Carrying the whole enum (not a separate `kind` scalar) makes
+    /// `(kind, payload)` agreement true by construction — no runtime
+    /// cross-check at the insert boundary.
+    pub kind_payload: RequestKindPayload,
+}
+
+impl NewPromptRequest {
+    /// Build a normal user-facing prompt — the shape every
+    /// HTTP-triggered enqueue takes.
+    #[must_use]
+    pub fn normal(
+        session: Option<SessionId>,
+        sender: Participant,
+        receiver_agent_id: AgentId,
+        parent_session: Option<SessionId>,
+        content: Prompt,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            session,
+            sender,
+            receiver_agent_id,
+            parent_session,
+            content,
+            idempotency_key,
+            kind_payload: RequestKindPayload::Normal {},
+        }
+    }
 }
 
 /// Outcome of an enqueue. Idempotent retries return [`EnqueueOutcome::Existing`] so the
@@ -222,6 +256,14 @@ pub struct ClaimedSession {
     pub prompts: Vec<ClaimedPrompt>,
     pub lease: LeaseToken,
     pub traceparent: Option<String>,
+    /// Kind-specific payload from the first drained row. The whole batch
+    /// shares one variant because the queue groups by `(session, kind)`
+    /// per claim, so this single value carries both the job kind (via
+    /// [`RequestKindPayload::kind`]) and any per-variant metadata the
+    /// worker needs for kind-specific post-turn dispatch (reflection
+    /// checkpoint, no-action contradiction close). The `Normal` arm is
+    /// a no-op today.
+    pub kind_payload: RequestKindPayload,
 }
 
 impl ClaimedSession {

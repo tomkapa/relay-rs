@@ -18,6 +18,8 @@ use sqlx::{Decode, Encode, Type};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::memory::ContradictionEventId;
+use crate::session::SessionId;
 use crate::types::ParseError;
 
 use super::limits::{MAX_ATTEMPTS, MAX_IDEMPOTENCY_KEY_BYTES};
@@ -220,6 +222,72 @@ impl RequestStatus {
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed)
+    }
+}
+
+crate::str_enum! {
+    /// Job kind carried on every `prompt_requests` row (doc/memory.md §2.1).
+    /// Generalises the queue from "queue of prompts" to "queue of agent
+    /// jobs"; the worker dispatches on this column to pick reply / reflect
+    /// / resolve. The label list is the single source of truth for the
+    /// column `CHECK` constraint and the JSON wire format used by
+    /// [`RequestKindPayload`].
+    pub enum RequestKind {
+        /// User-facing reply turn. Carries the empty
+        /// [`RequestKindPayload::Normal`] variant.
+        Normal     => "normal",
+        /// Autonomous self-curation. Payload is
+        /// [`RequestKindPayload::Reflection`].
+        Reflection => "reflection",
+        /// Single-contradiction resolution. Payload is
+        /// [`RequestKindPayload::Resolution`].
+        Resolution => "resolution",
+    }
+}
+
+/// Kind-specific metadata persisted in `prompt_requests.kind_payload` as JSONB.
+///
+/// Every [`RequestKind`] has a corresponding variant — `Normal` is an
+/// empty struct today, but matching shapes 1:1 with `RequestKind` keeps
+/// the API symmetric and makes "is this a Normal claim?" a single match
+/// arm rather than `Option::is_none` plus a kind check. The empty struct
+/// (vs. unit) variant leaves room for Normal-specific fields without a
+/// wire-format break.
+///
+/// Adjacently-tagged JSON (`{"kind":"normal","data":{}}`) so a new variant
+/// cannot collide with an existing one — and so `serde_json::from_value`
+/// rejects an old-shaped payload deterministically rather than silently
+/// matching the wrong arm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum RequestKindPayload {
+    Normal {},
+    Reflection {
+        /// Conversation session this reflection covers — its
+        /// `reflection_checkpoints` row is the audit anchor.
+        session_id: SessionId,
+        /// Cursor the scheduler captured at enqueue time. The conversation
+        /// slice carried in the prompt body spans `(previous checkpoint,
+        /// up_to_turn_id]`; on success the checkpoint is stamped to this
+        /// value so the next reflection picks up strictly after it.
+        up_to_turn_id: PromptRequestId,
+    },
+    Resolution {
+        contradiction_event_id: ContradictionEventId,
+    },
+}
+
+impl RequestKindPayload {
+    /// Discriminator — the [`RequestKind`] this payload corresponds to.
+    /// Used at insert time to assert (kind, payload) consistency before
+    /// the row hits Postgres.
+    #[must_use]
+    pub const fn kind(&self) -> RequestKind {
+        match self {
+            Self::Normal {} => RequestKind::Normal,
+            Self::Reflection { .. } => RequestKind::Reflection,
+            Self::Resolution { .. } => RequestKind::Resolution,
+        }
     }
 }
 

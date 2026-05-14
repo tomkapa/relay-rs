@@ -1,0 +1,21 @@
+meta {
+  name: DELETE /mcp-servers/{id} — remove an MCP server
+  type: http
+  seq: 5
+}
+
+delete {
+  url: {{base_url}}/mcp-servers/{{mcp_server_id}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}
+
+tests {
+  test("204 No Content", function() {
+    expect(res.status).to.equal(204);
+  });
+}

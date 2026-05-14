@@ -11,7 +11,7 @@ categories = ["asynchronous"]
 publish = false
 
 [dependencies]
-async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion", "byot"] }
+async-openai = { version = "0.36", default-features = false, features = ["rustls", "chat-completion", "byot", "embedding"] }
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log", "tracing", "macros", "query"] }
 # §8 (zero-dep bias): we already pull `base64` transitively via reqwest/jsonwebtoken/etc, but

@@ -1,0 +1,164 @@
+meta {
+  name: Multi-Agent Scenario — delegate translation to a specialist
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/prompts
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  Accept: application/json
+}
+
+body:json {
+  {
+    "content": "Please translate the word 'hello' to French. Do not translate it yourself — call send_message to delegate to the translator agent at id {{translator_id}}, then forward their reply back to me.",
+    "idempotency_key": "{{idempotency_key}}"
+  }
+}
+
+docs {
+  Single-click end-to-end test for the multi-agent communication
+  feature (steps 1-8 of the design). Click **Send** once and the
+  pre-request script handles all data setup.
+
+  ## Design notes
+
+  This test deliberately keeps **per-agent system prompts minimal and
+  role-focused**. The how-to of inter-agent communication
+  (`send_message`, "plain text is private", etc.) lives in the
+  in-binary `<core>` block that `AgentMemory` prepends to every
+  agent's prompt — see `src/app.rs::CORE_SYSTEM_PROMPT`. We do **not**
+  repeat those mechanics in the Translator's system_prompt; that would
+  be a maintenance hack and would force every operator who creates a
+  new agent to re-paste the protocol.
+
+  Dynamic, deployment-specific information — *which* other agents are
+  available right now and what their ids are — also doesn't belong in
+  a static `system_prompt`. The human's message body itself is the
+  right place for "delegate to the translator with id …", which is
+  what this scenario does.
+
+  ## What gets created
+
+  Pre-request creates (or finds) one row:
+   - **translator** — system_prompt is exactly the role description:
+     "translate phrases into French; reply with just the translated
+     phrase." Nothing about send_message or how to address the caller
+     — the core block teaches that.
+
+  The seeded default agent serves as the coordinator. No mutation of
+  the default; nothing else in this collection breaks.
+
+  ## What you'll see on `Threads / Thread Stream.bru`
+
+  Open it after this request returns and click Send to watch the
+  DAG-wide SSE fan-in:
+   - `tool_call` + `tool_result` chunks from the default agent's first
+     turn (it calls `send_message` to delegate to the Translator),
+   - `text` / `tool_call` / `tool_result` chunks from the Translator's
+     own turn (a child request inside the same DAG — the fan-in
+     subscriber demuxes both onto one stream),
+   - one `agent_message` chunk authored by the default agent carrying
+     the translation back to the human (the `send_message(Human, ...)`
+     delivery — step 6 of the design),
+   - terminal `done` chunk when the DAG drains (step 8). The handler
+     closes the SSE connection after forwarding it.
+
+  See also `Threads / List Threads.bru` (channel feed) and
+  `Threads / Thread Messages.bru` (flat history of every session in this
+  DAG, useful for refetch-and-dedupe on reconnect).
+
+  ## Failure modes
+
+  - **Model ignores the delegation hint.** Models sometimes answer
+    directly instead of delegating. Re-Send. If it persists, make the
+    body more explicit ("you MUST delegate"). This is a model-quality
+    knob, not a system bug.
+  - **Ping-pong guard fires.** Agent emitted text without calling
+    `send_message`. Worker injects a system nudge and retries up to
+    `MAX_PINGPONG_RETRIES` times before parking the request as
+    `Failed { reason: NoEgress }`. SSE shows an `error` chunk.
+  - **DAG budget exceeded.** Loops are capped at `MAX_DAG_TURNS = 64`
+    `send_message` calls per DAG. Past that, the offending insert is
+    rolled back and an `error` chunk lands on the root.
+}
+
+script:pre-request {
+  // Bruno's QuickJS sandbox does not expose `fetch`; use the bundled
+  // `axios` library directly. The QuickJS shim only ships top-level
+  // methods (`axios.get` / `axios.post`); `axios.create` is NOT
+  // available, so build per-call configs inline.
+  const axios = require("axios");
+  const baseUrl = bru.getEnvVar("base_url");
+  const headers = { "Accept": "application/json", "Content-Type": "application/json" };
+
+  // ── Translator ────────────────────────────────────────────────────────
+  // Role-only system prompt. The core block teaches `send_message`;
+  // nothing about delivery mechanics belongs here.
+  const translatorPrompt =
+    "You translate phrases between languages. Default target is French " +
+    "unless the caller specifies otherwise. Reply with just the translated " +
+    "phrase, no commentary, no prefix.";
+
+  const list = await axios.get(baseUrl + "/agents", { headers });
+  let translator = list.data.find((a) => a.name === "translator");
+  if (!translator) {
+    const created = await axios.post(
+      baseUrl + "/agents",
+      {
+        name: "translator",
+        system_prompt: translatorPrompt,
+        is_default: false
+      },
+      { headers }
+    );
+    translator = created.data;
+  }
+  bru.setVar("translator_id", translator.id);
+
+  // ── Idempotency key ───────────────────────────────────────────────────
+  // Fresh per click so a re-Send creates a new DAG. Override the env
+  // var manually to exercise the dedup path (queue returns the existing
+  // request_id with status=200).
+  const key = "bru-multi-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+  bru.setVar("idempotency_key", key);
+}
+
+script:post-response {
+  const json = res.getBody();
+  bru.setVar("request_id", json.request_id);
+  bru.setVar("session_id", json.session_id);
+  // First prompt's request_id is the DAG root; thread routes key off it.
+  bru.setVar("root_request_id", json.request_id);
+
+  console.log(
+    "Multi-agent run kicked off:\n" +
+      "  request_id (== DAG root) = " + json.request_id + "\n" +
+      "  session_id (human↔agent) = " + json.session_id + "\n" +
+      "  translator_id            = " + bru.getVar("translator_id") + "\n" +
+      "→ Open 'Threads / 03 - Thread Stream.bru' and click Send to watch the conversation."
+  );
+}
+
+tests {
+  test("202 Accepted (or 200 on idempotent replay)", function() {
+    expect([200, 202]).to.include(res.status);
+  });
+
+  test("response shape", function() {
+    const json = res.getBody();
+    expect(json.request_id, "request_id").to.be.a("string");
+    expect(json.session_id, "session_id").to.be.a("string");
+    expect(json.status, "status").to.be.oneOf(["pending", "processing", "done", "failed"]);
+  });
+
+  test("translator created or resolved", function() {
+    expect(bru.getVar("translator_id"), "translator_id").to.be.a("string");
+  });
+}

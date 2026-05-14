@@ -18,6 +18,9 @@ pub enum SettingsError {
         "multiple provider api keys set ({set:?}); set only one of: OPENAI_API_KEY, ANTHROPIC_API_KEY"
     )]
     MultipleProviderKeys { set: Vec<&'static str> },
+
+    #[error("embedding configuration missing; set EMBEDDING_API_KEY and EMBEDDING_MODEL")]
+    MissingEmbedding,
 }
 
 /// Process-wide configuration loaded once at startup. Secrets are wrapped in
@@ -33,6 +36,23 @@ pub struct Settings {
     /// Postgres connection string. Required at startup — there is no in-memory
     /// fallback. Wrapped in [`SecretString`] because the URL embeds a password.
     pub database_url: SecretString,
+    /// Embedding provider configuration. Required: the memory subsystem
+    /// refuses to start without one. Decoupled from the chat provider so
+    /// chat and embeddings can point at different vendors.
+    pub embedding: EmbeddingSettings,
+}
+
+/// Embedding-provider settings — `EMBEDDING_API_KEY` /
+/// `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL`. Required as a group:
+/// either all three (api_key + model, base_url optional) or none.
+#[derive(Debug, Clone)]
+pub struct EmbeddingSettings {
+    pub api_key: SecretString,
+    pub base_url: Option<String>,
+    pub model: String,
+    /// Vector dimension produced by the model. Must match the
+    /// `agent_memories.embedding` column (1536 in migration 9).
+    pub dimensions: usize,
 }
 
 /// Provider selection + the credentials that go with it. Exhaustive — adding a backend
@@ -82,6 +102,15 @@ struct RawSettings {
     #[serde(default = "default_http_addr")]
     http_addr: SocketAddr,
     database_url: SecretString,
+
+    #[serde(default)]
+    embedding_api_key: Option<SecretString>,
+    #[serde(default)]
+    embedding_base_url: Option<String>,
+    #[serde(default)]
+    embedding_model: Option<String>,
+    #[serde(default)]
+    embedding_dimensions: Option<usize>,
 }
 
 fn default_model() -> ModelId {
@@ -115,15 +144,33 @@ impl TryFrom<RawSettings> for Settings {
                 });
             }
         };
+        let embedding = match (raw.embedding_api_key, raw.embedding_model) {
+            (Some(api_key), Some(model)) => EmbeddingSettings {
+                api_key,
+                base_url: raw.embedding_base_url,
+                model,
+                dimensions: raw
+                    .embedding_dimensions
+                    .unwrap_or(DEFAULT_EMBEDDING_DIMENSIONS),
+            },
+            _ => return Err(SettingsError::MissingEmbedding),
+        };
         Ok(Self {
             provider,
             brave_search_api_key: raw.brave_search_api_key,
             model: raw.model,
             http_addr: raw.http_addr,
             database_url: raw.database_url,
+            embedding,
         })
     }
 }
+
+/// Default vector dimension. Matches `text-embedding-3-small` / the
+/// `agent_memories.embedding` column committed in migration 9. Operators
+/// pointing at a model with a different dimension must override
+/// `EMBEDDING_DIMENSIONS` *and* run a custom column migration.
+const DEFAULT_EMBEDDING_DIMENSIONS: usize = 1536;
 
 impl Settings {
     /// Load settings from environment variables. Missing required values surface as a
@@ -146,6 +193,9 @@ mod tests {
     }
 
     fn empty_raw() -> RawSettings {
+        // Embedding settings are required per doc/memory.md §2.9 — fill
+        // them in for the cases that expect a successful parse; tests that
+        // probe the no-embedding error path overwrite them back to None.
         RawSettings {
             openai_api_key: None,
             openai_base_url: None,
@@ -155,6 +205,10 @@ mod tests {
             model: default_model(),
             http_addr: default_http_addr(),
             database_url: secret("postgres://relay:relay@localhost:5432/relay"),
+            embedding_api_key: Some(secret("emb")),
+            embedding_base_url: None,
+            embedding_model: Some("text-embedding-3-small".to_string()),
+            embedding_dimensions: None,
         }
     }
 
@@ -192,5 +246,15 @@ mod tests {
         raw.anthropic_api_key = Some(secret("sk-ant"));
         let s = Settings::try_from(raw).expect("valid");
         assert_eq!(s.provider.name(), "anthropic");
+    }
+
+    #[test]
+    fn missing_embedding_is_rejected() {
+        let mut raw = empty_raw();
+        raw.openai_api_key = Some(secret("sk-x"));
+        raw.embedding_api_key = None;
+        raw.embedding_model = None;
+        let err = Settings::try_from(raw).expect_err("expected error");
+        assert!(matches!(err, SettingsError::MissingEmbedding));
     }
 }
