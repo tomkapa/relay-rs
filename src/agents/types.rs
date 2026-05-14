@@ -10,9 +10,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::mcp::McpServerId;
 use crate::types::ParseError;
 
-use super::limits::{AGENT_NAME_MAX_LEN, AGENT_SYSTEM_PROMPT_MAX_LEN};
+use super::limits::{
+    AGENT_NAME_MAX_LEN, AGENT_SYSTEM_PROMPT_MAX_LEN, MAX_ALLOWED_MCP_SERVERS_PER_AGENT,
+};
 
 crate::uuid_newtype! {
     /// Opaque identifier for a registered agent row. Wire format and DB column both
@@ -138,14 +141,74 @@ impl fmt::Debug for AgentSystemPrompt {
 }
 
 /// Snapshot of a single row in the `agents` table.
+///
+/// `allowed_mcp_servers` is the per-agent MCP allowlist: every id in this
+/// vector grants the agent visibility to that server's tools. The semantics
+/// are strict — an empty vector means **zero** MCP tools, not "all of them".
+/// Operators must explicitly opt an agent in to each server.
 #[derive(Debug, Clone)]
 pub struct AgentRecord {
     pub id: AgentId,
     pub name: AgentName,
     pub system_prompt: AgentSystemPrompt,
     pub is_default: bool,
+    pub allowed_mcp_servers: AllowedMcpServers,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Bounded list of MCP server ids an agent is allowed to see.
+///
+/// The newtype enforces the cardinality cap on every construction path
+/// (HTTP, store reload, factory wiring). Empty is a legitimate value — the
+/// "no MCP tools" lockdown — and is the default for a freshly minted agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowedMcpServers(Vec<McpServerId>);
+
+impl AllowedMcpServers {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[McpServerId] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn contains(&self, id: McpServerId) -> bool {
+        self.0.contains(&id)
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Vec<McpServerId> {
+        self.0
+    }
+}
+
+impl TryFrom<Vec<McpServerId>> for AllowedMcpServers {
+    type Error = ParseError;
+
+    fn try_from(raw: Vec<McpServerId>) -> Result<Self, Self::Error> {
+        if raw.len() > MAX_ALLOWED_MCP_SERVERS_PER_AGENT {
+            return Err(ParseError::OutOfRange {
+                field: "allowed_mcp_servers",
+                detail: "too many entries",
+            });
+        }
+        Ok(Self(raw))
+    }
 }
 
 /// Seed payload used by the init function to insert the default agent row when
@@ -190,5 +253,38 @@ mod tests {
     fn agent_system_prompt_accepts_normal() {
         let p = AgentSystemPrompt::try_from("be helpful").expect("valid");
         assert_eq!(p.as_str(), "be helpful");
+    }
+
+    #[test]
+    fn allowed_mcp_servers_default_is_empty() {
+        let a = AllowedMcpServers::default();
+        assert!(a.is_empty());
+        assert_eq!(a.len(), 0);
+        assert_eq!(a.as_slice(), &[]);
+    }
+
+    #[test]
+    fn allowed_mcp_servers_rejects_oversize() {
+        let too_many: Vec<McpServerId> = (0..=MAX_ALLOWED_MCP_SERVERS_PER_AGENT)
+            .map(|_| McpServerId::new())
+            .collect();
+        let err = AllowedMcpServers::try_from(too_many).expect_err("over cap");
+        assert!(matches!(
+            err,
+            ParseError::OutOfRange {
+                field: "allowed_mcp_servers",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_mcp_servers_accepts_at_cap() {
+        let at_cap: Vec<McpServerId> = (0..MAX_ALLOWED_MCP_SERVERS_PER_AGENT)
+            .map(|_| McpServerId::new())
+            .collect();
+        let allowed = AllowedMcpServers::try_from(at_cap.clone()).expect("at cap");
+        assert_eq!(allowed.len(), MAX_ALLOWED_MCP_SERVERS_PER_AGENT);
+        assert!(allowed.contains(at_cap[0]));
     }
 }

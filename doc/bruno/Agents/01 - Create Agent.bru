@@ -19,7 +19,8 @@ body:json {
   {
     "name": "researcher",
     "system_prompt": "You are a careful researcher. You search before answering, you cite sources, and you flag uncertainty rather than guess.",
-    "is_default": false
+    "is_default": false,
+    "allowed_mcp_servers": []
   }
 }
 
@@ -27,6 +28,11 @@ docs {
   Mint a new agent. `is_default = true` atomically demotes the previously-
   default row in the same transaction, so the partial unique index
   `agents_default_unique` is always satisfied.
+
+  `allowed_mcp_servers` is the explicit list of MCP server ids the agent
+  may use tools from. Omitted or `[]` means **zero** MCP tools — there is
+  no "unrestricted" mode. To grant access, pass the server uuids returned
+  by `GET /mcp-servers`. Cap: 32 servers per agent.
 
   The `agents` table is uncapped at the global level (relay-rs is SaaS;
   tenants accumulate agents over time). Per-tenant caps will land alongside

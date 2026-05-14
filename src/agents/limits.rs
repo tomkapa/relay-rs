@@ -24,3 +24,11 @@ pub const AGENT_PROMPT_CACHE_CAP: usize = 256;
 /// TTL for cached agent prompts. Edits to an agent's `system_prompt` row become
 /// visible to live workers within this window — no LISTEN/NOTIFY required.
 pub const AGENT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Maximum number of MCP server ids that may sit in one agent's `allowed_mcp_servers` array.
+///
+/// Mirrors `crate::mcp::MAX_MCP_SERVERS`: an agent could legitimately be
+/// granted every server registered system-wide, so a tighter per-agent cap
+/// would just create a confusing asymmetry. The schema
+/// `CHECK (cardinality(...) <= 32)` enforces the same number on the DB side.
+pub const MAX_ALLOWED_MCP_SERVERS_PER_AGENT: usize = 32;

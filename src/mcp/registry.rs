@@ -3,6 +3,11 @@
 //! Holds the live MCP client connections and the tool specs derived from them. Refresh
 //! is the only mutator; reads (`specs`, `get`) are lock-free in steady state because
 //! the inner state is replaced as a whole `Arc`.
+//!
+//! [`McpRegistry`] is a cheap-clone newtype around `Arc<McpRegistryInner>` —
+//! every consumer (worker, HTTP handlers, refresher, scoped sources) holds
+//! its own clone of the registry handle without needing to wrap it in an
+//! outer `Arc<...>` each time.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -23,18 +28,34 @@ use super::store::{McpHealthUpdate, SharedMcpServerStore};
 use super::tool::McpTool;
 use super::types::{DiscoveredTool, McpServerAlias, McpServerId, McpServerRecord, McpTransport};
 
-/// Live tool catalogue derived from registered MCP servers.
+/// Cheap-clone handle to the live MCP tool catalogue.
 ///
-/// The composition root holds one `Arc<McpRegistry>`; it is shared by the worker
-/// (read path) and the HTTP CRUD handlers (which trigger `refresh` after every write).
-pub struct McpRegistry {
+/// Wraps an `Arc<McpRegistryInner>`: the composition root constructs one and
+/// every consumer (worker, refresher, HTTP CRUD, scoped sources) just
+/// clones it. Reads (`specs`, `get`) are lock-free in steady state because
+/// the inner state is replaced wholesale on each refresh.
+#[derive(Clone, Debug)]
+pub struct McpRegistry(Arc<McpRegistryInner>);
+
+/// Point-in-time read view returned by [`McpRegistry::snapshot`]. Holding
+/// both `Arc`s lets a caller iterate specs and look up source servers
+/// without re-entering the registry lock per spec.
+#[derive(Debug, Clone)]
+pub struct RegistrySnapshot {
+    pub specs: Arc<[ToolSpec]>,
+    pub tool_servers: Arc<HashMap<ToolName, McpServerId>>,
+}
+
+/// Inner state — held behind an `Arc` by [`McpRegistry`]. Holds the live
+/// MCP clients and the spec snapshot; mutated only by `refresh`.
+struct McpRegistryInner {
     inner: RwLock<McpState>,
     store: SharedMcpServerStore,
     clock: SharedClock,
     server_cap: usize,
 }
 
-impl std::fmt::Debug for McpRegistry {
+impl std::fmt::Debug for McpRegistryInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snapshot = self.inner.read().expect("registry lock poisoned");
         f.debug_struct("McpRegistry")
@@ -48,6 +69,11 @@ impl std::fmt::Debug for McpRegistry {
 #[derive(Default)]
 struct McpState {
     by_name: HashMap<ToolName, SharedTool>,
+    /// Per-tool back-pointer to the server that produced it. Wrapped in
+    /// `Arc` so [`ScopedMcpSource`] can pull a single snapshot under one
+    /// read lock alongside `specs` instead of looking each name up
+    /// through a fresh acquisition.
+    tool_servers: Arc<HashMap<ToolName, McpServerId>>,
     specs: Arc<[ToolSpec]>,
     /// Indexed by server id so we can reuse a client across refreshes when its config
     /// hasn't changed (avoids re-running the MCP `initialize` handshake on every CRUD
@@ -65,19 +91,112 @@ impl McpRegistry {
     /// the worker pool begins claiming sessions, so the agent's first turn already sees
     /// the registered MCP tools.
     #[must_use]
-    pub fn new(store: SharedMcpServerStore, clock: SharedClock) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(store: SharedMcpServerStore, clock: SharedClock) -> Self {
+        Self(Arc::new(McpRegistryInner {
             inner: RwLock::new(McpState::default()),
             store,
             clock,
             server_cap: MAX_MCP_SERVERS,
-        })
+        }))
     }
 
     /// Read-side handle: the (possibly-empty) flat slice of tool specs the agent
     /// concatenates with the static built-in registry every turn.
     #[must_use]
     pub fn specs(&self) -> Arc<[ToolSpec]> {
+        self.0.specs()
+    }
+
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<SharedTool> {
+        self.0.get(name)
+    }
+
+    /// Snapshot of the read state the per-agent scope filter needs — both
+    /// the spec slice and the tool→server map — in **one** lock acquisition.
+    /// The returned `Arc`s share state with the registry; subsequent refreshes
+    /// replace them wholesale, so the caller gets a consistent point-in-time
+    /// view without holding the lock while it filters.
+    #[must_use]
+    pub fn snapshot(&self) -> RegistrySnapshot {
+        self.0.snapshot()
+    }
+
+    /// Single-lock-acquisition lookup of a tool and its source server. Used
+    /// by [`ScopedMcpSource::get`] so dispatch never pays two round-trips
+    /// through the read lock.
+    #[must_use]
+    pub fn lookup(&self, name: &str) -> Option<(SharedTool, McpServerId)> {
+        self.0.lookup(name)
+    }
+
+    /// Re-read enabled servers, refresh tool lists, atomically swap state.
+    /// Per-server failures are isolated; one bad server doesn't abort the
+    /// whole refresh.
+    pub async fn refresh(&self) -> Result<(), McpError> {
+        self.0.refresh().await
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Project this registry as the trait object the [`crate::tools::ToolBox`]
+    /// expects on its dynamic side. The returned `Arc` shares state with `self`
+    /// (no extra allocation), so the toolbox sees the same live catalogue
+    /// every refresh writes into.
+    #[must_use]
+    pub fn as_dynamic_source(&self) -> Arc<dyn DynamicToolSource> {
+        self.0.clone()
+    }
+
+    /// Test seam: bypass the refresh path by installing a synthetic catalogue
+    /// directly. Each entry is `(server_id, tool)`; the tool's own name is
+    /// used as the registry key (no `mcp_<alias>_` prefixing — tests build
+    /// whatever names they need). Lives behind `#[cfg(test)]` so it never
+    /// reaches release artifacts.
+    #[cfg(test)]
+    pub(crate) fn for_test(entries: Vec<(McpServerId, SharedTool)>) -> Self {
+        let mut by_name: HashMap<ToolName, SharedTool> = HashMap::new();
+        let mut tool_servers: HashMap<ToolName, McpServerId> = HashMap::new();
+        let mut specs: Vec<ToolSpec> = Vec::with_capacity(entries.len());
+        for (server, tool) in entries {
+            let name = tool.name().clone();
+            let spec = ToolSpec {
+                name: name.clone(),
+                description: Arc::from(tool.description()),
+                input_schema: tool.input_schema(),
+            };
+            specs.push(spec);
+            tool_servers.insert(name.clone(), server);
+            by_name.insert(name, tool);
+        }
+        specs.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        Self(Arc::new(McpRegistryInner {
+            inner: RwLock::new(McpState {
+                by_name,
+                tool_servers: Arc::new(tool_servers),
+                specs: Arc::from(specs),
+                servers: HashMap::new(),
+            }),
+            // The store and clock are only consulted by `refresh`; tests
+            // that build via `for_test` never call refresh, so the
+            // never-touched fields can hold null-object stand-ins.
+            store: crate::mcp::store::test_support::null_store(),
+            clock: crate::clock::SystemClock::shared(),
+            server_cap: MAX_MCP_SERVERS,
+        }))
+    }
+}
+
+impl McpRegistryInner {
+    fn specs(&self) -> Arc<[ToolSpec]> {
         self.inner
             .read()
             .expect("registry lock poisoned")
@@ -85,8 +204,7 @@ impl McpRegistry {
             .clone()
     }
 
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<SharedTool> {
+    fn get(&self, name: &str) -> Option<SharedTool> {
         self.inner
             .read()
             .expect("registry lock poisoned")
@@ -95,8 +213,22 @@ impl McpRegistry {
             .cloned()
     }
 
-    #[must_use]
-    pub fn len(&self) -> usize {
+    fn snapshot(&self) -> RegistrySnapshot {
+        let guard = self.inner.read().expect("registry lock poisoned");
+        RegistrySnapshot {
+            specs: guard.specs.clone(),
+            tool_servers: guard.tool_servers.clone(),
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<(SharedTool, McpServerId)> {
+        let guard = self.inner.read().expect("registry lock poisoned");
+        let server = guard.tool_servers.get(name).copied()?;
+        let tool = guard.by_name.get(name).cloned()?;
+        Some((tool, server))
+    }
+
+    fn len(&self) -> usize {
         self.inner
             .read()
             .expect("registry lock poisoned")
@@ -104,19 +236,12 @@ impl McpRegistry {
             .len()
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Re-read the enabled servers from the store, reconnect any whose config changed,
-    /// list their tools, and atomically replace the in-memory state.
-    ///
-    /// Per-server failures are isolated: a server that fails to connect or list tools
-    /// is dropped from the live spec set with its `last_error` row updated, but
-    /// healthy servers continue to serve their tools.
     #[instrument(name = "mcp.registry.refresh", skip_all, err)]
-    pub async fn refresh(&self) -> Result<(), McpError> {
+    async fn refresh(&self) -> Result<(), McpError> {
         let rows = self.store.list_enabled().await?;
         // §6 / §5: cap is enforced at create-time, but we belt-and-brace at refresh too
         // — a misconfigured deploy or a DB hand-edit shouldn't blow the budget here.
@@ -135,22 +260,12 @@ impl McpRegistry {
             std::mem::take(&mut guard.servers)
         };
 
-        let mut servers: HashMap<McpServerId, ConnectedServer> = HashMap::with_capacity(rows.len());
-        let mut by_name: HashMap<ToolName, SharedTool> = HashMap::new();
-        let mut specs: Vec<ToolSpec> = Vec::new();
-
+        let mut builder = McpStateBuilder::with_capacity(rows.len());
         for row in rows {
-            self.refresh_one(row, &mut prior, &mut servers, &mut by_name, &mut specs)
-                .await;
+            self.refresh_one(row, &mut prior, &mut builder).await;
         }
 
-        specs.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
-        let new_state = McpState {
-            by_name,
-            specs: Arc::from(specs),
-            servers,
-        };
-        *self.inner.write().expect("registry lock poisoned") = new_state;
+        *self.inner.write().expect("registry lock poisoned") = builder.finish();
         // `prior` (any servers no longer present) is dropped here, which terminates
         // their rmcp worker tasks.
         drop(prior);
@@ -164,9 +279,7 @@ impl McpRegistry {
         &self,
         row: McpServerRecord,
         prior: &mut HashMap<McpServerId, ConnectedServer>,
-        servers: &mut HashMap<McpServerId, ConnectedServer>,
-        by_name: &mut HashMap<ToolName, SharedTool>,
-        specs: &mut Vec<ToolSpec>,
+        builder: &mut McpStateBuilder,
     ) {
         let McpServerRecord {
             id, alias, config, ..
@@ -202,7 +315,7 @@ impl McpRegistry {
         };
 
         let now = chrono::DateTime::<Utc>::from(self.clock.now_wall());
-        let discovered = ingest_tools(&alias, &client, remote_tools, by_name, specs);
+        let discovered = ingest_tools(id, &alias, &client, remote_tools, builder);
 
         let _ = self
             .store
@@ -216,7 +329,9 @@ impl McpRegistry {
             )
             .await;
 
-        servers.insert(id, ConnectedServer { config, client });
+        builder
+            .servers
+            .insert(id, ConnectedServer { config, client });
     }
 
     /// Reuse an existing client when its config hasn't changed; otherwise open a new
@@ -262,11 +377,11 @@ impl McpRegistry {
 /// Build [`McpTool`] / [`ToolSpec`] entries for one server's remote tool list. Returns
 /// the per-row `discovered_tools` snapshot that the store records.
 fn ingest_tools(
+    server_id: McpServerId,
     alias: &McpServerAlias,
     client: &Arc<McpClient>,
     remote_tools: Vec<rmcp::model::Tool>,
-    by_name: &mut HashMap<ToolName, SharedTool>,
-    specs: &mut Vec<ToolSpec>,
+    builder: &mut McpStateBuilder,
 ) -> Vec<DiscoveredTool> {
     let mut discovered: Vec<DiscoveredTool> = Vec::with_capacity(remote_tools.len());
     for remote in remote_tools.into_iter().take(MAX_TOOLS_PER_SERVER) {
@@ -282,7 +397,7 @@ fn ingest_tools(
                 continue;
             }
         };
-        if by_name.contains_key(&prefixed) {
+        if builder.by_name.contains_key(&prefixed) {
             // A different server already produced this prefixed name (alias collision
             // or duplicated remote name); skip the duplicate so registry building stays
             // total. Operators see the survivor in `discovered_tools`.
@@ -311,14 +426,48 @@ fn ingest_tools(
             schema.clone(),
             client.clone(),
         ));
-        specs.push(ToolSpec {
+        builder.specs.push(ToolSpec {
             name: prefixed.clone(),
             description,
             input_schema: schema,
         });
-        by_name.insert(prefixed, tool);
+        builder.tool_servers.insert(prefixed.clone(), server_id);
+        builder.by_name.insert(prefixed, tool);
     }
     discovered
+}
+
+/// Accumulator for the in-progress next [`McpState`] across the
+/// per-server refresh loop. Owning the four parallel collections in one
+/// struct keeps the per-call signature of [`refresh_one`] / `ingest_tools`
+/// to a single `&mut` borrow.
+struct McpStateBuilder {
+    by_name: HashMap<ToolName, SharedTool>,
+    tool_servers: HashMap<ToolName, McpServerId>,
+    specs: Vec<ToolSpec>,
+    servers: HashMap<McpServerId, ConnectedServer>,
+}
+
+impl McpStateBuilder {
+    fn with_capacity(server_count: usize) -> Self {
+        Self {
+            by_name: HashMap::new(),
+            tool_servers: HashMap::new(),
+            specs: Vec::new(),
+            servers: HashMap::with_capacity(server_count),
+        }
+    }
+
+    fn finish(mut self) -> McpState {
+        self.specs
+            .sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        McpState {
+            by_name: self.by_name,
+            tool_servers: Arc::new(self.tool_servers),
+            specs: Arc::from(self.specs),
+            servers: self.servers,
+        }
+    }
 }
 
 fn prefixed_name(alias: &McpServerAlias, remote: &str) -> Result<ToolName, ParseError> {
@@ -326,7 +475,10 @@ fn prefixed_name(alias: &McpServerAlias, remote: &str) -> Result<ToolName, Parse
     ToolName::try_from(raw.as_str())
 }
 
-impl DynamicToolSource for McpRegistry {
+/// `DynamicToolSource` lives on the inner so `Arc<McpRegistryInner>` upcasts
+/// straight to `Arc<dyn DynamicToolSource>` — [`McpRegistry::as_dynamic_source`]
+/// just returns that upcast, no extra wrapping.
+impl DynamicToolSource for McpRegistryInner {
     fn specs(&self) -> Arc<[ToolSpec]> {
         Self::specs(self)
     }

@@ -58,3 +58,53 @@ pub trait McpServerStore: fmt::Debug + Send + Sync {
 }
 
 pub type SharedMcpServerStore = Arc<dyn McpServerStore>;
+
+// `pub(crate)` is the accurate visibility — the module is reachable from any
+// `#[cfg(test)]` site in the crate — and `unreachable_pub` would otherwise
+// trip if we used a plain `pub` on items inside a private module.
+#[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) mod test_support {
+    //! Null-object [`McpServerStore`] used only by the `McpRegistry::for_test`
+    //! constructor in this crate's unit tests. Every method panics — calling
+    //! it would mean a test path that should have been allocation-free went
+    //! through `refresh`, which is the bug.
+    use super::*;
+    use crate::mcp::types::{McpServerId, McpServerRecord};
+
+    #[derive(Debug)]
+    struct NullStore;
+
+    #[async_trait]
+    impl McpServerStore for NullStore {
+        async fn create(&self, _: McpServerCreate) -> Result<McpServerRecord, McpError> {
+            panic!("invariant: McpRegistry::for_test must not consult the store");
+        }
+        async fn list(&self) -> Result<Vec<McpServerRecord>, McpError> {
+            panic!("invariant: McpRegistry::for_test must not consult the store");
+        }
+        async fn list_enabled(&self) -> Result<Vec<McpServerRecord>, McpError> {
+            panic!("invariant: McpRegistry::for_test must not consult the store");
+        }
+        async fn read(&self, _: McpServerId) -> Result<McpServerRecord, McpError> {
+            panic!("invariant: McpRegistry::for_test must not consult the store");
+        }
+        async fn update(
+            &self,
+            _: McpServerId,
+            _: McpServerUpdate,
+        ) -> Result<McpServerRecord, McpError> {
+            panic!("invariant: McpRegistry::for_test must not consult the store");
+        }
+        async fn delete(&self, _: McpServerId) -> Result<(), McpError> {
+            panic!("invariant: McpRegistry::for_test must not consult the store");
+        }
+        async fn update_health(&self, _: McpServerId, _: McpHealthUpdate) -> Result<(), McpError> {
+            panic!("invariant: McpRegistry::for_test must not consult the store");
+        }
+    }
+
+    pub(crate) fn null_store() -> SharedMcpServerStore {
+        Arc::new(NullStore)
+    }
+}

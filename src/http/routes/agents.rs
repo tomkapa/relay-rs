@@ -21,7 +21,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agents::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, AgentUpdate, NewAgent};
+use crate::agents::{
+    AgentId, AgentName, AgentRecord, AgentSystemPrompt, AgentUpdate, AllowedMcpServers, NewAgent,
+};
+use crate::mcp::McpServerId;
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
@@ -45,6 +48,10 @@ struct AgentResponse {
     name: String,
     system_prompt: String,
     is_default: bool,
+    /// MCP server ids this agent is allowed to use tools from. Always
+    /// present; an empty array means the agent has no MCP access (the
+    /// default for newly minted agents).
+    allowed_mcp_servers: Vec<McpServerId>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -56,6 +63,7 @@ impl From<AgentRecord> for AgentResponse {
             name: r.name.as_str().to_owned(),
             system_prompt: r.system_prompt.as_str().to_owned(),
             is_default: r.is_default,
+            allowed_mcp_servers: r.allowed_mcp_servers.into_inner(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -70,6 +78,10 @@ struct CreateAgentRequest {
     /// row is demoted in the same transaction.
     #[serde(default)]
     is_default: bool,
+    /// MCP servers the new agent may use. Omitted = no MCP access (`[]`):
+    /// there is no "unrestricted" mode. The operator opts in explicitly.
+    #[serde(default)]
+    allowed_mcp_servers: Vec<McpServerId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +95,11 @@ struct UpdateAgentRequest {
     /// current default — the system requires exactly one default at all times.
     #[serde(default)]
     is_default: Option<bool>,
+    /// `Some(list)` replaces the allowlist atomically — including
+    /// `Some([])`, the explicit lockdown that revokes every server. `None`
+    /// (field omitted) leaves the existing allowlist untouched.
+    #[serde(default)]
+    allowed_mcp_servers: Option<Vec<McpServerId>>,
 }
 
 async fn create_agent(
@@ -92,12 +109,15 @@ async fn create_agent(
     let name = AgentName::try_from(payload.name).map_err(HttpError::Parse)?;
     let system_prompt =
         AgentSystemPrompt::try_from(payload.system_prompt).map_err(HttpError::Parse)?;
+    let allowed_mcp_servers =
+        AllowedMcpServers::try_from(payload.allowed_mcp_servers).map_err(HttpError::Parse)?;
     let record = state
         .agents
         .create(NewAgent {
             name,
             system_prompt,
             is_default: payload.is_default,
+            allowed_mcp_servers,
         })
         .await?;
     Ok((StatusCode::CREATED, Json(record.into())))
@@ -133,6 +153,11 @@ async fn update_agent(
         .map(AgentSystemPrompt::try_from)
         .transpose()
         .map_err(HttpError::Parse)?;
+    let allowed_mcp_servers = payload
+        .allowed_mcp_servers
+        .map(AllowedMcpServers::try_from)
+        .transpose()
+        .map_err(HttpError::Parse)?;
     let row = state
         .agents
         .update(
@@ -141,6 +166,7 @@ async fn update_agent(
                 name,
                 system_prompt,
                 is_default: payload.is_default,
+                allowed_mcp_servers,
             },
         )
         .await?;

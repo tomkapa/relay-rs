@@ -26,7 +26,9 @@ use crate::config::{EmbeddingSettings, ProviderSettings, Settings};
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
-use crate::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
+use crate::mcp::{
+    McpRefresher, McpRegistry, PgMcpServerStore, ScopedMcpSource, SharedMcpServerStore,
+};
 use crate::memory::{
     AgentMemory, LibrarianScheduler, MemorySectionLoader, ModeCores, PgMemoryStore,
     ReflectionScheduler, SESSION_MEMORY_CACHE_CAP, SESSION_MEMORY_CACHE_TTL_SECS,
@@ -225,7 +227,7 @@ struct Collaborators {
     sink: SharedResponseSink,
     responses: SharedResponseSource,
     mcp_store: SharedMcpServerStore,
-    mcp_registry: Arc<McpRegistry>,
+    mcp_registry: McpRegistry,
     scheduled_tasks: SharedScheduledTaskStore,
 }
 
@@ -363,9 +365,40 @@ impl Collaborators {
             scheduled_tasks,
         })
     }
+}
 
-    fn toolbox(&self) -> ToolBox {
-        ToolBox::new(self.builtin_tools.clone(), self.mcp_registry.clone())
+/// Just enough of the collaborator graph to assemble one `Agent` for one
+/// `AgentRecord`. Cheap to clone (every field is either `Arc`-wrapped or
+/// already `Clone` over cheap state) so the factory closure can hold it.
+#[derive(Clone)]
+struct AgentFactoryPieces {
+    provider: SharedProvider,
+    sessions: SharedSessionStore,
+    memory: SharedMemory,
+    clock: SharedClock,
+    builtin_tools: ToolRegistry,
+    mcp_registry: McpRegistry,
+    model: crate::types::ModelId,
+}
+
+impl AgentFactoryPieces {
+    fn build(&self, record: &crate::agents::AgentRecord) -> Agent {
+        let dynamic = Arc::new(ScopedMcpSource::new(
+            self.mcp_registry.clone(),
+            &record.allowed_mcp_servers,
+        ));
+        let toolbox = ToolBox::new(self.builtin_tools.clone(), dynamic);
+        AgentBuilder::new(
+            self.provider.clone(),
+            self.sessions.clone(),
+            self.memory.clone(),
+            self.model.clone(),
+        )
+        .expect("invariant: limits constants are static and parse")
+        .with_tools(toolbox)
+        .with_hooks(HookChain::new())
+        .with_clock(self.clock.clone())
+        .build()
     }
 }
 
@@ -433,12 +466,20 @@ fn default_agent_seed() -> Result<DefaultAgentSeed, AppError> {
 }
 
 /// Build a fully-wired [`Agent`] without the HTTP/worker stack.
+///
+/// Skips per-agent MCP scoping (no `AgentRecord` to scope against here) —
+/// callers must not use this for production turn dispatch, which goes
+/// through `build_server`'s per-agent factory below.
 pub async fn build_agent(settings: Settings) -> Result<Agent, AppError> {
     let pieces = Collaborators::new(&settings).await?;
     Ok(build_agent_from(&pieces, &settings))
 }
 
 fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
+    let toolbox = ToolBox::new(
+        pieces.builtin_tools.clone(),
+        pieces.mcp_registry.as_dynamic_source(),
+    );
     AgentBuilder::new(
         pieces.provider.clone(),
         pieces.sessions.clone(),
@@ -446,7 +487,7 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
         settings.model.clone(),
     )
     .expect("invariant: limits constants are static and parse")
-    .with_tools(pieces.toolbox())
+    .with_tools(toolbox)
     .with_hooks(HookChain::new())
     .with_clock(pieces.clock.clone())
     .build()
@@ -459,10 +500,20 @@ pub async fn build_server(
     cancel: CancellationToken,
 ) -> Result<Server, AppError> {
     let pieces = Collaborators::new(&settings).await?;
-    // Every agent shares the same collaborators today; the factory seam is
-    // here so a future change can specialise per-agent (model, tool subset).
-    let template = build_agent_from(&pieces, &settings);
-    let factory: AgentFactory = Arc::new(move |_record| template.clone());
+    // Per-agent MCP scope: the factory reads the row's `allowed_mcp_servers`
+    // and builds a `ScopedMcpSource` so the agent's `ToolBox` only sees the
+    // permitted servers' tools. Everything else (provider, sessions, memory,
+    // builtins, hooks) is cheap-clone shared across agents.
+    let factory_pieces = AgentFactoryPieces {
+        provider: pieces.provider.clone(),
+        sessions: pieces.sessions.clone(),
+        memory: pieces.memory.clone(),
+        clock: pieces.clock.clone(),
+        builtin_tools: pieces.builtin_tools.clone(),
+        mcp_registry: pieces.mcp_registry.clone(),
+        model: settings.model.clone(),
+    };
+    let factory: AgentFactory = Arc::new(move |record| factory_pieces.build(record));
     let agents_registry: SharedAgents = Arc::new(CachedAgents::new(
         pieces.agents.clone(),
         factory,

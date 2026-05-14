@@ -11,6 +11,7 @@ mod limits;
 mod pg_store;
 mod refresher;
 mod registry;
+mod scoped;
 mod store;
 mod tool;
 mod types;
@@ -26,6 +27,7 @@ pub use limits::{
 pub use pg_store::PgMcpServerStore;
 pub use refresher::{McpRefreshTrigger, McpRefresher};
 pub use registry::McpRegistry;
+pub use scoped::ScopedMcpSource;
 pub use store::{
     McpHealthUpdate, McpServerCreate, McpServerStore, McpServerUpdate, SharedMcpServerStore,
 };

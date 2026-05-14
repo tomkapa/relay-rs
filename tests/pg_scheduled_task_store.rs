@@ -37,6 +37,7 @@ async fn extra_agent(db: &TestDb, name: &str) -> AgentId {
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from("p").expect("valid prompt"),
         is_default: false,
+        allowed_mcp_servers: relay_rs::agents::AllowedMcpServers::empty(),
     };
     agents.create(payload).await.expect("create agent").id
 }

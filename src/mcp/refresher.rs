@@ -6,8 +6,6 @@
 //! The owned `JoinHandle` lives in the [`Server`](crate::app::Server) so graceful
 //! shutdown waits on it (CLAUDE.md §7 — no floating tasks).
 
-use std::sync::Arc;
-
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -56,7 +54,7 @@ impl McpRefresher {
     /// Spawn the single coordinator task. Returns `self` (hand to the `Server` for
     /// graceful shutdown) and a [`McpRefreshTrigger`] (clone into `AppState`).
     #[must_use]
-    pub fn spawn(registry: Arc<McpRegistry>) -> (Self, McpRefreshTrigger) {
+    pub fn spawn(registry: McpRegistry) -> (Self, McpRefreshTrigger) {
         let (tx, mut rx) = mpsc::channel::<()>(REFRESH_QUEUE_CAP);
         let cancel = CancellationToken::new();
         let token = cancel.clone();

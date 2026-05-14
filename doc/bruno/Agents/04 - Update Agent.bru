@@ -22,14 +22,16 @@ body:json {
 }
 
 docs {
-  Patch any subset of `name`, `system_prompt`, `is_default`. Omit a field to
-  leave it unchanged.
+  Patch any subset of `name`, `system_prompt`, `is_default`,
+  `allowed_mcp_servers`. Omit a field to leave it unchanged.
 
   - `is_default = true` atomically demotes the previously-default row.
   - `is_default = false` against the current default returns 409 — the system
     requires exactly one default at all times, so promote another row first.
-  - An update to `system_prompt` becomes visible to live workers within the
-    cache TTL (60 s); there is no synchronous flush.
+  - `allowed_mcp_servers` replaces the entire allowlist when present. Pass
+    `[]` to revoke all MCP access; omit the field to keep the existing list.
+  - An update to `system_prompt` or `allowed_mcp_servers` becomes visible to
+    live workers within the cache TTL (60 s); there is no synchronous flush.
 }
 
 tests {

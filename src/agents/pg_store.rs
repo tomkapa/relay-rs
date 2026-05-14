@@ -12,10 +12,13 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::clock::SharedClock;
+use crate::mcp::McpServerId;
 
 use super::error::AgentStoreError;
 use super::store::{AgentStore, AgentUpdate, NewAgent};
-use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, DefaultAgentSeed};
+use super::types::{
+    AgentId, AgentName, AgentRecord, AgentSystemPrompt, AllowedMcpServers, DefaultAgentSeed,
+};
 
 /// Transaction-scoped advisory-lock key used by [`PgAgentStore::seed_default`] to
 /// serialise its "check default exists, insert if not" critical section across
@@ -23,6 +26,12 @@ use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, DefaultAg
 /// `0x6167656E745F6473` (= ASCII "agent_ds") — chosen for readability and to
 /// avoid colliding with the MCP create lock.
 const AGENT_DEFAULT_SEED_LOCK_KEY: i64 = 0x6167_656E_745F_6473;
+
+/// Single source of truth for the `agents` column list. Every SELECT that
+/// hydrates an [`AgentRow`] must use this — adding a column then becomes a
+/// one-line edit here plus the matching `AgentRow` field.
+const AGENT_COLS: &str = "id, name, system_prompt, is_default, \
+    allowed_mcp_servers, created_at, updated_at";
 
 /// Postgres-backed [`AgentStore`]. Holds a cheap clone of a [`PgPool`] and a
 /// [`SharedClock`]; safe to share across the runtime.
@@ -67,6 +76,9 @@ impl PgAgentStore {
         }
 
         let id = AgentId::new();
+        // `allowed_mcp_servers` is intentionally left to the column's SQL
+        // default (`'{}'`): a freshly seeded agent has no MCP access. An
+        // operator opts it in to specific servers via PUT after startup.
         sqlx::query(
             "INSERT INTO agents \
                  (id, name, system_prompt, is_default, created_at, updated_at) \
@@ -111,13 +123,15 @@ impl AgentStore for PgAgentStore {
         let id = AgentId::new();
         sqlx::query(
             "INSERT INTO agents \
-                 (id, name, system_prompt, is_default, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $5)",
+                 (id, name, system_prompt, is_default, allowed_mcp_servers, \
+                  created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
         )
         .bind(id)
         .bind(payload.name.as_str())
         .bind(payload.system_prompt.as_str())
         .bind(payload.is_default)
+        .bind(payload.allowed_mcp_servers.as_slice())
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -129,29 +143,26 @@ impl AgentStore for PgAgentStore {
             name: payload.name,
             system_prompt: payload.system_prompt,
             is_default: payload.is_default,
+            allowed_mcp_servers: payload.allowed_mcp_servers,
             created_at: now,
             updated_at: now,
         })
     }
 
     async fn list(&self) -> Result<Vec<AgentRecord>, AgentStoreError> {
-        let rows = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
-             FROM agents ORDER BY created_at ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let sql = format!("SELECT {AGENT_COLS} FROM agents ORDER BY created_at ASC");
+        let rows = sqlx::query_as::<_, AgentRow>(&sql)
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(AgentRecord::try_from).collect()
     }
 
     async fn read(&self, id: AgentId) -> Result<AgentRecord, AgentStoreError> {
-        let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
-             FROM agents WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let sql = format!("SELECT {AGENT_COLS} FROM agents WHERE id = $1");
+        let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         let row = row.ok_or(AgentStoreError::NotFound(id))?;
         row.try_into()
     }
@@ -164,13 +175,11 @@ impl AgentStore for PgAgentStore {
         let now = self.now();
         let mut tx = self.pool.begin().await?;
 
-        let existing: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(
-            "SELECT id, name, system_prompt, is_default, created_at, updated_at \
-             FROM agents WHERE id = $1 FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let sql = format!("SELECT {AGENT_COLS} FROM agents WHERE id = $1 FOR UPDATE");
+        let existing: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(&sql)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
         let existing = existing.ok_or(AgentStoreError::NotFound(id))?;
         let mut current = AgentRecord::try_from(existing)?;
 
@@ -187,6 +196,9 @@ impl AgentStore for PgAgentStore {
         }
         if let Some(system_prompt) = payload.system_prompt {
             current.system_prompt = system_prompt;
+        }
+        if let Some(allowed) = payload.allowed_mcp_servers {
+            current.allowed_mcp_servers = allowed;
         }
 
         // Promote: clear the old default in the same transaction, then set the
@@ -206,13 +218,15 @@ impl AgentStore for PgAgentStore {
 
         sqlx::query(
             "UPDATE agents \
-             SET name = $2, system_prompt = $3, is_default = $4, updated_at = $5 \
+             SET name = $2, system_prompt = $3, is_default = $4, \
+                 allowed_mcp_servers = $5, updated_at = $6 \
              WHERE id = $1",
         )
         .bind(id)
         .bind(current.name.as_str())
         .bind(current.system_prompt.as_str())
         .bind(current.is_default)
+        .bind(current.allowed_mcp_servers.as_slice())
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -264,6 +278,7 @@ struct AgentRow {
     name: String,
     system_prompt: String,
     is_default: bool,
+    allowed_mcp_servers: Vec<McpServerId>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -277,6 +292,7 @@ impl TryFrom<AgentRow> for AgentRecord {
             name: AgentName::try_from(row.name)?,
             system_prompt: AgentSystemPrompt::try_from(row.system_prompt)?,
             is_default: row.is_default,
+            allowed_mcp_servers: AllowedMcpServers::try_from(row.allowed_mcp_servers)?,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })

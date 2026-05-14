@@ -23,9 +23,12 @@ mod types;
 pub use cache::AgentPromptCache;
 pub use error::AgentStoreError;
 pub use limits::{
-    AGENT_NAME_MAX_LEN, AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AGENT_SYSTEM_PROMPT_MAX_LEN,
+    AGENT_NAME_MAX_LEN, AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL,
+    AGENT_SYSTEM_PROMPT_MAX_LEN, MAX_ALLOWED_MCP_SERVERS_PER_AGENT,
 };
 pub use pg_store::PgAgentStore;
 pub use registry::{AgentFactory, Agents, AgentsError, CachedAgents, SharedAgents};
 pub use store::{AgentStore, AgentUpdate, NewAgent, SharedAgentStore};
-pub use types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, DefaultAgentSeed};
+pub use types::{
+    AgentId, AgentName, AgentRecord, AgentSystemPrompt, AllowedMcpServers, DefaultAgentSeed,
+};

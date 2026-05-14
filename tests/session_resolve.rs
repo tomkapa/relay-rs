@@ -32,6 +32,7 @@ async fn fresh_agent(db: &TestDb, name: &str) -> Participant {
             name: AgentName::try_from(name).expect("name"),
             system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
             is_default: false,
+            allowed_mcp_servers: relay_rs::agents::AllowedMcpServers::empty(),
         })
         .await
         .expect("create agent");

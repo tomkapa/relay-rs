@@ -2,7 +2,7 @@
 ## Governance
 - [ ] Organization and user
 ## Agent core
-- [ ] Each agent has a subset of tools
+- [x] Each agent has a subset of tools
 - [x] Each agent has its own memory
 ## Agent functionalities
 - [x] Agent can talk to each other

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::error::AgentStoreError;
-use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt};
+use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, AllowedMcpServers};
 
 /// Input to [`AgentStore::create`]. Server-side fields (`id`, `created_at`,
 /// `updated_at`) are minted by the store; never carried in.
@@ -18,6 +18,9 @@ pub struct NewAgent {
     /// is demoted in the same transaction so the partial unique index is
     /// satisfied.
     pub is_default: bool,
+    /// Initial MCP allowlist. Empty for the no-MCP-tools default; the operator
+    /// supplies it explicitly when granting access at create time.
+    pub allowed_mcp_servers: AllowedMcpServers,
 }
 
 /// HTTP-PATCH-style update payload.
@@ -26,12 +29,14 @@ pub struct NewAgent {
 /// "field present (set)". `is_default = Some(true)` triggers an atomic
 /// demote-then-promote; `is_default = Some(false)` is rejected when applied to
 /// the current default row (the system requires a default to exist at all
-/// times).
+/// times). `allowed_mcp_servers = Some(<empty>)` is the lockdown path —
+/// distinct from "field omitted" so HTTP PATCH can revoke every server.
 #[derive(Debug, Clone, Default)]
 pub struct AgentUpdate {
     pub name: Option<AgentName>,
     pub system_prompt: Option<AgentSystemPrompt>,
     pub is_default: Option<bool>,
+    pub allowed_mcp_servers: Option<AllowedMcpServers>,
 }
 
 /// Storage trait for the agents registry. Implementations must be thread-safe.

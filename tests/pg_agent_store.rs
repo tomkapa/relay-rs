@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use relay_rs::agents::{
     AgentId, AgentName, AgentStore, AgentStoreError, AgentSystemPrompt, AgentUpdate,
-    DefaultAgentSeed, NewAgent, PgAgentStore,
+    AllowedMcpServers, DefaultAgentSeed, NewAgent, PgAgentStore,
 };
 use relay_rs::clock::SystemClock;
+use relay_rs::mcp::McpServerId;
 use relay_rs::session::PgSessionStore;
 
 mod common;
@@ -31,7 +32,12 @@ fn new_agent(name: &str, prompt: &str, is_default: bool) -> NewAgent {
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
         is_default,
+        allowed_mcp_servers: AllowedMcpServers::empty(),
     }
+}
+
+fn allowed(ids: &[McpServerId]) -> AllowedMcpServers {
+    AllowedMcpServers::try_from(ids.to_vec()).expect("under cap")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -155,6 +161,7 @@ async fn update_promotes_to_default_atomically() {
                 name: None,
                 system_prompt: None,
                 is_default: Some(true),
+                allowed_mcp_servers: None,
             },
         )
         .await
@@ -179,6 +186,7 @@ async fn update_cannot_demote_only_default() {
                 name: None,
                 system_prompt: None,
                 is_default: Some(false),
+                allowed_mcp_servers: None,
             },
         )
         .await
@@ -202,6 +210,7 @@ async fn update_changes_name_and_prompt() {
                 name: Some(AgentName::try_from("renamed").expect("name")),
                 system_prompt: Some(AgentSystemPrompt::try_from("rolled-out v2").expect("prompt")),
                 is_default: None,
+                allowed_mcp_servers: None,
             },
         )
         .await
@@ -237,6 +246,125 @@ async fn delete_refuses_default() {
         .await
         .expect_err("forbidden");
     assert!(matches!(err, AgentStoreError::DefaultDeletionForbidden));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_default_allowed_mcp_servers_is_empty() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    // Operator opts in explicitly; absence of opt-in means no MCP tools.
+    let agent = store
+        .create(new_agent("scoped", "I have no MCP yet", false))
+        .await
+        .expect("create");
+    assert!(agent.allowed_mcp_servers.is_empty());
+
+    // The seeded default agent is also empty — the migration's column default
+    // is `'{}'` so existing rows round-trip into an empty allowlist.
+    let default = store.read(db.default_agent_id).await.expect("read default");
+    assert!(default.allowed_mcp_servers.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_with_explicit_allowed_mcp_servers_round_trips() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let s1 = McpServerId::new();
+    let s2 = McpServerId::new();
+    let payload = NewAgent {
+        name: AgentName::try_from("scoped").expect("name"),
+        system_prompt: AgentSystemPrompt::try_from("scoped agent").expect("prompt"),
+        is_default: false,
+        allowed_mcp_servers: allowed(&[s1, s2]),
+    };
+    let created = store.create(payload).await.expect("create");
+    assert_eq!(created.allowed_mcp_servers.len(), 2);
+    assert!(created.allowed_mcp_servers.contains(s1));
+    assert!(created.allowed_mcp_servers.contains(s2));
+
+    let reread = store.read(created.id).await.expect("read");
+    assert_eq!(reread.allowed_mcp_servers.as_slice(), &[s1, s2]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_replaces_allowed_mcp_servers() {
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+
+    let s1 = McpServerId::new();
+    let s2 = McpServerId::new();
+    let s3 = McpServerId::new();
+
+    let agent = store
+        .create(NewAgent {
+            name: AgentName::try_from("rotates").expect("name"),
+            system_prompt: AgentSystemPrompt::try_from("rotating MCP").expect("prompt"),
+            is_default: false,
+            allowed_mcp_servers: allowed(&[s1, s2]),
+        })
+        .await
+        .expect("create");
+
+    let updated = store
+        .update(
+            agent.id,
+            AgentUpdate {
+                name: None,
+                system_prompt: None,
+                is_default: None,
+                allowed_mcp_servers: Some(allowed(&[s3])),
+            },
+        )
+        .await
+        .expect("update");
+    assert_eq!(updated.allowed_mcp_servers.as_slice(), &[s3]);
+
+    // Empty array via Some(empty) is the explicit lockdown path.
+    let locked = store
+        .update(
+            agent.id,
+            AgentUpdate {
+                name: None,
+                system_prompt: None,
+                is_default: None,
+                allowed_mcp_servers: Some(AllowedMcpServers::empty()),
+            },
+        )
+        .await
+        .expect("update");
+    assert!(locked.allowed_mcp_servers.is_empty());
+
+    // Field omitted (None) leaves the column unchanged.
+    let restored_first = store
+        .update(
+            agent.id,
+            AgentUpdate {
+                name: None,
+                system_prompt: None,
+                is_default: None,
+                allowed_mcp_servers: Some(allowed(&[s1])),
+            },
+        )
+        .await
+        .expect("update");
+    let after_noop = store
+        .update(
+            agent.id,
+            AgentUpdate {
+                name: Some(AgentName::try_from("renamed-only").expect("name")),
+                system_prompt: None,
+                is_default: None,
+                allowed_mcp_servers: None,
+            },
+        )
+        .await
+        .expect("update");
+    assert_eq!(
+        after_noop.allowed_mcp_servers.as_slice(),
+        restored_first.allowed_mcp_servers.as_slice()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
