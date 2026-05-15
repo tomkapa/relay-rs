@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agents::{
-    AgentId, AgentName, AgentRecord, AgentSystemPrompt, AgentUpdate, AllowedMcpServers, NewAgent,
+    AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt, AgentUpdate,
+    AllowedMcpServers, NewAgent,
 };
 use crate::mcp::McpServerId;
 
@@ -47,6 +48,9 @@ struct AgentResponse {
     id: AgentId,
     name: String,
     system_prompt: String,
+    /// Operator-curated, model-facing one-sentence blurb embedded for
+    /// `search_agents`. Always present — the column is `NOT NULL`.
+    description: String,
     is_default: bool,
     /// MCP server ids this agent is allowed to use tools from. Always
     /// present; an empty array means the agent has no MCP access (the
@@ -62,6 +66,7 @@ impl From<AgentRecord> for AgentResponse {
             id: r.id,
             name: r.name.as_str().to_owned(),
             system_prompt: r.system_prompt.as_str().to_owned(),
+            description: r.description.as_str().to_owned(),
             is_default: r.is_default,
             allowed_mcp_servers: r.allowed_mcp_servers.into_inner(),
             created_at: r.created_at,
@@ -74,6 +79,9 @@ impl From<AgentRecord> for AgentResponse {
 struct CreateAgentRequest {
     name: String,
     system_prompt: String,
+    /// Required, non-empty (doc/agent_discovery_plan.md §5.2). Embedded
+    /// for `search_agents`.
+    description: String,
     /// When `true`, the new agent becomes the default. The previously-default
     /// row is demoted in the same transaction.
     #[serde(default)]
@@ -90,6 +98,10 @@ struct UpdateAgentRequest {
     name: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
+    /// Patch the description. `Some(_)` re-embeds; `None` (field omitted)
+    /// leaves the existing description and embedding untouched.
+    #[serde(default)]
+    description: Option<String>,
     /// `Some(true)` promotes this row to default (atomically demotes the
     /// previous default). `Some(false)` is rejected when applied to the
     /// current default — the system requires exactly one default at all times.
@@ -109,6 +121,7 @@ async fn create_agent(
     let name = AgentName::try_from(payload.name).map_err(HttpError::Parse)?;
     let system_prompt =
         AgentSystemPrompt::try_from(payload.system_prompt).map_err(HttpError::Parse)?;
+    let description = AgentDescription::try_from(payload.description).map_err(HttpError::Parse)?;
     let allowed_mcp_servers =
         AllowedMcpServers::try_from(payload.allowed_mcp_servers).map_err(HttpError::Parse)?;
     let record = state
@@ -116,6 +129,7 @@ async fn create_agent(
         .create(NewAgent {
             name,
             system_prompt,
+            description,
             is_default: payload.is_default,
             allowed_mcp_servers,
         })
@@ -153,6 +167,11 @@ async fn update_agent(
         .map(AgentSystemPrompt::try_from)
         .transpose()
         .map_err(HttpError::Parse)?;
+    let description = payload
+        .description
+        .map(AgentDescription::try_from)
+        .transpose()
+        .map_err(HttpError::Parse)?;
     let allowed_mcp_servers = payload
         .allowed_mcp_servers
         .map(AllowedMcpServers::try_from)
@@ -165,6 +184,7 @@ async fn update_agent(
             AgentUpdate {
                 name,
                 system_prompt,
+                description,
                 is_default: payload.is_default,
                 allowed_mcp_servers,
             },

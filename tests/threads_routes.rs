@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use relay_rs::agents::{PgAgentStore, SharedAgentStore};
+use relay_rs::agents::SharedAgentStore;
 use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::http::{AppState, router};
 use relay_rs::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
@@ -66,7 +66,7 @@ impl ThreadsHarness {
         let sessions: SharedSessionStore =
             Arc::new(PgSessionStore::new(pool.clone(), clock.clone()));
         let agent_store: SharedAgentStore =
-            Arc::new(PgAgentStore::new(pool.clone(), clock.clone()));
+            common::pg::shared_agent_store(pool.clone(), clock.clone());
         let dag: SharedDagBudget = Arc::new(PgDagBudget::new(pool.clone()));
 
         let mcp_store: SharedMcpServerStore =

@@ -16,6 +16,7 @@ pub mod http;
 pub mod mcp;
 pub mod memory;
 pub mod observability;
+pub mod pg_vector;
 pub mod provider;
 pub mod runtime;
 pub mod scheduling;

@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use relay_rs::agents::{AgentName, AgentSystemPrompt, NewAgent, PgAgentStore, SharedAgentStore};
+use relay_rs::agents::{AgentName, AgentSystemPrompt, NewAgent, SharedAgentStore};
 use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::http::{AppState, router};
 use relay_rs::mcp::{McpRefresher, McpRegistry, PgMcpServerStore, SharedMcpServerStore};
@@ -56,7 +56,7 @@ impl PromptsHarness {
 
         let sessions: SharedSessionStore =
             Arc::new(PgSessionStore::new(pool.clone(), clock.clone()));
-        let agents: SharedAgentStore = Arc::new(PgAgentStore::new(pool.clone(), clock.clone()));
+        let agents: SharedAgentStore = common::pg::shared_agent_store(pool.clone(), clock.clone());
         let dag: SharedDagBudget = Arc::new(PgDagBudget::new(pool.clone()));
 
         let mcp_store: SharedMcpServerStore =
@@ -103,6 +103,8 @@ impl PromptsHarness {
             .create(NewAgent {
                 name: AgentName::try_from(name).expect("name"),
                 system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
+                description: relay_rs::agents::AgentDescription::try_from("test agent")
+                    .expect("desc"),
                 is_default: false,
                 allowed_mcp_servers: relay_rs::agents::AllowedMcpServers::empty(),
             })

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use relay_rs::agents::{AgentPromptCache, PgAgentStore, SharedAgentStore};
+use relay_rs::agents::{AgentNamesCache, AgentPromptCache, SharedAgentStore};
 use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::memory::{
     AgentMemory, MAX_MEMORY_MUTATIONS_PER_TURN, MemoryContent, MemoryHandle, MemoryKind,
@@ -40,11 +40,12 @@ struct Fixture {
 
 async fn fixture(db: &TestDb) -> Fixture {
     let clock: SharedClock = SystemClock::shared();
-    let agents: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
+    let embeddings = common::embedding::FakeEmbeddingProvider::shared();
+    let agents: SharedAgentStore = common::pg::shared_agent_store(db.pool.clone(), clock.clone());
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
-    let embeddings = common::embedding::FakeEmbeddingProvider::shared();
+    let names_cache = AgentNamesCache::new(Duration::from_secs(60), clock.clone());
     let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
         db.pool.clone(),
         clock.clone(),
@@ -56,6 +57,7 @@ async fn fixture(db: &TestDb) -> Fixture {
     let _memory = AgentMemory::new(
         agents,
         prompt_cache,
+        names_cache,
         loader.clone(),
         relay_rs::memory::ModeCores {
             normal: std::sync::Arc::from("core"),
@@ -364,10 +366,11 @@ async fn handle_round_trips_through_session_cache() {
     // Resolve via the same loader the tools use; M-1 should map to the
     // seeded memory id.
     let agents: SharedAgentStore =
-        Arc::new(PgAgentStore::new(db.pool.clone(), SystemClock::shared()));
+        common::pg::shared_agent_store(db.pool.clone(), SystemClock::shared());
     let memory = AgentMemory::new(
         agents,
         AgentPromptCache::new(2, Duration::from_secs(60), SystemClock::shared()),
+        AgentNamesCache::new(Duration::from_secs(60), SystemClock::shared()),
         f.loader.clone(),
         relay_rs::memory::ModeCores {
             normal: std::sync::Arc::from("core"),

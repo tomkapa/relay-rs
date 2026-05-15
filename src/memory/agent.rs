@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::agents::{AgentId, AgentPromptCache, SharedAgentStore};
+use crate::agents::{
+    AgentId, AgentNamesCache, AgentPromptCache, SharedAgentStore, render_agents_block,
+};
 use crate::runtime::{RequestKind, RequestKindPayload};
 use crate::session::SessionId;
 use crate::types::Participant;
@@ -71,6 +73,7 @@ impl ModeCores {
 pub struct AgentMemory {
     agents: SharedAgentStore,
     prompt_cache: AgentPromptCache,
+    names_cache: AgentNamesCache,
     loader: MemorySectionLoader,
     cores: ModeCores,
 }
@@ -80,12 +83,14 @@ impl AgentMemory {
     pub fn new(
         agents: SharedAgentStore,
         prompt_cache: AgentPromptCache,
+        names_cache: AgentNamesCache,
         loader: MemorySectionLoader,
         cores: ModeCores,
     ) -> Self {
         Self {
             agents,
             prompt_cache,
+            names_cache,
             loader,
             cores,
         }
@@ -149,16 +154,33 @@ impl Memory for AgentMemory {
             .composed_section(session, agent_id, kind_payload)
             .await?;
 
+        // `<agents>` name index (doc/agent_discovery_plan.md §8). Cached
+        // globally with the same TTL as `AgentPromptCache` so admin
+        // edits propagate within one liveness window; on cache miss
+        // we hit `AgentStore::list_names`. Empty deployments and
+        // self-only deployments yield an empty string; the renderer
+        // omits the envelope entirely (§8).
+        let agents_block = match self.names_cache.get_or_load(&self.agents).await {
+            Ok(names) => render_agents_block(names.as_ref(), agent_id),
+            Err(e) => {
+                tracing::warn!(error = %e, "agents.list_names.error");
+                String::new()
+            }
+        };
+
         let core_arc = self.cores.for_kind(kind_payload.kind());
         let core = core_arc.as_ref();
         let role_str = role.as_str();
         let memory_str = memory_section.text();
         let memory_sep = if memory_str.is_empty() { "" } else { "\n" };
+        let agents_sep = if agents_block.is_empty() { "" } else { "\n" };
 
         let mut out = String::with_capacity(
             CORE_TAG_OPEN.len()
                 + core.len()
                 + CORE_TAG_CLOSE.len()
+                + agents_block.len()
+                + agents_sep.len()
                 + ROLE_TAG_OPEN.len()
                 + role_str.len()
                 + ROLE_TAG_CLOSE.len()
@@ -168,6 +190,8 @@ impl Memory for AgentMemory {
         out.push_str(CORE_TAG_OPEN);
         out.push_str(core);
         out.push_str(CORE_TAG_CLOSE);
+        out.push_str(&agents_block);
+        out.push_str(agents_sep);
         out.push_str(ROLE_TAG_OPEN);
         out.push_str(role_str);
         out.push_str(ROLE_TAG_CLOSE);

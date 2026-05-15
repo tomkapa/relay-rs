@@ -238,6 +238,11 @@ async fn retrieve_contextual(
     let filter = SearchFilter {
         kinds: Some(vec![
             MemoryKind::Other,
+            // Collaborator joins the contextual allowlist
+            // (doc/agent_discovery_plan.md §4.4) — collaborator knowledge
+            // is by nature contextual, surfaced only when the session is
+            // about something that calls for delegation.
+            MemoryKind::Collaborator,
             MemoryKind::Procedure,
             MemoryKind::Open,
         ]),

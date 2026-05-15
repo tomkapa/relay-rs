@@ -19,8 +19,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use relay_rs::agent_core::AgentBuilder;
 use relay_rs::agents::{
-    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, CachedAgents, PgAgentStore,
-    SharedAgentStore, SharedAgents,
+    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, CachedAgents, SharedAgentStore,
+    SharedAgents,
 };
 use relay_rs::clock::SystemClock;
 use relay_rs::hook::HookChain;
@@ -105,7 +105,8 @@ pub async fn build_harness(provider: Arc<ScriptedProvider>) -> WorkerHarness {
 
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
-    let agent_store: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
+    let agent_store: SharedAgentStore =
+        super::pg::shared_agent_store(db.pool.clone(), clock.clone());
     let dag: SharedDagBudget = Arc::new(PgDagBudget::new(db.pool.clone()));
     let memory_store: relay_rs::memory::SharedMemoryStore =
         Arc::new(relay_rs::memory::PgMemoryStore::new(

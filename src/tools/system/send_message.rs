@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::agents::{AgentId, AgentStoreError, SharedAgentStore};
+use crate::agents::{AgentId, AgentName, AgentStoreError, SharedAgentStore};
 use crate::observability::log::preview;
 use crate::runtime::IdempotencyKey;
 use crate::runtime::PromptError;
@@ -55,15 +55,23 @@ use crate::types::{MessageSender, PROMPT_MAX_BYTES, Participant, Prompt, ToolNam
 
 use super::super::traits::{Tool, ToolCallContext, ToolError};
 
-/// Wire-side participant shape — `{"kind":"human"}` or
-/// `{"kind":"agent","agent_id":"…"}`. Same JSON envelope as
-/// [`Participant`]'s serde, but the deserialiser lives on the tool input so
-/// invalid shapes surface as a tool input error (not a serde panic).
+/// Wire-side receiver shape — `{"kind":"human"}` or
+/// `{"kind":"agent","name":"<role>"}`. The model addresses peers by role
+/// name (doc/agent_discovery_plan.md §7); the id-based path is removed
+/// because there is no model-facing surface that produces ids any more
+/// (CLAUDE.md §13 — no compat hacks pre-release).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SendMessageReceiver {
+    Human,
+    Agent { name: AgentName },
+}
+
 #[derive(Debug, Deserialize)]
 struct SendMessageInput {
     /// Who to send to — `{"kind":"human"}` or
-    /// `{"kind":"agent","agent_id":"…"}`.
-    receiver: Participant,
+    /// `{"kind":"agent","name":"<role>"}`.
+    receiver: SendMessageReceiver,
     /// The message body. Same `PROMPT_MAX_BYTES` cap as the HTTP boundary.
     content: String,
     /// REQUIRED only the first time you message this receiver in the current
@@ -111,10 +119,12 @@ const ERR_SYSTEM_RECEIVER: &str = "send_message: cannot deliver to System";
 const TOOL_DESCRIPTION: &str = "Send a message to a participant. \
     Use this for ALL communication including replies to the human — plain \
     assistant text is not delivered. \
-    Arguments: `receiver` (who to send to: Human, or Agent with id), \
-    `content` (the message body), and `context_summary` (REQUIRED only the \
+    Arguments: `receiver` is either `{\"kind\":\"human\"}` or \
+    `{\"kind\":\"agent\",\"name\":\"<role>\"}` where `<role>` is one of the \
+    names in your `<agents>` block (or returned by `search_agents`); \
+    `content` is the message body; `context_summary` is REQUIRED only the \
     first time you message this receiver in the current task — a brief \
-    framing of why you're contacting them and what you need; IGNORE on \
+    framing of why you're contacting them and what you need (IGNORE on \
     follow-ups, the system drops it). \
     The system decides whether a session already exists; do not specify a \
     session id.";
@@ -149,10 +159,10 @@ impl SendMessageTool {
                             "additionalProperties": false
                         },
                         {
-                            "required": ["kind", "agent_id"],
+                            "required": ["kind", "name"],
                             "properties": {
                                 "kind": { "const": "agent" },
-                                "agent_id": { "type": "string", "format": "uuid" }
+                                "name": { "type": "string", "minLength": 1 }
                             },
                             "additionalProperties": false
                         }
@@ -179,7 +189,9 @@ impl SendMessageTool {
     }
 
     /// Up-front input validation. Returns `(content, context_summary,
-    /// receiver)` so the main path is straight-line.
+    /// receiver)` so the main path is straight-line. The wire-side
+    /// `{kind:"agent", name:<role>}` shape resolves through
+    /// [`Self::resolve_receiver`] before any session / queue work.
     async fn validate(
         &self,
         input: SendMessageInput,
@@ -199,20 +211,6 @@ impl SendMessageTool {
             )));
         }
 
-        // Self-message would create a one-party session: representationally
-        // invalid (CLAUDE.md §1).
-        if input.receiver == ctx.viewer {
-            set_outcome("invalid_input");
-            return Err(ToolError::InvalidInput(
-                "send_message: receiver equals caller".into(),
-            ));
-        }
-
-        if input.receiver.is_system() {
-            set_outcome("invalid_input");
-            return Err(ToolError::InvalidInput(ERR_SYSTEM_RECEIVER.into()));
-        }
-
         // Caller must be an agent — humans don't run tool calls. This also
         // means we always have a `caller_agent_id` to record on the session
         // and (for human receiver) to attribute the AgentMessage chunk.
@@ -223,31 +221,49 @@ impl SendMessageTool {
             ));
         }
 
-        // For an agent receiver, validate the row exists up-front so a typed
-        // error reaches the model before we touch sessions/queue. The Human
-        // branch needs no agent lookup. NotFound is the model's fault
-        // (`InvalidInput`); a DB-level failure is infrastructure (`Backend`).
-        if let Participant::Agent { agent_id } = input.receiver {
-            match self.agents.read(agent_id).await {
-                Ok(_) => {}
-                Err(AgentStoreError::NotFound(_)) => {
-                    set_outcome("unknown_agent");
-                    warn!(relay.agent.id = %agent_id, "send_message.unknown_agent");
-                    return Err(ToolError::InvalidInput(format!(
-                        "send_message: unknown agent {agent_id}"
-                    )));
-                }
-                Err(e) => {
-                    set_outcome("backend_error");
-                    warn!(error = %e, relay.agent.id = %agent_id, "send_message.agent_lookup_failed");
-                    return Err(ToolError::Backend(format!(
-                        "send_message: agent lookup: {e}"
-                    )));
-                }
-            }
+        let receiver = self.resolve_receiver(input.receiver).await?;
+
+        // Self-message would create a one-party session: representationally
+        // invalid (CLAUDE.md §1).
+        if receiver == ctx.viewer {
+            set_outcome("invalid_input");
+            return Err(ToolError::InvalidInput(
+                "send_message: receiver equals caller".into(),
+            ));
         }
 
-        Ok((content, input.context_summary, input.receiver))
+        if receiver.is_system() {
+            set_outcome("invalid_input");
+            return Err(ToolError::InvalidInput(ERR_SYSTEM_RECEIVER.into()));
+        }
+
+        Ok((content, input.context_summary, receiver))
+    }
+
+    /// Resolve the wire-side receiver into a [`Participant`]. The agent
+    /// branch hits the store for case-insensitive name lookup; the human
+    /// branch is direct. NotFound is the model's fault (`InvalidInput`);
+    /// a DB-level failure is infrastructure (`Backend`).
+    async fn resolve_receiver(&self, raw: SendMessageReceiver) -> Result<Participant, ToolError> {
+        let name = match raw {
+            SendMessageReceiver::Human => return Ok(Participant::Human),
+            SendMessageReceiver::Agent { name } => name,
+        };
+        let record = self.agents.read_by_name(&name).await.map_err(|e| match e {
+            AgentStoreError::NameNotFound(_) => {
+                set_outcome("unknown_agent");
+                warn!(relay.agent.name = %name, "send_message.unknown_agent");
+                ToolError::InvalidInput(format!("send_message: unknown agent name {name}"))
+            }
+            err => {
+                set_outcome("backend_error");
+                warn!(error = %err, relay.agent.name = %name, "send_message.agent_lookup_failed");
+                ToolError::Backend(format!("send_message: agent lookup: {err}"))
+            }
+        })?;
+        Ok(Participant::Agent {
+            agent_id: record.id,
+        })
     }
 
     /// Opening framing — only on a freshly-minted receiver session, and only

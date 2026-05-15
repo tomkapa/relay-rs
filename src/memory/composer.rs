@@ -33,6 +33,7 @@ pub const MEMORY_TAG_CLOSE: &str = "\n</memory>";
 const KIND_ORDER: &[MemoryKind] = &[
     MemoryKind::Identity,
     MemoryKind::Other,
+    MemoryKind::Collaborator,
     MemoryKind::Procedure,
     MemoryKind::Open,
 ];

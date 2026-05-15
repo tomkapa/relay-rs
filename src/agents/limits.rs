@@ -7,6 +7,33 @@ use std::time::Duration;
 /// `octet_length(name) BETWEEN 1 AND 64` check on the `agents` table.
 pub const AGENT_NAME_MAX_LEN: usize = 64;
 
+/// Maximum length, in bytes, of an agent's operator-curated description.
+///
+/// Sized for ~one sentence (doc/agent_discovery_plan.md §5.4): short
+/// enough to be quick to read in a top-K `search_agents` list, large
+/// enough to carry useful "what's this role for" signal. Mirrors the
+/// `octet_length(description) BETWEEN 1 AND 512` check on the `agents`
+/// table.
+pub const AGENT_DESCRIPTION_MAX_LEN: usize = 512;
+
+/// Hard cap on the number of agent names rendered inline in the `<agents>` block.
+///
+/// (doc/agent_discovery_plan.md §8) Below the cap the full alphabetised list
+/// renders; above it the block degrades to a one-line "use `search_agents`"
+/// notice. Sized to comfortably cover realistic mid-market deployments
+/// without forcing every routine hop through semantic search.
+pub const MAX_AGENT_NAMES_INLINE: usize = 128;
+
+/// Top-K cap on a single `search_agents` result page.
+///
+/// (doc/agent_discovery_plan.md §7) Same order of magnitude as
+/// [`crate::memory::RECALL_MAX_RESULTS`] so the model's per-turn token
+/// budget for a single discovery hop stays bounded.
+pub const MAX_SEARCH_AGENT_RESULTS: u8 = 8;
+
+/// Default top-K for `search_agents` when the caller omits `limit`.
+pub const DEFAULT_SEARCH_AGENT_RESULTS: u8 = 4;
+
 /// Maximum length, in bytes, of an agent's role-specific system prompt.
 ///
 /// Mirrors the `octet_length(system_prompt) BETWEEN 1 AND 65536` check on the

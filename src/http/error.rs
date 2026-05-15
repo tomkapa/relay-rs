@@ -63,6 +63,9 @@ impl IntoResponse for HttpError {
             | Self::Agent(AgentStoreError::NotFound(_)) => {
                 (StatusCode::BAD_REQUEST, "unknown agent_id".into())
             }
+            Self::Agent(AgentStoreError::NameNotFound(_)) => {
+                (StatusCode::NOT_FOUND, self.to_string())
+            }
             Self::Session(SessionError::MessageCapExceeded { .. })
             | Self::Prompt(PromptError::PendingCapExceeded { .. })
             | Self::Mcp(McpError::ServerCapExceeded { .. }) => {

@@ -6,14 +6,20 @@
 //! §8 — zero-dep bias). pgvector's operators (`<=>` cosine distance,
 //! `<->` L2) handle similarity math server-side, so we don't need a
 //! parallel cosine implementation in Rust.
+//!
+//! Lives at the crate root because two unrelated subsystems (`agents`
+//! and `memory`) both write pgvector columns — keeping the encoder under
+//! `memory` would leak that module's name into every Postgres adapter.
 
 use std::fmt::Write;
 
-/// Encode a `&[f32]` as a pgvector literal — `[v0,v1,...]`. Returns the
-/// rendered string ready to bind as a `TEXT` parameter; the pg server
-/// casts it to `vector` automatically when the target column is typed.
+/// Encode a `&[f32]` as a pgvector literal — `[v0,v1,...]`.
+///
+/// Returns the rendered string ready to bind as a `TEXT` parameter; the
+/// pg server casts it to `vector` automatically when the target column
+/// is typed.
 #[must_use]
-pub(super) fn encode(v: &[f32]) -> String {
+pub fn encode(v: &[f32]) -> String {
     let mut out = String::with_capacity(v.len() * 12 + 2);
     out.push('[');
     for (i, x) in v.iter().enumerate() {

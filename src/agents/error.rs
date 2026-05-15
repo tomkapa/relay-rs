@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::types::ParseError;
 
-use super::types::AgentId;
+use super::types::{AgentId, AgentName};
 
 /// All failure modes of the agents subsystem. CLAUDE.md §12: one error per module
 /// boundary so callers exhaustively match.
@@ -10,6 +10,11 @@ use super::types::AgentId;
 pub enum AgentStoreError {
     #[error("agent {0:?} not found")]
     NotFound(AgentId),
+
+    /// Case-insensitive name lookup miss. Surfaces to the model when it
+    /// tries to `send_message` a peer that does not exist.
+    #[error("agent named {0:?} not found")]
+    NameNotFound(AgentName),
 
     /// `default_id()` was called before the init seeder ran. A correctly composed
     /// `Server` always seeds before exposing the store, so this is a programmer

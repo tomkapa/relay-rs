@@ -17,9 +17,9 @@ use tracing::{info, warn};
 
 use crate::agent_core::{Agent, AgentBuilder};
 use crate::agents::{
-    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, AgentName, AgentPromptCache,
-    AgentSystemPrompt, CachedAgents, DefaultAgentSeed, PgAgentStore, SharedAgentStore,
-    SharedAgents,
+    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentDescription, AgentFactory, AgentName,
+    AgentNamesCache, AgentPromptCache, AgentSystemPrompt, CachedAgents, DefaultAgentSeed,
+    PgAgentStore, SharedAgentStore, SharedAgents,
 };
 use crate::clock::{SharedClock, SystemClock};
 use crate::config::{EmbeddingSettings, ProviderSettings, Settings};
@@ -50,8 +50,8 @@ use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::system::{
     CancelScheduledTaskTool, GetSessionTool, ListScheduledTasksTool, MemoryForgetTool,
     MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool, RecallTool,
-    SCHEDULING_CORE_PROMPT_SUPPLEMENT, ScheduleTaskTool, SendMessageTool, WebFetchTool,
-    WebSearchTool,
+    SCHEDULING_CORE_PROMPT_SUPPLEMENT, ScheduleTaskTool, SearchAgentsTool, SendMessageTool,
+    WebFetchTool, WebSearchTool,
 };
 use crate::tools::{ToolBox, ToolRegistry};
 
@@ -134,6 +134,25 @@ const CORE_SYSTEM_PROMPT: &str = "<identity>\n\
     or (b) the agent who messaged you has explicitly asked you to report \
     to the human. When in doubt, reply to whoever asked you and let them \
     decide what to forward.\n\
+    \n\
+    Choosing a recipient — the delegation order. When an incoming \
+    message asks for work outside your role, do not attempt it; \
+    delegate. Pick a recipient in this strict order:\n\
+    \n\
+    1. A name your role prompt directly names (your procedural peers).\n\
+    2. A name your `<memory>` records as the right collaborator for this \
+    kind of task (Collaborator-kind entries).\n\
+    3. A name in `<agents>` whose role obviously fits the task.\n\
+    4. The top result of `search_agents(query)` when steps 1–3 don't \
+    yield a clear answer.\n\
+    \n\
+    If `search_agents` returns nothing relevant, `send_message` the human \
+    asking which collaborator should own this — or whether to drop the \
+    request. Do not improvise the work yourself.\n\
+    \n\
+    After a delegation that started with `search_agents` succeeds, write \
+    a `memory_write(kind=\"collaborator\", ...)` recording who you used \
+    and why, so future-you skips the search.\n\
     </chain_of_command>";
 
 /// `<core>` block injected for `RequestKind::Reflection` turns. Reflects
@@ -198,6 +217,12 @@ const DEFAULT_AGENT_ROLE_PROMPT: &str = "You are the user's general assistant, \
     musings, and ask one focused clarifying question when the request is \
     genuinely ambiguous.";
 
+/// Operator-facing, model-readable one-line description for the default
+/// agent. Seeded alongside the role prompt; later operator edits to this
+/// constant do **not** propagate (owned by the DB after first insert).
+const DEFAULT_AGENT_DESCRIPTION: &str = "General-purpose assistant for the human: \
+    drafting, summarising, planning, lookups, and following through on multi-step tasks.";
+
 /// All the pieces a deployment needs to serve HTTP + run workers in-process.
 #[derive(Debug)]
 pub struct Server {
@@ -232,6 +257,10 @@ struct Collaborators {
 }
 
 impl Collaborators {
+    // Composition root: a straight-line constructor that wires every
+    // collaborator once. The line cap (CLAUDE.md §4) targets logic
+    // functions; this one is configuration plus binding, not branching.
+    #[allow(clippy::too_many_lines)]
     async fn new(settings: &Settings) -> Result<Self, AppError> {
         let http = build_http_client()?;
         let clock = SystemClock::shared();
@@ -241,8 +270,15 @@ impl Collaborators {
             .await
             .map_err(|source| AppError::Migrate { source })?;
 
+        let embedding_provider: SharedEmbeddingProvider =
+            build_embedding_provider(&settings.embedding);
+
         // Downstream (HTTP, worker, memory) assumes `agents.default_id()` resolves.
-        let agents_impl = Arc::new(PgAgentStore::new(pool.clone(), clock.clone()));
+        let agents_impl = Arc::new(PgAgentStore::new(
+            pool.clone(),
+            clock.clone(),
+            embedding_provider.clone(),
+        ));
         let seed = default_agent_seed()?;
         agents_impl.seed_default(seed).await?;
         let agents: SharedAgentStore = agents_impl;
@@ -255,8 +291,7 @@ impl Collaborators {
             AGENT_PROMPT_CACHE_TTL,
             clock.clone(),
         );
-        let embedding_provider: SharedEmbeddingProvider =
-            build_embedding_provider(&settings.embedding);
+        let names_cache = AgentNamesCache::new(AGENT_PROMPT_CACHE_TTL, clock.clone());
         let memory_store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
             pool.clone(),
             clock.clone(),
@@ -287,6 +322,7 @@ impl Collaborators {
         let memory: SharedMemory = Arc::new(AgentMemory::new(
             agents.clone(),
             cache,
+            names_cache,
             memory_loader.clone(),
             cores,
         ));
@@ -444,6 +480,10 @@ fn build_builtin_tools(deps: BuiltinToolDeps<'_>) -> Result<ToolRegistry, AppErr
         .with(Arc::new(MemoryValidateTool::new(deps.memory_tools.clone())))
         .with(Arc::new(RecallTool::new(
             deps.memory_tools,
+            deps.embedding_provider.clone(),
+        )))
+        .with(Arc::new(SearchAgentsTool::new(
+            deps.agents.clone(),
             deps.embedding_provider,
         )))
         .with(Arc::new(ScheduleTaskTool::new(
@@ -462,6 +502,7 @@ fn default_agent_seed() -> Result<DefaultAgentSeed, AppError> {
     Ok(DefaultAgentSeed {
         name: AgentName::try_from(DEFAULT_AGENT_NAME)?,
         system_prompt: AgentSystemPrompt::try_from(DEFAULT_AGENT_ROLE_PROMPT)?,
+        description: AgentDescription::try_from(DEFAULT_AGENT_DESCRIPTION)?,
     })
 }
 

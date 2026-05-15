@@ -43,7 +43,7 @@ use serde_json::json;
 use relay_rs::agent_core::AgentBuilder;
 use relay_rs::agents::{
     AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, AgentId, AgentName,
-    AgentSystemPrompt, CachedAgents, NewAgent, PgAgentStore, SharedAgentStore, SharedAgents,
+    AgentSystemPrompt, CachedAgents, NewAgent, SharedAgentStore, SharedAgents,
 };
 use relay_rs::clock::SystemClock;
 use relay_rs::hook::HookChain;
@@ -140,7 +140,8 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
     // ── Agents — Coordinator is the seeded default; Translator is a fresh
     // row created against the live agents store. ─────────────────────────
     let coordinator_id = db.default_agent_id;
-    let agent_store: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
+    let agent_store: SharedAgentStore =
+        common::pg::shared_agent_store(db.pool.clone(), clock.clone());
     let translator_record = agent_store
         .create(NewAgent {
             name: AgentName::try_from("translator").expect("name"),
@@ -148,6 +149,10 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
                 "You translate phrases into French. Reply via send_message.",
             )
             .expect("prompt"),
+            description: relay_rs::agents::AgentDescription::try_from(
+                "Translates phrases between English and other languages.",
+            )
+            .expect("desc"),
             is_default: false,
             allowed_mcp_servers: relay_rs::agents::AllowedMcpServers::empty(),
         })
@@ -168,7 +173,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         vec![
             // Run 1: delegate.
             send_message_chunk(
-                json!({ "kind": "agent", "agent_id": translator_id.as_uuid().to_string() }),
+                json!({ "kind": "agent", "name": "translator" }),
                 "translate 'hello' to French, reply with the single word",
                 "co-call-1",
             ),
@@ -186,7 +191,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         "translator",
         vec![
             send_message_chunk(
-                json!({ "kind": "agent", "agent_id": coordinator_id.as_uuid().to_string() }),
+                json!({ "kind": "agent", "name": "test-default" }),
                 "bonjour",
                 "tr-call-1",
             ),

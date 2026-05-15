@@ -48,13 +48,16 @@ crate::str_enum! {
     /// constraint and operator UI are unaffected.
     pub enum MemoryKind {
         /// Identity, style, preferences ("I default to terse replies").
-        Identity   => "self",
-        /// Beliefs about specific peers or humans.
-        Other      => "other",
+        Identity     => "self",
+        /// Beliefs about specific peers or humans (external).
+        Other        => "other",
+        /// Beliefs about other *agents* in the network, written from the
+        /// agent's delegation experience (doc/agent_discovery_plan.md §4).
+        Collaborator => "collaborator",
         /// Learned how-tos.
-        Procedure  => "procedure",
+        Procedure    => "procedure",
         /// Known unknowns.
-        Open       => "open",
+        Open         => "open",
     }
 }
 
@@ -68,6 +71,7 @@ impl MemoryKind {
         match self {
             Self::Identity => "Self",
             Self::Other => "Other",
+            Self::Collaborator => "Collaborator",
             Self::Procedure => "Procedure",
             Self::Open => "Open",
         }

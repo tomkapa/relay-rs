@@ -26,9 +26,11 @@ const TOOL_DESCRIPTION: &str = "Persist a new memory the agent should carry acro
      DO NOT use on weak or implicit signals; reflection turns capture those.\n\
      \n\
      Arguments: `kind` is one of \"self\" (identity, style, preferences), \"other\" \
-     (beliefs about specific peers), \"procedure\" (learned how-tos), \"open\" \
-     (known unknowns); `content` is one or two sentences (max 4096 bytes). New \
-     memories land at `tentative` state and need independent confirmation to promote.";
+     (beliefs about specific peers or humans), \"collaborator\" (beliefs about \
+     other agents in your network, written after a successful delegation), \
+     \"procedure\" (learned how-tos), \"open\" (known unknowns); `content` is one \
+     or two sentences (max 4096 bytes). New memories land at `tentative` state \
+     and need independent confirmation to promote.";
 
 #[derive(Debug, Deserialize)]
 struct Input {
@@ -65,7 +67,7 @@ impl MemoryWriteTool {
             "type": "object",
             "required": ["kind", "content"],
             "properties": {
-                "kind": { "type": "string", "enum": ["self", "other", "procedure", "open"] },
+                "kind": { "type": "string", "enum": ["self", "other", "collaborator", "procedure", "open"] },
                 "content": { "type": "string", "minLength": 1, "maxLength": 4096 }
             },
             "additionalProperties": false,

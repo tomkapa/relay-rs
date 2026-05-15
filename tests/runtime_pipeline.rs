@@ -17,8 +17,8 @@ use futures::StreamExt;
 
 use relay_rs::agent_core::AgentBuilder;
 use relay_rs::agents::{
-    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, CachedAgents, PgAgentStore,
-    SharedAgentStore, SharedAgents,
+    AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentFactory, CachedAgents, SharedAgentStore,
+    SharedAgents,
 };
 use relay_rs::clock::SystemClock;
 use relay_rs::hook::HookChain;
@@ -117,7 +117,8 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
     let provider: SharedProvider = provider;
     let memory: SharedMemory = Arc::new(StaticMemory::new("test"));
     let model = ModelId::try_from("test-model").expect("model");
-    let agent_store: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
+    let agent_store: SharedAgentStore =
+        common::pg::shared_agent_store(db.pool.clone(), clock.clone());
     let dag: SharedDagBudget = Arc::new(PgDagBudget::new(db.pool.clone()));
     // The worker's ping-pong guard requires every successful turn to call
     // send_message, so test scripts must invoke it.

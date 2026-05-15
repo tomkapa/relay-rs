@@ -4,6 +4,12 @@
 //! SQL — so a `TestClock`-driven test sees stable timestamps (CLAUDE.md §11). Ids
 //! cross the SQL boundary via the macro-generated `sqlx::Type` impl on
 //! [`AgentId`].
+//!
+//! `description` is embedded synchronously before opening a transaction on every
+//! create / description-update path (doc/agent_discovery_plan.md §5.3) — same
+//! pattern the memory store uses (CLAUDE.md §5). The embedding backs
+//! `search_agents`; a row whose description embed call fails never lands, so
+//! discovery cannot silently skip an agent.
 
 use std::fmt;
 
@@ -13,12 +19,21 @@ use sqlx::PgPool;
 
 use crate::clock::SharedClock;
 use crate::mcp::McpServerId;
+use crate::pg_vector;
+use crate::provider::{SharedEmbeddingProvider, embed_one};
 
 use super::error::AgentStoreError;
 use super::store::{AgentStore, AgentUpdate, NewAgent};
 use super::types::{
-    AgentId, AgentName, AgentRecord, AgentSystemPrompt, AllowedMcpServers, DefaultAgentSeed,
+    AgentCard, AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt,
+    AllowedMcpServers, DefaultAgentSeed,
 };
+
+/// Hard cap on `list_names` SQL — fetched batches are bounded per
+/// CLAUDE.md §5. Sized at 4× the inline-render cap; the renderer already
+/// degrades above [`MAX_AGENT_NAMES_INLINE`], so this LIMIT just keeps
+/// the wire transfer bounded if the registry grows past that.
+const LIST_NAMES_MAX_ROWS: i64 = 512;
 
 /// Transaction-scoped advisory-lock key used by [`PgAgentStore::seed_default`] to
 /// serialise its "check default exists, insert if not" critical section across
@@ -30,24 +45,39 @@ const AGENT_DEFAULT_SEED_LOCK_KEY: i64 = 0x6167_656E_745F_6473;
 /// Single source of truth for the `agents` column list. Every SELECT that
 /// hydrates an [`AgentRow`] must use this — adding a column then becomes a
 /// one-line edit here plus the matching `AgentRow` field.
-const AGENT_COLS: &str = "id, name, system_prompt, is_default, \
+const AGENT_COLS: &str = "id, name, system_prompt, description, is_default, \
     allowed_mcp_servers, created_at, updated_at";
 
-/// Postgres-backed [`AgentStore`]. Holds a cheap clone of a [`PgPool`] and a
-/// [`SharedClock`]; safe to share across the runtime.
+/// Postgres-backed [`AgentStore`]. Holds a cheap clone of a [`PgPool`], a
+/// [`SharedClock`], and a [`SharedEmbeddingProvider`] for `description`
+/// embedding; safe to share across the runtime.
 pub struct PgAgentStore {
     pool: PgPool,
     clock: SharedClock,
+    embeddings: SharedEmbeddingProvider,
 }
 
 impl PgAgentStore {
     #[must_use]
-    pub fn new(pool: PgPool, clock: SharedClock) -> Self {
-        Self { pool, clock }
+    pub fn new(pool: PgPool, clock: SharedClock, embeddings: SharedEmbeddingProvider) -> Self {
+        Self {
+            pool,
+            clock,
+            embeddings,
+        }
     }
 
     fn now(&self) -> DateTime<Utc> {
         DateTime::<Utc>::from(self.clock.now_wall())
+    }
+
+    /// Embed `description` synchronously. Errors propagate so the
+    /// mutation aborts before the row lands; no `<agents>` entry is
+    /// discoverable via `search_agents` without a vector to match.
+    async fn embed(&self, description: &str) -> Result<Vec<f32>, AgentStoreError> {
+        embed_one(self.embeddings.as_ref(), description)
+            .await
+            .map_err(|e| AgentStoreError::Backend(format!("description embed: {e}")))
     }
 
     /// Idempotent seed: insert `seed` as the default agent if no default row
@@ -58,6 +88,12 @@ impl PgAgentStore {
     /// lock; the partial unique index `agents_default_unique` is the last line
     /// of defence if the lock is bypassed.
     pub async fn seed_default(&self, seed: DefaultAgentSeed) -> Result<AgentId, AgentStoreError> {
+        // Embed before opening the transaction so a slow embedding call
+        // does not hold the advisory lock. On embed failure the seeder
+        // aborts without inserting; the next process start will retry.
+        let embedding = self.embed(seed.description.as_str()).await?;
+        let embedding_literal = pg_vector::encode(&embedding);
+
         let now = self.now();
         let mut tx = self.pool.begin().await?;
 
@@ -81,12 +117,15 @@ impl PgAgentStore {
         // operator opts it in to specific servers via PUT after startup.
         sqlx::query(
             "INSERT INTO agents \
-                 (id, name, system_prompt, is_default, created_at, updated_at) \
-             VALUES ($1, $2, $3, TRUE, $4, $4)",
+                 (id, name, system_prompt, description, description_embedding, \
+                  is_default, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5::vector, TRUE, $6, $6)",
         )
         .bind(id)
         .bind(seed.name.as_str())
         .bind(seed.system_prompt.as_str())
+        .bind(seed.description.as_str())
+        .bind(embedding_literal)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -105,6 +144,13 @@ impl fmt::Debug for PgAgentStore {
 #[async_trait]
 impl AgentStore for PgAgentStore {
     async fn create(&self, payload: NewAgent) -> Result<AgentRecord, AgentStoreError> {
+        // Embed before opening the transaction — same as memory store
+        // (CLAUDE.md §11 timing rule and the no-locks-held-across-IO
+        // principle). On embed failure the create aborts with no row
+        // inserted.
+        let embedding = self.embed(payload.description.as_str()).await?;
+        let embedding_literal = pg_vector::encode(&embedding);
+
         let now = self.now();
         let mut tx = self.pool.begin().await?;
 
@@ -123,13 +169,15 @@ impl AgentStore for PgAgentStore {
         let id = AgentId::new();
         sqlx::query(
             "INSERT INTO agents \
-                 (id, name, system_prompt, is_default, allowed_mcp_servers, \
-                  created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+                 (id, name, system_prompt, description, description_embedding, \
+                  is_default, allowed_mcp_servers, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $8)",
         )
         .bind(id)
         .bind(payload.name.as_str())
         .bind(payload.system_prompt.as_str())
+        .bind(payload.description.as_str())
+        .bind(embedding_literal)
         .bind(payload.is_default)
         .bind(payload.allowed_mcp_servers.as_slice())
         .bind(now)
@@ -142,6 +190,7 @@ impl AgentStore for PgAgentStore {
             id,
             name: payload.name,
             system_prompt: payload.system_prompt,
+            description: payload.description,
             is_default: payload.is_default,
             allowed_mcp_servers: payload.allowed_mcp_servers,
             created_at: now,
@@ -172,6 +221,14 @@ impl AgentStore for PgAgentStore {
         id: AgentId,
         payload: AgentUpdate,
     ) -> Result<AgentRecord, AgentStoreError> {
+        // Embed the new description before opening the transaction so we
+        // don't hold row locks across a network call. Empty payload.description
+        // keeps the existing embedding.
+        let new_embedding = match payload.description.as_ref() {
+            Some(d) => Some(self.embed(d.as_str()).await?),
+            None => None,
+        };
+
         let now = self.now();
         let mut tx = self.pool.begin().await?;
 
@@ -197,6 +254,9 @@ impl AgentStore for PgAgentStore {
         if let Some(system_prompt) = payload.system_prompt {
             current.system_prompt = system_prompt;
         }
+        if let Some(description) = payload.description {
+            current.description = description;
+        }
         if let Some(allowed) = payload.allowed_mcp_servers {
             current.allowed_mcp_servers = allowed;
         }
@@ -216,15 +276,22 @@ impl AgentStore for PgAgentStore {
 
         current.updated_at = now;
 
+        // `description_embedding` only moves when `description` does;
+        // a `COALESCE($N::vector, description_embedding)` keeps the
+        // existing vector untouched on the other update paths.
+        let embedding_arg = new_embedding.as_deref().map(pg_vector::encode);
         sqlx::query(
             "UPDATE agents \
-             SET name = $2, system_prompt = $3, is_default = $4, \
-                 allowed_mcp_servers = $5, updated_at = $6 \
+             SET name = $2, system_prompt = $3, description = $4, \
+                 description_embedding = COALESCE($5::vector, description_embedding), \
+                 is_default = $6, allowed_mcp_servers = $7, updated_at = $8 \
              WHERE id = $1",
         )
         .bind(id)
         .bind(current.name.as_str())
         .bind(current.system_prompt.as_str())
+        .bind(current.description.as_str())
+        .bind(embedding_arg)
         .bind(current.is_default)
         .bind(current.allowed_mcp_servers.as_slice())
         .bind(now)
@@ -270,6 +337,68 @@ impl AgentStore for PgAgentStore {
         let (id,) = row.ok_or(AgentStoreError::NoDefault)?;
         Ok(id)
     }
+
+    async fn read_by_name(&self, name: &AgentName) -> Result<AgentRecord, AgentStoreError> {
+        let sql = format!("SELECT {AGENT_COLS} FROM agents WHERE lower(name) = lower($1)");
+        let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(&sql)
+            .bind(name.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        let row = row.ok_or_else(|| AgentStoreError::NameNotFound(name.clone()))?;
+        row.try_into()
+    }
+
+    async fn list_names(&self) -> Result<Vec<(AgentId, AgentName)>, AgentStoreError> {
+        let rows: Vec<(AgentId, String)> =
+            sqlx::query_as("SELECT id, name FROM agents ORDER BY lower(name) ASC LIMIT $1")
+                .bind(LIST_NAMES_MAX_ROWS)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, name) in rows {
+            out.push((id, AgentName::try_from(name)?));
+        }
+        Ok(out)
+    }
+
+    async fn search_by_description(
+        &self,
+        embedding: &[f32],
+        viewer: AgentId,
+        k: usize,
+    ) -> Result<Vec<AgentCard>, AgentStoreError> {
+        if embedding.is_empty() || k == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(k).unwrap_or(i64::MAX);
+
+        // Caller-excluded at the SQL boundary so the self row never lands
+        // in the projection — keeps the three caller-excluded surfaces
+        // (`<agents>`, `search_agents`, `send_message`) consistent.
+        let rows: Vec<(AgentId, String, String)> = sqlx::query_as(
+            "SELECT id, name, description \
+             FROM agents \
+             WHERE description_embedding IS NOT NULL \
+               AND id <> $3 \
+             ORDER BY description_embedding <=> $1::vector ASC \
+             LIMIT $2",
+        )
+        .bind(pg_vector::encode(embedding))
+        .bind(limit)
+        .bind(viewer)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, name, description) in rows {
+            out.push(AgentCard {
+                id,
+                name: AgentName::try_from(name)?,
+                description: AgentDescription::try_from(description)?,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -277,6 +406,7 @@ struct AgentRow {
     id: AgentId,
     name: String,
     system_prompt: String,
+    description: String,
     is_default: bool,
     allowed_mcp_servers: Vec<McpServerId>,
     created_at: DateTime<Utc>,
@@ -291,6 +421,7 @@ impl TryFrom<AgentRow> for AgentRecord {
             id: row.id,
             name: AgentName::try_from(row.name)?,
             system_prompt: AgentSystemPrompt::try_from(row.system_prompt)?,
+            description: AgentDescription::try_from(row.description)?,
             is_default: row.is_default,
             allowed_mcp_servers: AllowedMcpServers::try_from(row.allowed_mcp_servers)?,
             created_at: row.created_at,

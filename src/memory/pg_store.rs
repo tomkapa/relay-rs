@@ -16,6 +16,7 @@ use sqlx::{PgPool, Row};
 
 use crate::agents::AgentId;
 use crate::clock::SharedClock;
+use crate::pg_vector;
 use crate::provider::SharedEmbeddingProvider;
 use crate::runtime::PromptRequestId;
 
@@ -29,7 +30,6 @@ use super::types::{
     ContradictionEventId, MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState,
     MutationKind, MutationSourceKind, ValidationEventId,
 };
-use super::vector;
 
 /// Column list reused by every `agent_memories` SELECT — keeping it in one
 /// place removes drift between `list` / `get` / `lock_existing` and the
@@ -262,7 +262,7 @@ impl MemoryStore for PgMemoryStore {
 
         let rows = sqlx::query(&sql)
             .bind(agent)
-            .bind(vector::encode(embedding))
+            .bind(pg_vector::encode(embedding))
             .bind(kinds_arg)
             .bind(min_state_priority)
             .bind(limit)
@@ -957,7 +957,7 @@ async fn apply_write(
 
     insert_event(tx, event_id, agent, memory_id, source, now, &payload).await?;
 
-    let embedding_lit = vector::encode(&embedding);
+    let embedding_lit = pg_vector::encode(&embedding);
     let sql = format!(
         "INSERT INTO agent_memories
              (id, agent_id, kind, content, state, pinned,
@@ -1009,7 +1009,7 @@ async fn apply_update(
 
     insert_event(tx, event_id, agent, target, source, now, &payload).await?;
 
-    let embedding_lit = vector::encode(&embedding);
+    let embedding_lit = pg_vector::encode(&embedding);
     let sql = format!(
         "UPDATE agent_memories SET content = $1, state = $2, embedding = $3::vector WHERE id = $4
          RETURNING {MEMORY_ROW_COLUMNS}",

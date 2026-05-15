@@ -26,7 +26,6 @@ mod r#static;
 mod store;
 mod traits;
 mod types;
-mod vector;
 
 // --- per-turn system-prompt assembly --------------------------------------
 pub use agent::{

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use relay_rs::agents::{AgentName, AgentSystemPrompt, NewAgent, PgAgentStore, SharedAgentStore};
+use relay_rs::agents::{AgentName, AgentSystemPrompt, NewAgent, SharedAgentStore};
 use relay_rs::clock::SystemClock;
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{PgSessionStore, SessionStore};
@@ -26,11 +26,12 @@ fn store(db: &TestDb) -> Arc<PgSessionStore> {
 /// can reference it. Returns the [`Participant::Agent`] wrapping its id.
 async fn fresh_agent(db: &TestDb, name: &str) -> Participant {
     let store: SharedAgentStore =
-        Arc::new(PgAgentStore::new(db.pool.clone(), SystemClock::shared()));
+        common::pg::shared_agent_store(db.pool.clone(), SystemClock::shared());
     let record = store
         .create(NewAgent {
             name: AgentName::try_from(name).expect("name"),
             system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
+            description: relay_rs::agents::AgentDescription::try_from("test desc").expect("desc"),
             is_default: false,
             allowed_mcp_servers: relay_rs::agents::AllowedMcpServers::empty(),
         })

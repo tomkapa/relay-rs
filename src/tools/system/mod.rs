@@ -25,6 +25,7 @@
 mod get_session;
 mod memory;
 mod scheduling;
+mod search_agents;
 mod send_message;
 mod web_fetch;
 mod web_search;
@@ -38,6 +39,7 @@ pub use scheduling::{
     CancelScheduledTaskTool, ListScheduledTasksTool, SCHEDULING_CORE_PROMPT_SUPPLEMENT,
     ScheduleTaskTool,
 };
+pub use search_agents::SearchAgentsTool;
 pub use send_message::SendMessageTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;

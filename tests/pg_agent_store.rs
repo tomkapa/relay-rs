@@ -6,24 +6,25 @@
 use std::sync::Arc;
 
 use relay_rs::agents::{
-    AgentId, AgentName, AgentStore, AgentStoreError, AgentSystemPrompt, AgentUpdate,
-    AllowedMcpServers, DefaultAgentSeed, NewAgent, PgAgentStore,
+    AgentDescription, AgentId, AgentName, AgentStore, AgentStoreError, AgentSystemPrompt,
+    AgentUpdate, AllowedMcpServers, DefaultAgentSeed, NewAgent, PgAgentStore,
 };
 use relay_rs::clock::SystemClock;
 use relay_rs::mcp::McpServerId;
 use relay_rs::session::PgSessionStore;
 
 mod common;
-use common::pg::{TestDb, human_to_agent_session};
+use common::pg::{TestDb, agent_store, human_to_agent_session};
 
 fn store(db: &TestDb) -> Arc<PgAgentStore> {
-    Arc::new(PgAgentStore::new(db.pool.clone(), SystemClock::shared()))
+    agent_store(db.pool.clone(), SystemClock::shared())
 }
 
 fn seed(name: &str, prompt: &str) -> DefaultAgentSeed {
     DefaultAgentSeed {
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
+        description: AgentDescription::try_from("Default seed.").expect("valid desc"),
     }
 }
 
@@ -31,6 +32,7 @@ fn new_agent(name: &str, prompt: &str, is_default: bool) -> NewAgent {
     NewAgent {
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
+        description: AgentDescription::try_from(format!("Role: {name}")).expect("valid desc"),
         is_default,
         allowed_mcp_servers: AllowedMcpServers::empty(),
     }
@@ -158,10 +160,8 @@ async fn update_promotes_to_default_atomically() {
         .update(
             other.id,
             AgentUpdate {
-                name: None,
-                system_prompt: None,
                 is_default: Some(true),
-                allowed_mcp_servers: None,
+                ..Default::default()
             },
         )
         .await
@@ -183,10 +183,8 @@ async fn update_cannot_demote_only_default() {
         .update(
             db.default_agent_id,
             AgentUpdate {
-                name: None,
-                system_prompt: None,
                 is_default: Some(false),
-                allowed_mcp_servers: None,
+                ..Default::default()
             },
         )
         .await
@@ -209,8 +207,7 @@ async fn update_changes_name_and_prompt() {
             AgentUpdate {
                 name: Some(AgentName::try_from("renamed").expect("name")),
                 system_prompt: Some(AgentSystemPrompt::try_from("rolled-out v2").expect("prompt")),
-                is_default: None,
-                allowed_mcp_servers: None,
+                ..Default::default()
             },
         )
         .await
@@ -276,6 +273,7 @@ async fn create_with_explicit_allowed_mcp_servers_round_trips() {
     let payload = NewAgent {
         name: AgentName::try_from("scoped").expect("name"),
         system_prompt: AgentSystemPrompt::try_from("scoped agent").expect("prompt"),
+        description: AgentDescription::try_from("Scoped agent.").expect("desc"),
         is_default: false,
         allowed_mcp_servers: allowed(&[s1, s2]),
     };
@@ -301,6 +299,7 @@ async fn update_replaces_allowed_mcp_servers() {
         .create(NewAgent {
             name: AgentName::try_from("rotates").expect("name"),
             system_prompt: AgentSystemPrompt::try_from("rotating MCP").expect("prompt"),
+            description: AgentDescription::try_from("Rotating MCP agent.").expect("desc"),
             is_default: false,
             allowed_mcp_servers: allowed(&[s1, s2]),
         })
@@ -311,10 +310,8 @@ async fn update_replaces_allowed_mcp_servers() {
         .update(
             agent.id,
             AgentUpdate {
-                name: None,
-                system_prompt: None,
-                is_default: None,
                 allowed_mcp_servers: Some(allowed(&[s3])),
+                ..Default::default()
             },
         )
         .await
@@ -326,10 +323,8 @@ async fn update_replaces_allowed_mcp_servers() {
         .update(
             agent.id,
             AgentUpdate {
-                name: None,
-                system_prompt: None,
-                is_default: None,
                 allowed_mcp_servers: Some(AllowedMcpServers::empty()),
+                ..Default::default()
             },
         )
         .await
@@ -341,10 +336,8 @@ async fn update_replaces_allowed_mcp_servers() {
         .update(
             agent.id,
             AgentUpdate {
-                name: None,
-                system_prompt: None,
-                is_default: None,
                 allowed_mcp_servers: Some(allowed(&[s1])),
+                ..Default::default()
             },
         )
         .await
@@ -354,9 +347,7 @@ async fn update_replaces_allowed_mcp_servers() {
             agent.id,
             AgentUpdate {
                 name: Some(AgentName::try_from("renamed-only").expect("name")),
-                system_prompt: None,
-                is_default: None,
-                allowed_mcp_servers: None,
+                ..Default::default()
             },
         )
         .await

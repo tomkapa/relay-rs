@@ -16,8 +16,13 @@
 
 use std::time::Duration;
 
-use relay_rs::agents::{AgentId, AgentName, AgentSystemPrompt, DefaultAgentSeed, PgAgentStore};
-use relay_rs::clock::SystemClock;
+use std::sync::Arc;
+
+use relay_rs::agents::{
+    AgentDescription, AgentId, AgentName, AgentSystemPrompt, DefaultAgentSeed, PgAgentStore,
+    SharedAgentStore,
+};
+use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{SessionId, SessionStore};
 use relay_rs::types::Participant;
@@ -88,12 +93,14 @@ impl TestDb {
 
         // Seed a default agent so `sessions.agent_id` (NOT NULL REFERENCES
         // agents) can be satisfied by tests calling `sessions.create(id)`.
-        let agents = PgAgentStore::new(pool.clone(), SystemClock::shared());
+        let agents = agent_store(pool.clone(), SystemClock::shared());
         let default_agent_id = agents
             .seed_default(DefaultAgentSeed {
                 name: AgentName::try_from("test-default").expect("valid name"),
                 system_prompt: AgentSystemPrompt::try_from("test default prompt")
                     .expect("valid prompt"),
+                description: AgentDescription::try_from("Default test agent.")
+                    .expect("valid description"),
             })
             .await
             .expect("seed default agent");
@@ -105,6 +112,23 @@ impl TestDb {
             admin,
         }
     }
+}
+
+/// Construct a `PgAgentStore` wired with the fake embedding provider used
+/// by every test path. Returns the concrete `Arc<PgAgentStore>`; callers
+/// that need the trait object can coerce with `as SharedAgentStore`.
+pub fn agent_store(pool: PgPool, clock: SharedClock) -> Arc<PgAgentStore> {
+    Arc::new(PgAgentStore::new(
+        pool,
+        clock,
+        super::embedding::FakeEmbeddingProvider::shared(),
+    ))
+}
+
+/// `SharedAgentStore`-typed handle for callers that want the trait object
+/// directly (most route / harness setups).
+pub fn shared_agent_store(pool: PgPool, clock: SharedClock) -> SharedAgentStore {
+    agent_store(pool, clock)
 }
 
 /// Mint a fresh human-to-`agent_id` session via the new

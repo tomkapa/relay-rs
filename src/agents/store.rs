@@ -6,7 +6,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::error::AgentStoreError;
-use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, AllowedMcpServers};
+use super::types::{
+    AgentCard, AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt,
+    AllowedMcpServers,
+};
 
 /// Input to [`AgentStore::create`]. Server-side fields (`id`, `created_at`,
 /// `updated_at`) are minted by the store; never carried in.
@@ -14,6 +17,9 @@ use super::types::{AgentId, AgentName, AgentRecord, AgentSystemPrompt, AllowedMc
 pub struct NewAgent {
     pub name: AgentName,
     pub system_prompt: AgentSystemPrompt,
+    /// Operator-curated, model-facing one-sentence blurb. Required at
+    /// create time — there is no "empty description" path.
+    pub description: AgentDescription,
     /// When `true`, the new row becomes the default; the previously-default row
     /// is demoted in the same transaction so the partial unique index is
     /// satisfied.
@@ -35,6 +41,9 @@ pub struct NewAgent {
 pub struct AgentUpdate {
     pub name: Option<AgentName>,
     pub system_prompt: Option<AgentSystemPrompt>,
+    /// Patch the description. Required, non-empty if present — the
+    /// newtype's `TryFrom` rejects empty/whitespace at the HTTP boundary.
+    pub description: Option<AgentDescription>,
     pub is_default: Option<bool>,
     pub allowed_mcp_servers: Option<AllowedMcpServers>,
 }
@@ -64,6 +73,32 @@ pub trait AgentStore: fmt::Debug + Send + Sync {
 
     /// Id of the row whose `is_default` flag is `TRUE`.
     async fn default_id(&self) -> Result<AgentId, AgentStoreError>;
+
+    /// Case-insensitive lookup by [`AgentName`]. Returns the matching
+    /// record on success; [`AgentStoreError::NameNotFound`] when no row
+    /// matches. Powers the model-facing addressing surfaces — the
+    /// `send_message` tool resolves `{kind:"agent", name:<role>}` through
+    /// here.
+    async fn read_by_name(&self, name: &AgentName) -> Result<AgentRecord, AgentStoreError>;
+
+    /// Snapshot of every row's `(id, name)` pair, ordered alphabetically
+    /// by `lower(name)`. Used to render the `<agents>` block; the renderer
+    /// excludes the caller before formatting. Distinct from [`Self::list`]
+    /// so the caller can skip hydrating columns it does not need.
+    async fn list_names(&self) -> Result<Vec<(AgentId, AgentName)>, AgentStoreError>;
+
+    /// Top-K cosine-similarity search over agents' description embeddings.
+    /// Returns slim cards sorted by descending similarity, capped at `k`,
+    /// with `viewer` excluded at the SQL boundary so the caller never
+    /// pays decode cost for the self row. Rows whose embedding is null
+    /// (not yet backfilled) are skipped — the caller treats an empty
+    /// result as a degraded layer rather than an error.
+    async fn search_by_description(
+        &self,
+        embedding: &[f32],
+        viewer: AgentId,
+        k: usize,
+    ) -> Result<Vec<AgentCard>, AgentStoreError>;
 }
 
 /// Cheap-clone handle so collaborators can hold the store without a generic

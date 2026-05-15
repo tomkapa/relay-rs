@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use chrono_tz::Asia::Bangkok;
-use relay_rs::agents::{AgentId, AgentName, AgentStore, AgentSystemPrompt, NewAgent, PgAgentStore};
+use relay_rs::agents::{AgentId, AgentName, AgentStore, AgentSystemPrompt, NewAgent};
 use relay_rs::clock::SystemClock;
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::scheduling::{
@@ -32,10 +32,11 @@ fn store(db: &TestDb) -> Arc<PgScheduledTaskStore> {
 }
 
 async fn extra_agent(db: &TestDb, name: &str) -> AgentId {
-    let agents = PgAgentStore::new(db.pool.clone(), SystemClock::shared());
+    let agents = common::pg::agent_store(db.pool.clone(), SystemClock::shared());
     let payload = NewAgent {
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from("p").expect("valid prompt"),
+        description: relay_rs::agents::AgentDescription::try_from("p").expect("desc"),
         is_default: false,
         allowed_mcp_servers: relay_rs::agents::AllowedMcpServers::empty(),
     };

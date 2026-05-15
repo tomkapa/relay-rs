@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use relay_rs::agents::{AgentPromptCache, PgAgentStore, SharedAgentStore};
+use relay_rs::agents::{AgentNamesCache, AgentPromptCache, SharedAgentStore};
 use relay_rs::clock::{SharedClock, SystemClock, TestClock};
 use relay_rs::memory::{
     AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, MEMORY_TAG_CLOSE, MEMORY_TAG_OPEN, Memory,
@@ -43,11 +43,12 @@ struct Fixture {
 }
 
 fn build_memory(db: &TestDb, clock: SharedClock) -> Fixture {
-    let agents: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), clock.clone()));
+    let embeddings = common::embedding::FakeEmbeddingProvider::shared();
+    let agents: SharedAgentStore = common::pg::shared_agent_store(db.pool.clone(), clock.clone());
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
-    let embeddings = common::embedding::FakeEmbeddingProvider::shared();
+    let names_cache = AgentNamesCache::new(Duration::from_secs(60), clock.clone());
     let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
         db.pool.clone(),
         clock.clone(),
@@ -56,7 +57,7 @@ fn build_memory(db: &TestDb, clock: SharedClock) -> Fixture {
     let session_cache = SessionMemoryCache::new(16, Duration::from_secs(60), clock.clone());
     let loader =
         MemorySectionLoader::new(store.clone(), sessions.clone(), embeddings, session_cache);
-    let memory = AgentMemory::new(agents.clone(), prompt_cache, loader, cores());
+    let memory = AgentMemory::new(agents.clone(), prompt_cache, names_cache, loader, cores());
     Fixture {
         memory,
         sessions,
@@ -286,7 +287,7 @@ async fn cache_serves_within_ttl_then_refreshes_after_expiry() {
     let clock = Arc::new(TestClock::new());
     let shared: SharedClock = clock.clone();
 
-    let agents: SharedAgentStore = Arc::new(PgAgentStore::new(db.pool.clone(), shared.clone()));
+    let agents: SharedAgentStore = common::pg::shared_agent_store(db.pool.clone(), shared.clone());
     let cache = AgentPromptCache::new(8, Duration::from_secs(60), shared.clone());
 
     let first = cache

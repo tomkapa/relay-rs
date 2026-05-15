@@ -85,7 +85,7 @@ impl RecallTool {
             "required": ["query"],
             "properties": {
                 "query": { "type": "string", "minLength": 1, "maxLength": 1024 },
-                "kind": { "type": "string", "enum": ["self", "other", "procedure", "open"] },
+                "kind": { "type": "string", "enum": ["self", "other", "collaborator", "procedure", "open"] },
                 "limit": { "type": "integer", "minimum": 1, "maximum": RECALL_MAX_RESULTS }
             },
             "additionalProperties": false,
