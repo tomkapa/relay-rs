@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use crate::agents::{
     AgentId, AgentNamesCache, AgentPromptCache, SharedAgentStore, render_agents_block,
 };
+use crate::clock::SharedClock;
 use crate::runtime::{RequestKind, RequestKindPayload};
 use crate::session::SessionId;
 use crate::types::Participant;
@@ -35,6 +36,15 @@ pub const CORE_TAG_OPEN: &str = "<core>\n";
 pub const CORE_TAG_CLOSE: &str = "\n</core>\n";
 pub const ROLE_TAG_OPEN: &str = "<role>\n";
 pub const ROLE_TAG_CLOSE: &str = "\n</role>";
+pub const DATE_TAG_OPEN: &str = "<date>\n";
+pub const DATE_TAG_CLOSE: &str = "\n</date>";
+
+/// `strftime` pattern for the `<date>` body.
+///
+/// ISO 8601 date + weekday name + timezone tag — gives the model both
+/// machine-parseable and human-friendly anchors for relative-date reasoning
+/// ("next Friday", "tomorrow").
+pub const DATE_FORMAT: &str = "%Y-%m-%d (%A, UTC)";
 
 /// The per-mode `<core>` strings the composition root configures.
 ///
@@ -76,6 +86,7 @@ pub struct AgentMemory {
     names_cache: AgentNamesCache,
     loader: MemorySectionLoader,
     cores: ModeCores,
+    clock: SharedClock,
 }
 
 impl AgentMemory {
@@ -86,6 +97,7 @@ impl AgentMemory {
         names_cache: AgentNamesCache,
         loader: MemorySectionLoader,
         cores: ModeCores,
+        clock: SharedClock,
     ) -> Self {
         Self {
             agents,
@@ -93,6 +105,7 @@ impl AgentMemory {
             names_cache,
             loader,
             cores,
+            clock,
         }
     }
 
@@ -175,6 +188,12 @@ impl Memory for AgentMemory {
         let memory_sep = if memory_str.is_empty() { "" } else { "\n" };
         let agents_sep = if agents_block.is_empty() { "" } else { "\n" };
 
+        // `<date>` sits between `<role>` and `<memory>` so the daily-churn seam
+        // lies between the per-agent stable prefix and the per-turn memory tail.
+        let now_utc: chrono::DateTime<chrono::Utc> = self.clock.now_wall().into();
+        let date_str = now_utc.format(DATE_FORMAT).to_string();
+        let date_sep = "\n";
+
         let mut out = String::with_capacity(
             CORE_TAG_OPEN.len()
                 + core.len()
@@ -184,6 +203,10 @@ impl Memory for AgentMemory {
                 + ROLE_TAG_OPEN.len()
                 + role_str.len()
                 + ROLE_TAG_CLOSE.len()
+                + date_sep.len()
+                + DATE_TAG_OPEN.len()
+                + date_str.len()
+                + DATE_TAG_CLOSE.len()
                 + memory_sep.len()
                 + memory_str.len(),
         );
@@ -195,6 +218,10 @@ impl Memory for AgentMemory {
         out.push_str(ROLE_TAG_OPEN);
         out.push_str(role_str);
         out.push_str(ROLE_TAG_CLOSE);
+        out.push_str(date_sep);
+        out.push_str(DATE_TAG_OPEN);
+        out.push_str(&date_str);
+        out.push_str(DATE_TAG_CLOSE);
         out.push_str(memory_sep);
         out.push_str(memory_str);
 

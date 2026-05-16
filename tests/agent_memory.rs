@@ -15,10 +15,10 @@ use std::time::Duration;
 use relay_rs::agents::{AgentNamesCache, AgentPromptCache, SharedAgentStore};
 use relay_rs::clock::{SharedClock, SystemClock, TestClock};
 use relay_rs::memory::{
-    AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, MEMORY_TAG_CLOSE, MEMORY_TAG_OPEN, Memory,
-    MemoryContent, MemoryHandle, MemoryKind, MemoryMutation, MemorySectionLoader, MemoryState,
-    MutationSource, PgMemoryStore, ROLE_TAG_CLOSE, ROLE_TAG_OPEN, SessionMemoryCache,
-    SharedMemoryStore,
+    AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, DATE_TAG_CLOSE, DATE_TAG_OPEN, MEMORY_TAG_CLOSE,
+    MEMORY_TAG_OPEN, Memory, MemoryContent, MemoryHandle, MemoryKind, MemoryMutation,
+    MemorySectionLoader, MemoryState, MutationSource, PgMemoryStore, ROLE_TAG_CLOSE, ROLE_TAG_OPEN,
+    SessionMemoryCache, SharedMemoryStore,
 };
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::types::Participant;
@@ -57,7 +57,14 @@ fn build_memory(db: &TestDb, clock: SharedClock) -> Fixture {
     let session_cache = SessionMemoryCache::new(16, Duration::from_secs(60), clock.clone());
     let loader =
         MemorySectionLoader::new(store.clone(), sessions.clone(), embeddings, session_cache);
-    let memory = AgentMemory::new(agents.clone(), prompt_cache, names_cache, loader, cores());
+    let memory = AgentMemory::new(
+        agents.clone(),
+        prompt_cache,
+        names_cache,
+        loader,
+        cores(),
+        clock,
+    );
     Fixture {
         memory,
         sessions,
@@ -97,6 +104,64 @@ async fn assembles_core_then_role_in_order() {
         s.contains("test default prompt"),
         "role text from the seeded agent present"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn date_section_sits_between_role_and_memory() {
+    let db = TestDb::fresh().await;
+    let clock: SharedClock = Arc::new(TestClock::new());
+    let f = build_memory(&db, clock);
+    let agent_id = db.default_agent_id;
+
+    // Seed one memory so `<memory>` actually appears — the ordering check
+    // requires both anchors to be present.
+    f.store
+        .apply(MemoryMutation::Write {
+            agent: agent_id,
+            kind: MemoryKind::Identity,
+            content: MemoryContent::try_from("I default to terse replies.").expect("valid"),
+            state: MemoryState::Validated,
+            pinned: false,
+            source: MutationSource::Operator,
+        })
+        .await
+        .expect("write");
+
+    let session = human_to_agent_session(f.sessions.as_ref(), agent_id).await;
+    let prompt = f
+        .memory
+        .system_prompt(
+            session,
+            Participant::agent(agent_id),
+            &relay_rs::runtime::RequestKindPayload::Normal {},
+        )
+        .await
+        .expect("system prompt");
+
+    let s = prompt.as_ref();
+    let role_close = s.find(ROLE_TAG_CLOSE).expect("has </role>");
+    let date_open = s.find(DATE_TAG_OPEN).expect("has <date>");
+    let date_close = s.find(DATE_TAG_CLOSE).expect("has </date>");
+    let memory_open = s.find(MEMORY_TAG_OPEN).expect("has <memory>");
+
+    assert!(role_close < date_open, "<date> opens after </role>");
+    assert!(date_open < date_close, "date tags ordered");
+    assert!(
+        date_close < memory_open,
+        "<date> closes before <memory> opens"
+    );
+
+    // Body of <date> must be the YYYY-MM-DD (Weekday, UTC) shape. We don't
+    // pin the value (TestClock is wall-clock-relative); the format anchors
+    // the contract.
+    let body_start = date_open + DATE_TAG_OPEN.len();
+    let body = &s[body_start..date_close];
+    let iso_prefix = body
+        .get(..10)
+        .unwrap_or_else(|| panic!("date body too short to hold YYYY-MM-DD: {body:?}"));
+    chrono::NaiveDate::parse_from_str(iso_prefix, "%Y-%m-%d")
+        .unwrap_or_else(|e| panic!("date body must start with ISO 8601 ({body:?}): {e}"));
+    assert!(body.ends_with(", UTC)"), "date body tagged UTC: {body:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

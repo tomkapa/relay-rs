@@ -370,6 +370,7 @@ impl Collaborators {
             names_cache,
             memory_loader.clone(),
             cores,
+            clock.clone(),
         ));
 
         let mcp_store: SharedMcpServerStore =
