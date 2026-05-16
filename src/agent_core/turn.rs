@@ -233,7 +233,9 @@ impl Agent {
     ///
     /// Consecutive concurrency-safe calls fan out via
     /// [`futures::future::join_all`]; an unsafe (or unknown) call forms
-    /// a barrier. `join_all` preserves input order.
+    /// a barrier. `join_all` preserves input order, and tracing /
+    /// observer side effects fire in call order from the merge step so
+    /// downstream consumers see a deterministic stream.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_tools(
         &self,
@@ -245,15 +247,12 @@ impl Agent {
         cancel: &CancellationToken,
         observer: Option<&SharedTurnObserver>,
     ) -> Result<Vec<ToolResult>, AgentError> {
-        let resolved: Vec<Option<SharedTool>> = calls
+        let classes: Vec<CallClass> = calls
             .iter()
-            .map(|c| tools.get_for(kind, c.name.as_str()))
+            .map(|c| CallClass::classify(tools.get_for(kind, c.name.as_str())))
             .collect();
-        let classes: Vec<bool> = resolved
-            .iter()
-            .map(|t| t.as_ref().is_some_and(|x| x.concurrency_safe()))
-            .collect();
-        let batches = plan_batches(&classes);
+        let safe_flags: Vec<bool> = classes.iter().map(CallClass::is_safe).collect();
+        let batches = plan_batches(&safe_flags);
 
         let mut out: Vec<ToolResult> = Vec::with_capacity(calls.len());
         for batch in batches {
@@ -261,25 +260,24 @@ impl Agent {
                 return Err(AgentError::Cancelled);
             }
             let results = futures::future::join_all(batch.map(|i| {
-                self.run_call_with_hooks(
-                    ctx,
-                    calls[i],
-                    resolved[i].clone(),
-                    kind,
-                    tool_ctx,
-                    cancel,
-                    observer,
-                )
+                self.run_call_with_hooks(ctx, calls[i], classes[i].tool(), kind, tool_ctx, cancel)
             }))
             .await;
+            // Emit log + observer in call order — `join_all` preserves
+            // input order on the result vec, so iterating it is the
+            // deterministic merge point.
             for r in results {
-                out.push(r?);
+                let result = r?;
+                log::tool_result(ctx.turn_index.get(), &result);
+                if let Some(obs) = observer {
+                    obs.on_tool_result(&result).await;
+                }
+                out.push(result);
             }
         }
         Ok(out)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run_call_with_hooks(
         &self,
         ctx: TurnContext,
@@ -288,7 +286,6 @@ impl Agent {
         kind: RequestKind,
         tool_ctx: &ToolCallContext,
         cancel: &CancellationToken,
-        observer: Option<&SharedTurnObserver>,
     ) -> Result<ToolResult, AgentError> {
         let hook_ctx = ToolContext {
             session_id: ctx.session_id,
@@ -301,10 +298,6 @@ impl Agent {
             .after_tool(hook_ctx, &result)
             .await?
             .into_result()?;
-        log::tool_result(ctx.turn_index.get(), &result);
-        if let Some(obs) = observer {
-            obs.on_tool_result(&result).await;
-        }
         Ok(result)
     }
 
@@ -406,6 +399,39 @@ fn error_result(call_id: ToolCallId, message: String) -> ToolResult {
 /// bounded `0..max_turns` range.
 pub(super) fn turn_index(turn: u32) -> TurnIndex {
     TurnIndex::try_from(turn).expect("invariant: max_turns is bounded so loop index fits TurnIndex")
+}
+
+/// Per-call dispatch classification. Mirrors the three resolved
+/// states `run_tools` must distinguish: a known concurrency-safe tool
+/// (joinable into the current batch), a known unsafe tool (barrier),
+/// and an unknown name (also a barrier — `run_one_tool` will turn it
+/// into an `is_error` `ToolResult`).
+#[derive(Debug, Clone)]
+enum CallClass {
+    Safe(SharedTool),
+    Unsafe(SharedTool),
+    Unknown,
+}
+
+impl CallClass {
+    fn classify(resolved: Option<SharedTool>) -> Self {
+        match resolved {
+            Some(t) if t.concurrency_safe() => Self::Safe(t),
+            Some(t) => Self::Unsafe(t),
+            None => Self::Unknown,
+        }
+    }
+
+    fn is_safe(&self) -> bool {
+        matches!(self, Self::Safe(_))
+    }
+
+    fn tool(&self) -> Option<SharedTool> {
+        match self {
+            Self::Safe(t) | Self::Unsafe(t) => Some(t.clone()),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// Fuse consecutive `true` entries into a single range; each `false`
