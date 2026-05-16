@@ -51,7 +51,7 @@ async fn fixture(db: &TestDb) -> Fixture {
         clock.clone(),
         embeddings.clone(),
     ));
-    let session_cache = SessionMemoryCache::new(8, Duration::from_secs(60), clock);
+    let session_cache = SessionMemoryCache::new(8, Duration::from_secs(60), clock.clone());
     let loader =
         MemorySectionLoader::new(store.clone(), sessions.clone(), embeddings, session_cache);
     let _memory = AgentMemory::new(
@@ -64,6 +64,7 @@ async fn fixture(db: &TestDb) -> Fixture {
             reflection: std::sync::Arc::from("core"),
             resolution: std::sync::Arc::from("core"),
         },
+        clock,
     );
     let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
     Fixture {
@@ -377,6 +378,7 @@ async fn handle_round_trips_through_session_cache() {
             reflection: std::sync::Arc::from("core"),
             resolution: std::sync::Arc::from("core"),
         },
+        SystemClock::shared(),
     );
     let resolved = memory
         .resolve_handle(
