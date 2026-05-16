@@ -150,6 +150,10 @@ impl Tool for SearchAgentsTool {
         self.input_schema.clone()
     }
 
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError> {
         let parsed: Input = serde_json::from_value(input)?;
         let viewer_id = ctx.viewer.agent_id().ok_or_else(|| {

@@ -109,6 +109,15 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     fn modes(&self) -> RequestKindModes {
         RequestKindModes::ALL
     }
+
+    /// `true` if the tool has no observable side effects on relay state
+    /// (sessions, memory, agents, schedules, MCP-server state) and is
+    /// safe to invoke concurrently with any other `concurrency_safe`
+    /// tool. Default `false`: a new tool serialises unless its author
+    /// has reasoned about safety.
+    fn concurrency_safe(&self) -> bool {
+        false
+    }
 }
 
 /// Cheap-clone alias used by the registry.

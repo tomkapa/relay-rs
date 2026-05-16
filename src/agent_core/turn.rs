@@ -13,7 +13,9 @@ use crate::provider::{
 };
 use crate::runtime::{PromptRequestId, RequestKind, RequestKindPayload};
 use crate::session::SessionId;
-use crate::tools::{TOOL_RESULT_MAX_BYTES, ToolBox, ToolCallContext, truncate_to_char_boundary};
+use crate::tools::{
+    SharedTool, TOOL_RESULT_MAX_BYTES, ToolBox, ToolCallContext, truncate_to_char_boundary,
+};
 use crate::types::{MessageSender, Participant, TurnIndex};
 
 use super::core::{Agent, send_message_tool_name};
@@ -228,6 +230,10 @@ impl Agent {
     /// model receives a complete picture of what happened. The toolbox is
     /// mode-filtered, so different turn modes (normal, reflection,
     /// resolution) can present different closed sets to the model.
+    ///
+    /// Consecutive concurrency-safe calls fan out via
+    /// [`futures::future::join_all`]; an unsafe (or unknown) call forms
+    /// a barrier. `join_all` preserves input order.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_tools(
         &self,
@@ -239,29 +245,67 @@ impl Agent {
         cancel: &CancellationToken,
         observer: Option<&SharedTurnObserver>,
     ) -> Result<Vec<ToolResult>, AgentError> {
-        let mut out = Vec::with_capacity(calls.len());
-        for call in calls {
+        let resolved: Vec<Option<SharedTool>> = calls
+            .iter()
+            .map(|c| tools.get_for(kind, c.name.as_str()))
+            .collect();
+        let classes: Vec<bool> = resolved
+            .iter()
+            .map(|t| t.as_ref().is_some_and(|x| x.concurrency_safe()))
+            .collect();
+        let batches = plan_batches(&classes);
+
+        let mut out: Vec<ToolResult> = Vec::with_capacity(calls.len());
+        for batch in batches {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let hook_ctx = ToolContext {
-                session_id: ctx.session_id,
-                turn_index: ctx.turn_index,
-                call,
-            };
-            self.hooks().before_tool(hook_ctx).await?.into_result()?;
-            let result = self.run_one_tool(call, tools, kind, tool_ctx, cancel).await;
-            self.hooks()
-                .after_tool(hook_ctx, &result)
-                .await?
-                .into_result()?;
-            log::tool_result(ctx.turn_index.get(), &result);
-            if let Some(obs) = observer {
-                obs.on_tool_result(&result).await;
+            let results = futures::future::join_all(batch.map(|i| {
+                self.run_call_with_hooks(
+                    ctx,
+                    calls[i],
+                    resolved[i].clone(),
+                    kind,
+                    tool_ctx,
+                    cancel,
+                    observer,
+                )
+            }))
+            .await;
+            for r in results {
+                out.push(r?);
             }
-            out.push(result);
         }
         Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_call_with_hooks(
+        &self,
+        ctx: TurnContext,
+        call: &ToolCall,
+        tool: Option<SharedTool>,
+        kind: RequestKind,
+        tool_ctx: &ToolCallContext,
+        cancel: &CancellationToken,
+        observer: Option<&SharedTurnObserver>,
+    ) -> Result<ToolResult, AgentError> {
+        let hook_ctx = ToolContext {
+            session_id: ctx.session_id,
+            turn_index: ctx.turn_index,
+            call,
+        };
+        self.hooks().before_tool(hook_ctx).await?.into_result()?;
+        let result = self.run_one_tool(call, tool, kind, tool_ctx, cancel).await;
+        self.hooks()
+            .after_tool(hook_ctx, &result)
+            .await?
+            .into_result()?;
+        log::tool_result(ctx.turn_index.get(), &result);
+        if let Some(obs) = observer {
+            obs.on_tool_result(&result).await;
+        }
+        Ok(result)
     }
 
     /// Resolve and run a single tool. All failure modes (unknown tool, timeout,
@@ -281,13 +325,13 @@ impl Agent {
     async fn run_one_tool(
         &self,
         call: &ToolCall,
-        tools: &ToolBox,
+        tool: Option<SharedTool>,
         kind: RequestKind,
         tool_ctx: &ToolCallContext,
         cancel: &CancellationToken,
     ) -> ToolResult {
         let id = call.id.clone();
-        let Some(tool) = tools.get_for(kind, call.name.as_str()) else {
+        let Some(tool) = tool else {
             warn!(relay.tool = %call.name, "tool.unknown");
             return error_result(
                 id,
@@ -362,4 +406,77 @@ fn error_result(call_id: ToolCallId, message: String) -> ToolResult {
 /// bounded `0..max_turns` range.
 pub(super) fn turn_index(turn: u32) -> TurnIndex {
     TurnIndex::try_from(turn).expect("invariant: max_turns is bounded so loop index fits TurnIndex")
+}
+
+/// Fuse consecutive `true` entries into a single range; each `false`
+/// becomes a singleton. Preserves input order; covers `0..classes.len()`
+/// exactly once.
+pub(super) fn plan_batches(classes: &[bool]) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut i = 0;
+    while i < classes.len() {
+        let mut j = i + 1;
+        if classes[i] {
+            while j < classes.len() && classes[j] {
+                j += 1;
+            }
+        }
+        out.push(i..j);
+        i = j;
+    }
+    out
+}
+
+#[cfg(test)]
+mod plan_batches_tests {
+    use super::plan_batches;
+
+    #[test]
+    fn empty_input_yields_no_batches() {
+        let batches = plan_batches(&[]);
+        assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn single_safe_call_is_one_singleton_batch() {
+        let batches = plan_batches(&[true]);
+        assert_eq!(batches, vec![0..1]);
+    }
+
+    #[test]
+    fn single_unsafe_call_is_one_singleton_batch() {
+        let batches = plan_batches(&[false]);
+        assert_eq!(batches, vec![0..1]);
+    }
+
+    #[test]
+    fn consecutive_safe_calls_fuse_into_one_batch() {
+        let batches = plan_batches(&[true, true, true]);
+        assert_eq!(batches, vec![0..3]);
+    }
+
+    #[test]
+    fn unsafe_call_breaks_the_batch() {
+        // [A_safe, B_safe, C_unsafe, D_safe, E_safe, F_safe]
+        // → [{A,B}, {C}, {D,E,F}]
+        let batches = plan_batches(&[true, true, false, true, true, true]);
+        assert_eq!(batches, vec![0..2, 2..3, 3..6]);
+    }
+
+    #[test]
+    fn alternating_unsafe_and_safe_yields_singletons_then_runs() {
+        let batches = plan_batches(&[false, true, false, true, true]);
+        assert_eq!(batches, vec![0..1, 1..2, 2..3, 3..5]);
+    }
+
+    #[test]
+    fn every_call_is_visited_exactly_once_in_order() {
+        let classes = [true, false, true, true, false, false, true];
+        let batches = plan_batches(&classes);
+        let mut covered: Vec<usize> = Vec::new();
+        for b in batches {
+            covered.extend(b);
+        }
+        assert_eq!(covered, (0..classes.len()).collect::<Vec<_>>());
+    }
 }

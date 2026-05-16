@@ -114,6 +114,9 @@ impl Tool for RecallTool {
     fn input_schema(&self) -> Arc<Value> {
         self.input_schema.clone()
     }
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
     async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError> {
         let parsed: Input = serde_json::from_value(input)?;
         let agent = expect_agent(ctx)?;
