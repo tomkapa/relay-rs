@@ -217,6 +217,10 @@ impl Tool for GetSessionTool {
         self.input_schema.clone()
     }
 
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolCallContext) -> Result<String, ToolError> {
         let parsed: GetSessionInput = serde_json::from_value(input)?;
         let out = self.handle(parsed, ctx).await?;

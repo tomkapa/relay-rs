@@ -202,6 +202,10 @@ impl Tool for WebSearchTool {
         self.schema.clone()
     }
 
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     #[instrument(name = "tool.web_search", skip_all, fields(relay.tool = "web_search"))]
     async fn execute(&self, input: Value, _ctx: &ToolCallContext) -> Result<String, ToolError> {
         let Input { query, count } = serde_json::from_value(input)

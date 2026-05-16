@@ -89,6 +89,10 @@ impl Tool for ListScheduledTasksTool {
         self.input_schema.clone()
     }
 
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     #[tracing::instrument(
         skip_all,
         name = "tool.list_scheduled_tasks",

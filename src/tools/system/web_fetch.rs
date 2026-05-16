@@ -101,6 +101,10 @@ impl Tool for WebFetchTool {
         self.schema.clone()
     }
 
+    fn concurrency_safe(&self) -> bool {
+        true
+    }
+
     #[instrument(name = "tool.web_fetch", skip_all, fields(relay.tool = "web_fetch"))]
     async fn execute(&self, input: Value, _ctx: &ToolCallContext) -> Result<String, ToolError> {
         let Input { url } = serde_json::from_value(input)
