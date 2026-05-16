@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::agents::{
     AGENT_DESCRIPTION_MAX_LEN, AGENT_NAME_MAX_LEN, AGENT_SYSTEM_PROMPT_MAX_LEN, AgentDescription,
@@ -140,35 +140,33 @@ impl CreateAgentTool {
             ));
         }
 
-        let name = AgentName::try_from(input.name).map_err(|e| {
+        let parse = |field: &str, e: crate::types::ParseError| {
             set_outcome(Outcome::InvalidInput);
-            ToolError::InvalidInput(format!("create_agent: name: {e}"))
-        })?;
-        let system_prompt = AgentSystemPrompt::try_from(input.system_prompt).map_err(|e| {
-            set_outcome(Outcome::InvalidInput);
-            ToolError::InvalidInput(format!("create_agent: system_prompt: {e}"))
-        })?;
-        let description = AgentDescription::try_from(input.description).map_err(|e| {
-            set_outcome(Outcome::InvalidInput);
-            ToolError::InvalidInput(format!("create_agent: description: {e}"))
-        })?;
-        let allowed_mcp_servers =
-            AllowedMcpServers::try_from(input.allowed_mcp_servers).map_err(|e| {
-                set_outcome(Outcome::InvalidInput);
-                ToolError::InvalidInput(format!("create_agent: allowed_mcp_servers: {e}"))
-            })?;
+            ToolError::InvalidInput(format!("create_agent: {field}: {e}"))
+        };
+        let name = AgentName::try_from(input.name).map_err(|e| parse("name", e))?;
+        let system_prompt = AgentSystemPrompt::try_from(input.system_prompt)
+            .map_err(|e| parse("system_prompt", e))?;
+        let description =
+            AgentDescription::try_from(input.description).map_err(|e| parse("description", e))?;
+        let allowed_mcp_servers = AllowedMcpServers::try_from(input.allowed_mcp_servers)
+            .map_err(|e| parse("allowed_mcp_servers", e))?;
 
+        // `is_default` is intentionally not on the input schema and not
+        // patched here — promoting the default stays an operator action via
+        // `PUT /agents/{id}`.
         let payload = NewAgent {
-            name: name.clone(),
+            name,
             system_prompt,
             description,
-            // `is_default` is intentionally not on the input schema and not
-            // patched here — promoting the default stays an operator
-            // action.
             is_default: false,
             allowed_mcp_servers,
         };
 
+        // Every input field is pre-parsed via its newtype `TryFrom` above,
+        // so `AgentStoreError::Parse` from `create` can only mean an
+        // internal invariant violation — let it fall through to the
+        // backend-error arm with full context.
         let record = match self.agents.create(payload).await {
             Ok(r) => r,
             Err(AgentStoreError::NameTaken(taken)) => {
@@ -177,13 +175,9 @@ impl CreateAgentTool {
                     "create_agent: name {taken} is already taken; pick a different role name"
                 )));
             }
-            Err(AgentStoreError::Parse(e)) => {
-                set_outcome(Outcome::InvalidInput);
-                return Err(ToolError::InvalidInput(format!("create_agent: {e}")));
-            }
             Err(e) => {
                 set_outcome(Outcome::BackendError);
-                warn!(error = %e, "create_agent.create_failed");
+                error!(error = ?e, event = "create_agent.create_failed");
                 return Err(ToolError::Backend(format!("create_agent: {e}")));
             }
         };

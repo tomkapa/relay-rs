@@ -231,14 +231,10 @@ async fn non_agent_viewer_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn is_default_is_ignored_or_rejected() {
+async fn is_default_is_rejected_by_schema() {
     let db = TestDb::fresh().await;
     let f = fixture(&db).await;
-    // The schema declares `additionalProperties: false` and the input struct
-    // uses `deny_unknown_fields`, so any caller that tries to smuggle
-    // `is_default` past the tool seam must hit a parse error rather than
-    // promoting a new agent to default and demoting the recruiter.
-    let result = f
+    let err = f
         .tool
         .execute(
             json!({
@@ -249,26 +245,14 @@ async fn is_default_is_ignored_or_rejected() {
             }),
             &f.ctx,
         )
-        .await;
-
-    match result {
-        Err(ToolError::InvalidInput(_) | ToolError::Json(_)) => {
-            // Expected: parser rejected the unknown field.
-            let name = AgentName::try_from("usurper").expect("name");
-            assert!(f.agents.read_by_name(&name).await.is_err());
-            let default = f.agents.default_id().await.expect("default present");
-            assert_eq!(default, f.viewer_agent_id);
-        }
-        Ok(_) => {
-            // Acceptable fallback: parser silently dropped the field. The
-            // hard contract is that the persisted row is not default and
-            // the seeded default is untouched.
-            let name = AgentName::try_from("usurper").expect("name");
-            let record = f.agents.read_by_name(&name).await.expect("read");
-            assert!(!record.is_default);
-            let default = f.agents.default_id().await.expect("default present");
-            assert_eq!(default, f.viewer_agent_id);
-        }
-        Err(other) => panic!("expected InvalidInput/Json or Ok, got {other:?}"),
-    }
+        .await
+        .expect_err("deny_unknown_fields must reject is_default");
+    assert!(matches!(
+        err,
+        ToolError::InvalidInput(_) | ToolError::Json(_)
+    ));
+    let name = AgentName::try_from("usurper").expect("name");
+    assert!(f.agents.read_by_name(&name).await.is_err());
+    let default = f.agents.default_id().await.expect("default present");
+    assert_eq!(default, f.viewer_agent_id);
 }
