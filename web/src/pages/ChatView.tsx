@@ -50,9 +50,10 @@ export function ChatView() {
   const attachRequestId = useThreadStore((s) => s.attachRequestId);
   const removePending = useThreadStore((s) => s.removePending);
 
-  // Demo fallback — `?demo=1` forces fixtures; otherwise backend data is
-  // authoritative and demo only fills in when the backend returns nothing.
-  const isDemo = forcedDemo || (!agentsQ.isLoading && !threadsQ.data?.length);
+  // Demo fixtures are opt-in via `?demo=1`. An empty backend renders the
+  // real (empty) UI — never fall back to fixtures, or replies get silently
+  // dropped by the `if (isDemo) return;` guards below.
+  const isDemo = forcedDemo;
   const agents = isDemo ? DEMO_AGENTS : (agentsQ.data ?? []);
   const threads = isDemo ? DEMO_THREADS : (threadsQ.data ?? []);
   const poster = isDemo ? DEMO_HUMAN_POSTER : DEMO_USER;

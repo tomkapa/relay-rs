@@ -148,6 +148,12 @@ impl SchedulerInner {
             DateTime<Utc>,
             Option<PromptRequestId>,
         )> = sqlx::query_as(
+            // The `seed.kind = $6` filter on the session's root prompt_request
+            // keeps the scheduler off its own off-DAG reflection sessions —
+            // otherwise the scheduler reflects on its previous reflection
+            // output, indefinitely, once per idle window. `seed.kind IS NULL`
+            // covers test fixtures that mint a session with a synthetic
+            // root_request_id; production always inserts the root row.
             "WITH latest_per_session AS (
                  SELECT m.session_id,
                         MAX(m.seq) AS latest_seq,
@@ -156,10 +162,12 @@ impl SchedulerInner {
                  GROUP BY m.session_id
              ),
              agent_sessions AS (
-                 SELECT id, participant_a_agent_id AS agent_id FROM sessions
+                 SELECT id, participant_a_agent_id AS agent_id, root_request_id
+                 FROM sessions
                  WHERE participant_a_kind = 'agent'
                  UNION ALL
-                 SELECT id, participant_b_agent_id AS agent_id FROM sessions
+                 SELECT id, participant_b_agent_id AS agent_id, root_request_id
+                 FROM sessions
                  WHERE participant_b_kind = 'agent'
              )
              SELECT a.agent_id,
@@ -173,8 +181,11 @@ impl SchedulerInner {
                  ON sm.session_id = a.id AND sm.seq = l.latest_seq
              LEFT JOIN reflection_checkpoints rc
                  ON rc.agent_id = a.agent_id AND rc.session_id = a.id
+             LEFT JOIN prompt_requests seed
+                 ON seed.id = a.root_request_id
              WHERE l.latest_at <= $1
                AND (rc.created_at IS NULL OR rc.created_at < l.latest_at)
+               AND (seed.kind IS NULL OR seed.kind = $6)
                AND NOT EXISTS (
                    SELECT 1 FROM prompt_requests pr
                    WHERE pr.kind = $3
@@ -189,6 +200,7 @@ impl SchedulerInner {
         .bind(RequestKind::Reflection)
         .bind(RequestStatus::Pending)
         .bind(RequestStatus::Processing)
+        .bind(RequestKind::Normal)
         .fetch_all(&self.pool)
         .await?;
 
@@ -362,9 +374,7 @@ fn render_chat_message(message: &ChatMessage, out: &mut String) {
                     UserContent::ToolResult(r) => {
                         out.push_str("[tool-result ");
                         out.push_str(r.call_id.as_str());
-                        out.push_str(": ");
-                        out.push_str(&r.output);
-                        out.push(']');
+                        out.push_str(if r.is_error { ": err]" } else { ": ok]" });
                     }
                 }
             }
@@ -406,7 +416,7 @@ fn map_for_viewer(stored: ChatMessage, is_self: bool) -> ChatMessage {
                     UserContent::ToolResult(r) => AssistantContent::Text(format!(
                         "[tool-result {}: {}]",
                         r.call_id.as_str(),
-                        r.output
+                        if r.is_error { "err" } else { "ok" }
                     )),
                 })
                 .collect();
@@ -446,3 +456,126 @@ struct ReflectionCandidate {
 
 // SQL paths are covered by `tests/reflection_pipeline.rs` against a real
 // Postgres. The candidate struct is too trivial to merit pure-unit tests.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ToolCall, ToolCallId, ToolResult};
+    use crate::types::ToolName;
+    use serde_json::json;
+
+    fn tool_call_id(s: &str) -> ToolCallId {
+        ToolCallId::try_from(s).expect("invariant: literal tool-call id is valid")
+    }
+
+    fn tool_name(s: &str) -> ToolName {
+        ToolName::try_from(s).expect("invariant: literal tool name is valid")
+    }
+
+    #[test]
+    fn tool_result_body_dropped_from_self_user_block() {
+        let big = "x".repeat(100_000);
+        let msg = ChatMessage::User(vec![UserContent::ToolResult(ToolResult {
+            call_id: tool_call_id("call-1"),
+            output: big.clone(),
+            is_error: false,
+        })]);
+        let mut out = String::new();
+        render_chat_message(&msg, &mut out);
+        assert!(out.contains("[tool-result call-1: ok]"));
+        assert!(!out.contains(&big));
+        assert!(out.len() < 200);
+    }
+
+    #[test]
+    fn tool_result_body_dropped_from_other_assistant_block() {
+        let big = "x".repeat(100_000);
+        let stored = ChatMessage::User(vec![UserContent::ToolResult(ToolResult {
+            call_id: tool_call_id("call-2"),
+            output: big.clone(),
+            is_error: false,
+        })]);
+        let flipped = map_for_viewer(stored, false);
+        let mut out = String::new();
+        render_chat_message(&flipped, &mut out);
+        assert!(out.contains("[tool-result call-2: ok]"));
+        assert!(!out.contains(&big));
+        assert!(out.len() < 200);
+    }
+
+    #[test]
+    fn tool_result_error_marker() {
+        let msg = ChatMessage::User(vec![UserContent::ToolResult(ToolResult {
+            call_id: tool_call_id("call-3"),
+            output: "boom".into(),
+            is_error: true,
+        })]);
+        let mut self_out = String::new();
+        render_chat_message(&msg, &mut self_out);
+        assert!(self_out.contains("[tool-result call-3: err]"));
+        assert!(!self_out.contains("boom"));
+
+        let flipped = map_for_viewer(msg, false);
+        let mut other_out = String::new();
+        render_chat_message(&flipped, &mut other_out);
+        assert!(other_out.contains("[tool-result call-3: err]"));
+        assert!(!other_out.contains("boom"));
+    }
+
+    #[test]
+    fn reasoning_and_tool_call_args_preserved_verbatim() {
+        let assistant = ChatMessage::Assistant(vec![
+            AssistantContent::Reasoning("digested findings".into()),
+            AssistantContent::ToolCall(ToolCall {
+                id: tool_call_id("call-4"),
+                name: tool_name("send_message"),
+                input: json!({"text": "report"}),
+            }),
+        ]);
+
+        let mut self_out = String::new();
+        render_chat_message(&assistant, &mut self_out);
+        assert!(self_out.contains("digested findings"));
+        assert!(self_out.contains("[tool-call send_message("));
+        assert!(self_out.contains(r#""text":"report""#));
+
+        let flipped = map_for_viewer(assistant, false);
+        let mut other_out = String::new();
+        render_chat_message(&flipped, &mut other_out);
+        assert!(other_out.contains("digested findings"));
+        assert!(other_out.contains("[tool-call send_message("));
+        assert!(other_out.contains(r#""text":"report""#));
+    }
+
+    #[test]
+    fn large_web_fetch_no_longer_triggers_truncation_notice() {
+        let huge = "x".repeat(200_000);
+        let slice = vec![
+            ChatMessage::User(vec![UserContent::Text("Produce the daily report".into())]),
+            ChatMessage::Assistant(vec![
+                AssistantContent::Reasoning("Let me fetch the index page.".into()),
+                AssistantContent::ToolCall(ToolCall {
+                    id: tool_call_id("call-5"),
+                    name: tool_name("web_fetch"),
+                    input: json!({"url": "https://example.com"}),
+                }),
+            ]),
+            ChatMessage::User(vec![UserContent::ToolResult(ToolResult {
+                call_id: tool_call_id("call-5"),
+                output: huge.clone(),
+                is_error: false,
+            })]),
+            ChatMessage::Assistant(vec![AssistantContent::Text("Done.".into())]),
+        ];
+
+        let prompt = build_reflection_prompt(&slice);
+        let body = prompt.as_str();
+        assert!(
+            !body.contains("[earlier turns truncated to fit prompt cap]"),
+            "prompt unexpectedly head-trimmed: {} bytes",
+            body.len()
+        );
+        assert!(body.contains("[tool-result call-5: ok]"));
+        assert!(!body.contains(&huge));
+    }
+}

@@ -299,3 +299,106 @@ async fn scheduler_does_not_duplicate_pending_reflection() {
         "scheduler must not duplicate while a pending reflection exists"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_skips_session_whose_seed_turn_is_reflection() {
+    // Regression: the scheduler used to find every agent-participant session
+    // including the off-DAG sessions it had just minted for reflection jobs,
+    // which produced reflections of reflections of reflections ad nauseam.
+    // The fix filters candidates to sessions whose seed prompt_request has
+    // `kind = 'normal'`.
+    let db = TestDb::fresh().await;
+    let clock: SharedClock = SystemClock::shared();
+    let sessions: SharedSessionStore =
+        Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
+    let queue: SharedPromptQueue = Arc::new(PgPromptQueue::new(db.pool.clone(), clock.clone()));
+
+    let agent_id = db.default_agent_id;
+    let session = human_to_agent_session(sessions.as_ref(), agent_id).await;
+
+    // Insert a seed prompt_request whose id matches the session's
+    // root_request_id and whose kind is 'reflection' — i.e. the shape of
+    // a freshly-minted reflection session in production.
+    let root_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT root_request_id FROM sessions WHERE id = $1")
+            .bind(session)
+            .fetch_one(&db.pool)
+            .await
+            .expect("fetch root");
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO prompt_requests
+             (id, session_id, content, idempotency_key, status,
+              sender_kind, sender_agent_id,
+              receiver_kind, receiver_agent_id, root_request_id,
+              kind, kind_payload, created_at, updated_at)
+         VALUES ($1, $2, '(reflection)', $3, 'done',
+                 'agent', $4,
+                 'agent', $4, $1,
+                 'reflection', $5, $6, $6)",
+    )
+    .bind(root_id)
+    .bind(session)
+    .bind(format!("seed-reflection-{root_id}"))
+    .bind(agent_id)
+    .bind(serde_json::json!({
+        "kind": "reflection",
+        "data": { "session_id": session, "up_to_turn_id": root_id }
+    }))
+    .bind(now)
+    .execute(&db.pool)
+    .await
+    .expect("seed reflection-kind root request");
+
+    // Append a back-dated message so the scheduler's idle predicate would
+    // otherwise fire. The seed-kind filter must keep this session out.
+    sqlx::query(
+        "INSERT INTO session_messages
+             (session_id, seq, request_id, body,
+              sender_kind, sender_agent_id,
+              receiver_kind, receiver_agent_id, created_at)
+         VALUES ($1, 1, $2, $3,
+                 'agent', $4,
+                 'agent', $4, $5)",
+    )
+    .bind(session)
+    .bind(root_id)
+    .bind(serde_json::json!({
+        "role": "assistant",
+        "contents": [{"kind": "text", "value": "prior reflection output"}]
+    }))
+    .bind(agent_id)
+    .bind(Utc::now() - chrono::Duration::seconds(60 * 60))
+    .execute(&db.pool)
+    .await
+    .expect("seed message");
+
+    let scheduler = ReflectionScheduler::spawn_with_cadence(
+        db.pool.clone(),
+        queue,
+        clock,
+        Duration::from_millis(100),
+        None,
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    scheduler.shutdown().await;
+
+    // Count reflections targeting the test session but excluding the seed
+    // row we inserted ourselves — the scheduler-enqueued reflections live on
+    // their own off-DAG (agent, system) session, so filtering on session_id
+    // != test session is the cleanest separator.
+    let scheduled_reflections: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM prompt_requests
+         WHERE kind = 'reflection'
+           AND kind_payload->'data'->>'session_id' = $1::text
+           AND session_id <> $1",
+    )
+    .bind(session)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        scheduled_reflections.0, 0,
+        "scheduler must not enqueue a reflection on a reflection-rooted session"
+    );
+}
