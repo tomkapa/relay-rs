@@ -16,6 +16,14 @@ pub enum AgentStoreError {
     #[error("agent named {0:?} not found")]
     NameNotFound(AgentName),
 
+    /// Create attempted with a name already in use (case-insensitive). The
+    /// `agents_name_lower_unique` index is the source of truth — Postgres
+    /// raises a unique-violation (SQLSTATE 23505) which the store maps to
+    /// this variant so callers can surface a clean "name taken" message
+    /// instead of an opaque DB error.
+    #[error("agent name {0:?} is already taken")]
+    NameTaken(AgentName),
+
     /// `default_id()` was called before the init seeder ran. A correctly composed
     /// `Server` always seeds before exposing the store, so this is a programmer
     /// error in test setup or a misordered startup, not a runtime condition.

@@ -1,7 +1,7 @@
 //! System tools — first-party capabilities the agent invokes through the
 //! tool seam.
 //!
-//! Four families:
+//! Five families:
 //!
 //! * **Communication** — [`SendMessageTool`] (the only delivery mechanism
 //!   for messages between participants) and [`GetSessionTool`]
@@ -15,6 +15,8 @@
 //!   [`CancelScheduledTaskTool`]. Persist a future wake-up; the
 //!   `ScheduledTaskScheduler` enqueues a `prompt_requests` row at fire
 //!   time so the agent receives a fresh turn.
+//! * **Agents** — [`SearchAgentsTool`] for discovery; [`CreateAgentTool`]
+//!   for hiring (the recruiter's primary capability).
 //! * **Built-in capabilities** — [`WebFetchTool`] and [`WebSearchTool`].
 //!
 //! Registration lives in the composition root (`src/app.rs`) — there is
@@ -22,6 +24,7 @@
 //! this directory + one `.with(...)` line in `app.rs`. Externally-supplied
 //! tools enter through the MCP registry instead of this module.
 
+mod create_agent;
 mod get_session;
 mod memory;
 mod scheduling;
@@ -30,6 +33,7 @@ mod send_message;
 mod web_fetch;
 mod web_search;
 
+pub use create_agent::CreateAgentTool;
 pub use get_session::GetSessionTool;
 pub use memory::{
     MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool,

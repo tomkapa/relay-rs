@@ -72,9 +72,12 @@ impl IntoResponse for HttpError {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
             }
             Self::Session(e) => (StatusCode::BAD_REQUEST, e.to_string()),
-            Self::Agent(AgentStoreError::DefaultDeletionForbidden | AgentStoreError::InUse(_)) => {
-                (StatusCode::CONFLICT, self.to_string())
-            }
+            Self::Agent(
+                AgentStoreError::DefaultDeletionForbidden
+                | AgentStoreError::InUse(_)
+                | AgentStoreError::NameTaken(_),
+            )
+            | Self::Mcp(McpError::AliasTaken(_)) => (StatusCode::CONFLICT, self.to_string()),
             Self::Agent(AgentStoreError::Parse(_)) => (StatusCode::BAD_REQUEST, self.to_string()),
             Self::Agent(AgentStoreError::NoDefault) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -95,7 +98,6 @@ impl IntoResponse for HttpError {
             Self::Mcp(McpError::NotFound(_)) => {
                 (StatusCode::NOT_FOUND, "mcp server not found".into())
             }
-            Self::Mcp(McpError::AliasTaken(_)) => (StatusCode::CONFLICT, self.to_string()),
             Self::Mcp(McpError::Parse(_) | McpError::InvalidConfig(_)) => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
