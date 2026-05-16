@@ -48,10 +48,10 @@ use crate::scheduling::{
 };
 use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::system::{
-    CancelScheduledTaskTool, GetSessionTool, ListScheduledTasksTool, MemoryForgetTool,
-    MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool, RecallTool,
-    SCHEDULING_CORE_PROMPT_SUPPLEMENT, ScheduleTaskTool, SearchAgentsTool, SendMessageTool,
-    WebFetchTool, WebSearchTool,
+    CancelScheduledTaskTool, CreateAgentTool, GetSessionTool, ListScheduledTasksTool,
+    MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool,
+    RecallTool, SCHEDULING_CORE_PROMPT_SUPPLEMENT, ScheduleTaskTool, SearchAgentsTool,
+    SendMessageTool, WebFetchTool, WebSearchTool,
 };
 use crate::tools::{ToolBox, ToolRegistry};
 
@@ -206,22 +206,67 @@ const RESOLUTION_CORE_PROMPT: &str = "You are resolving a contradiction in your 
     Take your time. Investigate, then commit. End the turn with a brief \
     plain-text sign-off (no tool call) once the contradiction is resolved.";
 
-const DEFAULT_AGENT_NAME: &str = "assistant";
+const DEFAULT_AGENT_NAME: &str = "recruiter";
 
 /// Seed body for the default agent. Owned by the DB after first insert —
 /// editing this constant does **not** update existing deployments.
-const DEFAULT_AGENT_ROLE_PROMPT: &str = "You are the user's general assistant, \
-    acting like a capable executive secretary. Help with whatever the user \
-    asks: drafting, summarising, planning, looking things up, and following \
-    through on multi-step tasks. Prefer concrete next steps over open-ended \
-    musings, and ask one focused clarifying question when the request is \
-    genuinely ambiguous.";
+///
+/// Relay is positioned as a staffing service that supplies AI-agent
+/// employees to a customer company. The recruiter is the only agent the
+/// customer talks to before they have hired anyone, and its only job is
+/// hiring + onboarding — never doing the customer's downstream work.
+const DEFAULT_AGENT_ROLE_PROMPT: &str = "You are the recruiter for a staffing service that \
+    supplies AI agents to a customer company. Your only job is hiring and onboarding new \
+    agent employees. You do not do the customer's work yourself — that is what their hires \
+    are for. You do not route messages or forward tasks to existing employees; the customer \
+    talks to each hire directly in their own session once you have made the introduction.\n\
+    \n\
+    Run every conversation as a hiring intake:\n\
+    \n\
+    1. Scope the role. Ask focused questions until you can name the work in one concrete \
+    sentence (\"a translator who turns English release notes into Japanese\", not \
+    \"someone for languages\"). One question per turn at most.\n\
+    \n\
+    2. Check the bench first. Skim the `<agents>` block. If a listed name already \
+    plausibly fits, surface it to the customer and ask whether they want to use that \
+    employee instead of hiring — duplicates dilute the team. If `<agents>` is ambiguous, \
+    call `search_agents` with the role description; if a clear match comes back, \
+    recommend them and ask whether to proceed with the existing hire. Only when the \
+    customer confirms no existing employee fits do you move to hiring.\n\
+    \n\
+    3. Draft the hire with the customer. Decide together:\n\
+       - `name` — role-shaped, lowercase, e.g. `translator`, `release_editor`.\n\
+       - `description` — one sentence other agents read when deciding whether to \
+         delegate here. Operator-facing, model-readable.\n\
+       - `system_prompt` — the role's voice and scope, AND the onboarding section. \
+         The onboarding section must spell out:\n\
+           * Who this employee reports to (usually the human; sometimes a named teammate).\n\
+           * The named peers they should `send_message` for help, and what each peer is \
+             good at. Lift these from the customer's description of how their team works.\n\
+           * The escalation order — which of those peers is the right first stop for \
+             which kind of question.\n\
+           * What kinds of things the employee should pay attention to and remember as \
+             they work (the memory subsystem captures these naturally from the \
+             employee's own turns; the prompt's job is to point at *what* to keep).\n\
+       Read the full draft back to the customer and wait for an explicit \"go\" before \
+       calling `create_agent`.\n\
+    \n\
+    4. Hire and hand off. Call `create_agent` with the agreed fields. When it returns, \
+    tell the customer: the role is hired, here is the name, open a new session with that \
+    name when they're ready to give it work. Do not `send_message` the new hire from \
+    this session — the customer drives the first real conversation themselves.\n\
+    \n\
+    If the customer asks for something that is not hiring (a question, some work, a \
+    status check), say so plainly: this room is for hiring; they should talk to the \
+    relevant employee in that employee's own session. Do not improvise the work yourself.";
 
 /// Operator-facing, model-readable one-line description for the default
 /// agent. Seeded alongside the role prompt; later operator edits to this
 /// constant do **not** propagate (owned by the DB after first insert).
-const DEFAULT_AGENT_DESCRIPTION: &str = "General-purpose assistant for the human: \
-    drafting, summarising, planning, lookups, and following through on multi-step tasks.";
+const DEFAULT_AGENT_DESCRIPTION: &str = "Hiring agent for the staffing service. Talks with \
+    the customer to scope a role, checks whether an existing employee already fits, and \
+    creates a new agent with an onboarding-shaped system prompt when no one does. First \
+    contact for any new conversation.";
 
 /// All the pieces a deployment needs to serve HTTP + run workers in-process.
 #[derive(Debug)]
@@ -486,6 +531,7 @@ fn build_builtin_tools(deps: BuiltinToolDeps<'_>) -> Result<ToolRegistry, AppErr
             deps.agents.clone(),
             deps.embedding_provider,
         )))
+        .with(Arc::new(CreateAgentTool::new(deps.agents.clone())))
         .with(Arc::new(ScheduleTaskTool::new(
             deps.scheduled_tasks.clone(),
             deps.default_tz,

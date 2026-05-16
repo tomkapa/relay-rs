@@ -167,7 +167,7 @@ impl AgentStore for PgAgentStore {
         }
 
         let id = AgentId::new();
-        sqlx::query(
+        let insert = sqlx::query(
             "INSERT INTO agents \
                  (id, name, system_prompt, description, description_embedding, \
                   is_default, allowed_mcp_servers, created_at, updated_at) \
@@ -182,7 +182,18 @@ impl AgentStore for PgAgentStore {
         .bind(payload.allowed_mcp_servers.as_slice())
         .bind(now)
         .execute(&mut *tx)
-        .await?;
+        .await;
+        match insert {
+            Ok(_) => {}
+            // 23505 = unique_violation. The only unique index that can fire
+            // on this INSERT is `agents_name_lower_unique` — `is_default`
+            // races are excluded by the same-tx demote above and the partial
+            // index, and ids are freshly minted UUIDs.
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+                return Err(AgentStoreError::NameTaken(payload.name));
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         tx.commit().await?;
 
