@@ -41,15 +41,14 @@ export function SignIn() {
     const params = new URLSearchParams(location.search);
     const fromQuery = params.get("from");
     const state = location.state as { from?: string } | null;
-    const from =
-      fromQuery && fromQuery !== "/sign-in"
-        ? fromQuery
-        : state?.from && state.from !== "/sign-in"
-          ? state.from
-          : "/";
+    const candidate = fromQuery ?? state?.from ?? "/";
+    const isSafeInternalPath =
+      candidate.startsWith("/") &&
+      !candidate.startsWith("//") &&
+      candidate !== "/sign-in";
     return {
       oauthDown: params.get("error") === "oauth_unavailable",
-      returnTo: from,
+      returnTo: isSafeInternalPath ? candidate : "/",
     };
   }, [location.search, location.state]);
 
