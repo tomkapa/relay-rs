@@ -37,3 +37,22 @@ pub const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Minimum byte length of the JWT signing secret. HS256 best-practice
 /// is 256 bits (32 bytes) of random material.
 pub const JWT_SECRET_MIN_BYTES: usize = 32;
+
+/// Cookie name carrying the CSRF double-submit token.
+///
+/// Non-HttpOnly so the SPA can read it via `document.cookie` and echo
+/// the value in an `X-CSRF-Token` header on every mutation. The CSRF
+/// middleware compares the two and rejects POSTs that disagree (§10.6).
+///
+/// Wire-protocol constant — keep in sync with `web/src/lib/api.ts`.
+pub const CSRF_COOKIE_NAME: &str = "relay_csrf";
+
+/// HTTP header the SPA echoes the CSRF token in.
+///
+/// Wire-protocol constant — keep in sync with `web/src/lib/api.ts`.
+pub const CSRF_HEADER_NAME: &str = "X-CSRF-Token";
+
+/// Maximum accepted length of either the header or cookie value. The
+/// mint produces a 22-char base64url token; anything ≫ that is junk
+/// and gets rejected before constant-time comparison.
+pub const CSRF_TOKEN_MAX_LEN: usize = 64;

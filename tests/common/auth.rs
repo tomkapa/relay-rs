@@ -52,15 +52,33 @@ pub struct SeededPrincipal {
     pub cookie_value: String,
 }
 
+/// Fixed CSRF token used by every seeded test principal. Real users
+/// receive a freshly minted token from the OAuth callback / `/me`;
+/// tests echo this constant in both the cookie and the header to
+/// satisfy the CSRF middleware on non-GET requests.
+pub const TEST_CSRF_TOKEN: &str = "test-csrf-token-fixed-value";
+
 impl SeededPrincipal {
     /// Build the `Cookie:` header value to attach to a test request.
+    /// Includes both the session JWT cookie and the CSRF cookie so
+    /// non-GET requests through the CSRF middleware succeed.
     #[must_use]
     pub fn cookie_header(&self) -> String {
         format!(
-            "{}={}",
+            "{}={}; {}={}",
             relay_rs::auth::limits::COOKIE_NAME,
-            self.cookie_value
+            self.cookie_value,
+            relay_rs::auth::limits::CSRF_COOKIE_NAME,
+            TEST_CSRF_TOKEN,
         )
+    }
+
+    /// The CSRF token value to echo in the `X-CSRF-Token` header on
+    /// non-GET requests. Pairs with [`Self::cookie_header`] — the
+    /// middleware enforces these two match.
+    #[must_use]
+    pub fn csrf_header(&self) -> &'static str {
+        TEST_CSRF_TOKEN
     }
 
     /// Build a `Principal` mirroring the JWT claims — useful when a

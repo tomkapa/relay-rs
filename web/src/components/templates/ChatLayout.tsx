@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { GlobalErrorBanner } from "../organisms/GlobalErrorBanner";
 
 export function ChatLayout({
   rail,
@@ -15,7 +16,10 @@ export function ChatLayout({
     <div className="flex h-screen w-screen overflow-hidden bg-[var(--color-surface)]">
       {rail}
       {sidebar}
-      <main className="flex min-w-0 flex-1 flex-col">{main}</main>
+      <main className="flex min-w-0 flex-1 flex-col">
+        <GlobalErrorBanner />
+        {main}
+      </main>
       {panel}
     </div>
   );

@@ -1,6 +1,29 @@
 // Wire types mirror src/runtime/response.rs and the route handlers.
 // Keep in sync with: src/http/routes/threads.rs, src/runtime/response.rs.
 
+export type Role = "owner" | "admin" | "member";
+
+export type Org = {
+  id: string;
+  name: string;
+  slug: string;
+  role: Role;
+};
+
+export type User = {
+  id: string;
+  email: string;
+  display_name: string | null;
+  avatar_url: string | null;
+};
+
+export type Me = {
+  user: User;
+  orgs: Org[];
+  active_org_id: string;
+  role: Role;
+};
+
 export type AgentRef = { id: string; name: string };
 
 export type Agent = {

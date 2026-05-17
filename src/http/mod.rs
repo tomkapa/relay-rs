@@ -2,6 +2,7 @@
 //! CLAUDE.md §2; handlers stay thin and call into `prompt::*` traits.
 
 mod auth_layer;
+mod csrf;
 mod error;
 mod membership_cache;
 mod routes;

@@ -1,25 +1,78 @@
 import type {
   Agent,
+  Me,
+  Role,
   SubmitPromptResponse,
   ThreadMessage,
   ThreadSummary,
 } from "../types/api";
+import { ApiError, AuthRedirect } from "./errors";
+import { readCookie } from "./cookies";
+import { useAuthStore } from "../stores/authStore";
 
-async function jsonOk<T>(res: Response): Promise<T> {
+// Wire-protocol constants — keep in sync with src/auth/limits.rs
+// (`CSRF_COOKIE_NAME`, `CSRF_HEADER_NAME`).
+const CSRF_COOKIE = "relay_csrf";
+const CSRF_HEADER = "X-CSRF-Token";
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+export async function request<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+  };
+  if (!SAFE_METHODS.has(method)) {
+    const csrf = readCookie(CSRF_COOKIE);
+    if (csrf) headers[CSRF_HEADER] = csrf;
+  }
+  const res = await fetch(path, { ...init, credentials: "include", headers });
+
+  if (res.status === 401) {
+    const back = encodeURIComponent(
+      window.location.pathname + window.location.search,
+    );
+    window.location.href = `/auth/google/login?return_to=${back}`;
+    throw new AuthRedirect();
+  }
+
+  if (res.status === 403) {
+    const body = await res.text().catch(() => "");
+    useAuthStore
+      .getState()
+      .setError({ kind: "forbidden", message: body || undefined });
+    throw new ApiError(403, body);
+  }
+
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status} ${res.statusText}: ${body}`);
+    throw new ApiError(res.status, body);
   }
-  return res.json() as Promise<T>;
+
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
 }
 
-export const api = {
-  agents: () => fetch("/agents").then(jsonOk<Agent[]>),
+export type SwitchOrgResponse = { active_org_id: string; role: Role };
 
-  threads: () => fetch("/threads").then(jsonOk<ThreadSummary[]>),
+export const api = {
+  me: () => request<Me>("/me"),
+  switchOrg: (orgId: string) =>
+    request<SwitchOrgResponse>("/auth/switch-org", {
+      method: "POST",
+      body: JSON.stringify({ org_id: orgId }),
+    }),
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
+
+  agents: () => request<Agent[]>("/agents"),
+
+  threads: () => request<ThreadSummary[]>("/threads"),
 
   threadMessages: (rootId: string) =>
-    fetch(`/threads/${rootId}/messages`).then(jsonOk<ThreadMessage[]>),
+    request<ThreadMessage[]>(`/threads/${rootId}/messages`),
 
   submitPrompt: (input: {
     session_id?: string;
@@ -27,15 +80,17 @@ export const api = {
     content: string;
     idempotency_key: string;
   }) =>
-    fetch("/prompts", {
+    request<SubmitPromptResponse>("/prompts", {
       method: "POST",
-      headers: { "content-type": "application/json" },
       body: JSON.stringify(input),
-    }).then(jsonOk<SubmitPromptResponse>),
-
-  cancelRequest: (requestId: string) =>
-    fetch(`/requests/${requestId}/cancel`, { method: "POST" }).then((r) => {
-      if (!r.ok && r.status !== 404)
-        throw new Error(`HTTP ${r.status} ${r.statusText}`);
     }),
+
+  cancelRequest: async (requestId: string) => {
+    try {
+      await request<void>(`/requests/${requestId}/cancel`, { method: "POST" });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return;
+      throw e;
+    }
+  },
 };

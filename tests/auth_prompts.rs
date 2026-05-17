@@ -180,6 +180,7 @@ async fn authenticated_post_prompt_returns_202_with_request_id() {
                 .uri("/prompts")
                 .header("content-type", "application/json")
                 .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", h.primary.csrf_header())
                 .body(axum::body::Body::from(
                     serde_json::json!({
                         "content": "hello relay",
@@ -233,6 +234,7 @@ async fn cross_org_cancel_returns_404_and_leaves_row_uncancelled() {
                 .uri("/prompts")
                 .header("content-type", "application/json")
                 .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", h.primary.csrf_header())
                 .body(axum::body::Body::from(
                     serde_json::json!({
                         "content": "primary prompt",
@@ -265,6 +267,7 @@ async fn cross_org_cancel_returns_404_and_leaves_row_uncancelled() {
                 .method("POST")
                 .uri(format!("/requests/{request_id}/cancel"))
                 .header("cookie", other.cookie_header())
+                .header("x-csrf-token", other.csrf_header())
                 .body(axum::body::Body::empty())
                 .expect("request"),
         )
@@ -290,6 +293,7 @@ async fn cross_org_cancel_returns_404_and_leaves_row_uncancelled() {
                 .method("POST")
                 .uri(format!("/requests/{request_id}/cancel"))
                 .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", h.primary.csrf_header())
                 .body(axum::body::Body::empty())
                 .expect("request"),
         )
@@ -303,4 +307,84 @@ async fn cross_org_cancel_returns_404_and_leaves_row_uncancelled() {
             .await
             .expect("fetch");
     assert!(cancelled, "owner's cancel landed");
+}
+
+// ---- CSRF middleware probes ---------------------------------------------
+//
+// These exercise the `require_csrf` layer applied inside the
+// authenticated subtree. The middleware rejects state-changing requests
+// whose `X-CSRF-Token` header doesn't match the `relay_csrf` cookie.
+// Safe methods (GET) bypass the middleware entirely.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_without_csrf_header_returns_403() {
+    let h = AuthPromptsHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/prompts")
+                .header("content-type", "application/json")
+                .header("cookie", h.primary.cookie_header())
+                // Intentionally omit the x-csrf-token header.
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "content": "csrf check",
+                        "idempotency_key": "k-csrf-missing",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_with_mismatched_csrf_header_returns_403() {
+    let h = AuthPromptsHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/prompts")
+                .header("content-type", "application/json")
+                .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", "different-token")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "content": "csrf check",
+                        "idempotency_key": "k-csrf-mismatch",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_without_csrf_passes_through() {
+    // GET is exempt from the CSRF middleware — it's not a state-
+    // changing method. /agents is a tenant-scoped GET that exercises
+    // the same `private` subtree as the POST cases above.
+    let h = AuthPromptsHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/agents")
+                .header("cookie", h.primary.cookie_header())
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
 }

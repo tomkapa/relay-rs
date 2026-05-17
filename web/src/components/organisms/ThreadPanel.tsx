@@ -9,8 +9,8 @@ import {
   Smile,
   X,
 } from "lucide-react";
+import { Button } from "../atoms/Button";
 import { Monogram } from "../atoms/Monogram";
-import { Spinner } from "../atoms/Spinner";
 import { Markdown } from "../molecules/Markdown";
 import { ToolCallLine } from "../molecules/ToolCallLine";
 import { MentionInput } from "../molecules/MentionInput";
@@ -103,13 +103,9 @@ export function ThreadPanel({
             Replies in <span className="font-[var(--font-mono)]">#{channel}</span>
           </div>
         </div>
-        <button
-          aria-label="Close"
-          onClick={onClose}
-          className="flex h-7 w-7 items-center justify-center text-[var(--color-muted)] hover:text-[var(--color-ink)]"
-        >
+        <Button variant="ghost" size="sm" iconOnly aria-label="Close" onClick={onClose}>
           <X className="h-4 w-4" />
-        </button>
+        </Button>
       </header>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto scroll-thin">
@@ -138,12 +134,9 @@ export function ThreadPanel({
           <span className="font-[var(--font-mono)] text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
             {bubbles.length} {bubbles.length === 1 ? "reply" : "replies"}
           </span>
-          <button
-            aria-label="Notifications"
-            className="text-[var(--color-muted)] hover:text-[var(--color-ink)]"
-          >
+          <Button variant="ghost" size="xs" iconOnly aria-label="Notifications">
             <Bell className="h-3.5 w-3.5" />
-          </button>
+          </Button>
         </div>
 
         <div className="flex flex-col">
@@ -190,43 +183,29 @@ export function ThreadPanel({
             maxHeight={140}
           />
           <div className="flex items-center gap-1 border-t border-[var(--color-line)] px-2 py-1">
-            <button
-              type="button"
-              aria-label="Mention"
-              onClick={insertAt}
-              className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)]"
-            >
+            <Button type="button" variant="ghost" size="xs" iconOnly aria-label="Mention" onClick={insertAt}>
               <AtSign className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              aria-label="Attach"
-              className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)]"
-            >
+            </Button>
+            <Button type="button" variant="ghost" size="xs" iconOnly aria-label="Attach">
               <Paperclip className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              aria-label="Emoji"
-              className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)]"
-            >
+            </Button>
+            <Button type="button" variant="ghost" size="xs" iconOnly aria-label="Emoji">
               <Smile className="h-3.5 w-3.5" />
-            </button>
-            <button
+            </Button>
+            <Button
               type="submit"
+              variant="moss"
+              size="sm"
+              loading={pending}
               disabled={!trimmed || pending || !thread}
-              className="ml-auto inline-flex h-7 items-center gap-1 bg-[var(--color-moss)] px-2.5 font-[var(--font-mono)] text-[11.5px] font-semibold text-white hover:bg-[var(--color-moss-deep)] disabled:cursor-not-allowed disabled:opacity-40"
+              className="ml-auto"
             >
-              {pending ? (
-                <>
-                  <Spinner size={10} className="text-white" /> sending
-                </>
-              ) : (
+              {pending ? "sending" : (
                 <>
                   Send <Send className="h-3 w-3" strokeWidth={2.5} />
                 </>
               )}
-            </button>
+            </Button>
           </div>
         </div>
       </form>
