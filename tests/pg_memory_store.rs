@@ -17,8 +17,9 @@ use relay_rs::clock::SystemClock;
 use relay_rs::memory::{
     MemoryContent, MemoryEventPayload, MemoryId, MemoryKind, MemoryMutation, MemoryState,
     MemoryStore, MemoryStoreError, MutationKind, MutationSource, MutationSourceKind, PgMemoryStore,
-    ResolutionOutcome, ResolutionReason, run_librarian_sweep,
+    ResolutionOutcome, ResolutionReason, SearchFilter, run_librarian_sweep,
 };
+use relay_rs::provider::embed_one;
 use relay_rs::runtime::{PromptRequestId, RequestKind};
 
 mod common;
@@ -245,6 +246,7 @@ async fn pinned_row_rejects_agent_update_but_accepts_operator_override() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // mixed-mutation scenario + embedding regression check
 async fn rebuild_materialized_reproduces_live_view() {
     let db = TestDb::fresh().await;
     let s = store(&db);
@@ -313,6 +315,25 @@ async fn rebuild_materialized_reproduces_live_view() {
         .map(|r| r.content.as_str().to_owned())
         .collect();
 
+    // Pre-rebuild embedding search baseline. `rebuild_materialized`
+    // DELETEs every materialized row and replays the journal, which by
+    // itself would leave `embedding IS NULL` (the embedding column lives
+    // on `agent_memories`, not in `memory_events`). The store snapshots
+    // and restores embeddings around the replay so retrieval keeps
+    // working — assert that here.
+    let embedder = common::embedding::FakeEmbeddingProvider::new();
+    let probe = embed_one(&embedder, "first revised")
+        .await
+        .expect("embed probe");
+    let pre_hits = s
+        .search_by_embedding(db.default_agent_id, &probe, 8, SearchFilter::default())
+        .await
+        .expect("pre search");
+    assert!(
+        !pre_hits.is_empty(),
+        "fake embedder + live writes should match at least one row before rebuild"
+    );
+
     s.rebuild_materialized(db.default_agent_id)
         .await
         .expect("rebuild");
@@ -334,6 +355,17 @@ async fn rebuild_materialized_reproduces_live_view() {
 
     assert_eq!(live_ids, rebuilt_ids);
     assert_eq!(live_contents, rebuilt_contents);
+
+    let post_hits = s
+        .search_by_embedding(db.default_agent_id, &probe, 8, SearchFilter::default())
+        .await
+        .expect("post search");
+    let pre_ids: Vec<MemoryId> = pre_hits.iter().map(|h| h.row.id).collect();
+    let post_ids: Vec<MemoryId> = post_hits.iter().map(|h| h.row.id).collect();
+    assert_eq!(
+        pre_ids, post_ids,
+        "rebuild_materialized must preserve embeddings — search hits diverged"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
