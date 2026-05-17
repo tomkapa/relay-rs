@@ -29,6 +29,7 @@ async fn fresh_agent(db: &TestDb, name: &str) -> Participant {
         common::pg::shared_agent_store(db.pool.clone(), SystemClock::shared());
     let record = store
         .create(NewAgent {
+            org_id: db.default_org_id,
             name: AgentName::try_from(name).expect("name"),
             system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
             description: relay_rs::agents::AgentDescription::try_from("test desc").expect("desc"),
@@ -49,11 +50,11 @@ async fn same_pair_same_dag_returns_same_session() {
     let b = Participant::agent(db.default_agent_id);
 
     let first = store
-        .resolve_or_create_for_pair(root, a, b, None)
+        .resolve_or_create_for_pair(root, a, b, None, db.default_org_id, db.default_user_id)
         .await
         .expect("first");
     let second = store
-        .resolve_or_create_for_pair(root, a, b, None)
+        .resolve_or_create_for_pair(root, a, b, None, db.default_org_id, db.default_user_id)
         .await
         .expect("second");
     assert_eq!(first, second, "upsert is idempotent on same key");
@@ -70,11 +71,11 @@ async fn reversed_pair_canonicalises_to_same_session() {
     let a = Participant::agent(db.default_agent_id);
 
     let forward = store
-        .resolve_or_create_for_pair(root, h, a, None)
+        .resolve_or_create_for_pair(root, h, a, None, db.default_org_id, db.default_user_id)
         .await
         .expect("forward");
     let reversed = store
-        .resolve_or_create_for_pair(root, a, h, None)
+        .resolve_or_create_for_pair(root, a, h, None, db.default_org_id, db.default_user_id)
         .await
         .expect("reversed");
     assert_eq!(forward, reversed);
@@ -89,11 +90,25 @@ async fn different_dags_get_distinct_sessions() {
     let dag_a = PromptRequestId::new();
     let dag_b = PromptRequestId::new();
     let s_a = store
-        .resolve_or_create_for_pair(dag_a, pair.0, pair.1, None)
+        .resolve_or_create_for_pair(
+            dag_a,
+            pair.0,
+            pair.1,
+            None,
+            db.default_org_id,
+            db.default_user_id,
+        )
         .await
         .expect("dag_a");
     let s_b = store
-        .resolve_or_create_for_pair(dag_b, pair.0, pair.1, None)
+        .resolve_or_create_for_pair(
+            dag_b,
+            pair.0,
+            pair.1,
+            None,
+            db.default_org_id,
+            db.default_user_id,
+        )
         .await
         .expect("dag_b");
     assert_ne!(s_a, s_b, "DAG isolation: same pair, different roots");
@@ -111,11 +126,25 @@ async fn parent_session_is_recorded() {
     let agent_b = fresh_agent(&db, "second").await;
 
     let parent_id = store
-        .resolve_or_create_for_pair(root, Participant::Human, agent_a, None)
+        .resolve_or_create_for_pair(
+            root,
+            Participant::Human,
+            agent_a,
+            None,
+            db.default_org_id,
+            db.default_user_id,
+        )
         .await
         .expect("parent");
     let child_id = store
-        .resolve_or_create_for_pair(root, agent_a, agent_b, Some(parent_id))
+        .resolve_or_create_for_pair(
+            root,
+            agent_a,
+            agent_b,
+            Some(parent_id),
+            db.default_org_id,
+            db.default_user_id,
+        )
         .await
         .expect("child");
 
@@ -136,7 +165,14 @@ async fn participants_are_returned_in_canonical_order() {
     let agent_p = Participant::agent(db.default_agent_id);
 
     let id = store
-        .resolve_or_create_for_pair(root, Participant::Human, agent_p, None)
+        .resolve_or_create_for_pair(
+            root,
+            Participant::Human,
+            agent_p,
+            None,
+            db.default_org_id,
+            db.default_user_id,
+        )
         .await
         .expect("session");
     let (a, b) = store.participants(id).await.expect("participants");
@@ -155,6 +191,8 @@ async fn root_request_id_round_trips() {
             Participant::Human,
             Participant::agent(db.default_agent_id),
             None,
+            db.default_org_id,
+            db.default_user_id,
         )
         .await
         .expect("session");
@@ -173,6 +211,8 @@ async fn self_session_is_rejected() {
             Participant::agent(db.default_agent_id),
             Participant::agent(db.default_agent_id),
             None,
+            db.default_org_id,
+            db.default_user_id,
         )
         .await
         .expect_err("self-session forbidden");

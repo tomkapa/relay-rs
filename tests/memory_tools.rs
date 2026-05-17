@@ -36,6 +36,7 @@ struct Fixture {
     store: SharedMemoryStore,
     session: relay_rs::session::SessionId,
     agent_id: relay_rs::agents::AgentId,
+    user_id: relay_rs::auth::UserId,
 }
 
 async fn fixture(db: &TestDb) -> Fixture {
@@ -45,7 +46,7 @@ async fn fixture(db: &TestDb) -> Fixture {
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
-    let names_cache = AgentNamesCache::new(Duration::from_secs(60), clock.clone());
+    let names_cache = AgentNamesCache::new(16, Duration::from_secs(60), clock.clone());
     let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
         db.pool.clone(),
         clock.clone(),
@@ -66,13 +67,20 @@ async fn fixture(db: &TestDb) -> Fixture {
         },
         clock,
     );
-    let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
+    let session = human_to_agent_session(
+        sessions.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     Fixture {
         deps: MemoryToolDeps::new(loader.clone()),
         loader,
         store,
         session,
         agent_id: db.default_agent_id,
+        user_id: db.default_user_id,
     }
 }
 
@@ -83,6 +91,7 @@ fn ctx(f: &Fixture, request_id: PromptRequestId) -> ToolCallContext {
         root_request_id: request_id,
         request_id,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
+        acting_user_id: f.user_id,
     }
 }
 
@@ -91,7 +100,7 @@ async fn memory_write_creates_tentative_row() {
     let db = TestDb::fresh().await;
     let f = fixture(&db).await;
     let tool = MemoryWriteTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
 
     let out = tool
         .execute(
@@ -133,7 +142,7 @@ async fn memory_update_resolves_handle_and_resets_state() {
 
     // Compose the section so the handle map is populated. We do this
     // through the same path the tool uses: a `resolve_handle` call.
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let _ = MemoryWriteTool::new(f.deps.clone()); // ensure deps usable
     let update = MemoryUpdateTool::new(f.deps.clone());
     // The tool resolves M-1 via the session cache it shares.
@@ -176,7 +185,7 @@ async fn memory_update_pinned_row_rejects_agent_call() {
         .expect("seed pinned");
 
     let update = MemoryUpdateTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let err = update
         .execute(
             json!({"handle": "M-1", "content": "agent attempt"}),
@@ -205,7 +214,7 @@ async fn memory_validate_promotes_state_without_content_change() {
         .expect("seed");
 
     let validate = MemoryValidateTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let out = validate
         .execute(
             json!({
@@ -248,7 +257,7 @@ async fn memory_validate_rejects_pinned_row() {
         .expect("seed pinned");
 
     let validate = MemoryValidateTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let err = validate
         .execute(
             json!({"handle": "M-1", "evidence": "external source agrees"}),
@@ -277,7 +286,7 @@ async fn memory_forget_removes_row() {
         .expect("seed");
 
     let forget = MemoryForgetTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let out = forget
         .execute(json!({"handle": "M-1"}), &ctx(&f, request))
         .await
@@ -296,7 +305,7 @@ async fn unknown_handle_surfaces_invalid_input() {
     let db = TestDb::fresh().await;
     let f = fixture(&db).await;
     let update = MemoryUpdateTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let err = update
         .execute(
             json!({"handle": "M-99", "content": "nope"}),
@@ -312,7 +321,7 @@ async fn per_turn_cap_blocks_overflow_within_one_request_id() {
     let db = TestDb::fresh().await;
     let f = fixture(&db).await;
     let write = MemoryWriteTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
 
     // The first MAX_MEMORY_MUTATIONS_PER_TURN writes succeed.
     for i in 0..MAX_MEMORY_MUTATIONS_PER_TURN {
@@ -337,7 +346,7 @@ async fn per_turn_cap_blocks_overflow_within_one_request_id() {
     );
 
     // A different request id has its own quota.
-    let new_req = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let new_req = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     write
         .execute(
             json!({"kind": "self", "content": "fresh turn"}),
@@ -371,7 +380,7 @@ async fn handle_round_trips_through_session_cache() {
     let memory = AgentMemory::new(
         agents,
         AgentPromptCache::new(2, Duration::from_secs(60), SystemClock::shared()),
-        AgentNamesCache::new(Duration::from_secs(60), SystemClock::shared()),
+        AgentNamesCache::new(16, Duration::from_secs(60), SystemClock::shared()),
         f.loader.clone(),
         relay_rs::memory::ModeCores {
             normal: std::sync::Arc::from("core"),
@@ -407,6 +416,7 @@ fn ctx_with_target(
         kind_payload: relay_rs::runtime::RequestKindPayload::Resolution {
             contradiction_event_id: target,
         },
+        acting_user_id: f.user_id,
     }
 }
 
@@ -456,7 +466,7 @@ async fn memory_update_with_resolution_target_closes_contradiction() {
     let (_, _, target) = seed_pair_and_contradiction(&f).await;
 
     let update = MemoryUpdateTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let _ = update
         .execute(
             json!({"handle": "M-1", "content": "ship on Friday after standup"}),
@@ -486,7 +496,7 @@ async fn memory_forget_with_resolution_target_closes_contradiction() {
     let (_, _, target) = seed_pair_and_contradiction(&f).await;
 
     let forget = MemoryForgetTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let _ = forget
         .execute(
             json!({"handle": "M-1"}),
@@ -513,7 +523,7 @@ async fn memory_update_without_resolution_target_leaves_contradiction_open() {
     let (_, _, target) = seed_pair_and_contradiction(&f).await;
 
     let update = MemoryUpdateTool::new(f.deps.clone());
-    let request = seed_prompt_request(&db.pool, f.session, f.agent_id).await;
+    let request = seed_prompt_request(&db.pool, f.session, f.agent_id, db.default_org_id).await;
     let _ = update
         .execute(
             json!({"handle": "M-1", "content": "unrelated tweak"}),

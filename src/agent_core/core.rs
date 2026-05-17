@@ -3,6 +3,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug};
 
+use crate::auth::UserId;
 use crate::clock::SharedClock;
 use crate::hook::{HookChain, TurnContext};
 use crate::memory::SharedMemory;
@@ -132,12 +133,14 @@ impl Agent {
             relay.outcome = tracing::field::Empty,
         ),
     )]
+    #[allow(clippy::too_many_arguments)]
     pub async fn reply(
         &self,
         session: SessionId,
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
+        acting_user_id: UserId,
         kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -148,6 +151,7 @@ impl Agent {
                 viewer,
                 prompts,
                 request_id,
+                acting_user_id,
                 &kind_payload,
                 cancel,
                 observer,
@@ -164,6 +168,7 @@ impl Agent {
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
+        acting_user_id: UserId,
         kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -178,7 +183,8 @@ impl Agent {
             .map(|p| UserContent::Text(p.into_string()))
             .collect();
         self.sessions
-            .append(
+            .append_for_user(
+                acting_user_id,
                 session,
                 MessageSender::from_participant(counterpart),
                 viewer,
@@ -192,6 +198,7 @@ impl Agent {
             viewer,
             counterpart,
             request_id,
+            acting_user_id,
             kind_payload,
             cancel,
             observer,
@@ -216,11 +223,13 @@ impl Agent {
             relay.outcome = tracing::field::Empty,
         ),
     )]
+    #[allow(clippy::too_many_arguments)]
     pub async fn resume(
         &self,
         session: SessionId,
         viewer: Participant,
         request_id: PromptRequestId,
+        acting_user_id: UserId,
         kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -232,6 +241,7 @@ impl Agent {
                 viewer,
                 counterpart,
                 request_id,
+                acting_user_id,
                 &kind_payload,
                 cancel,
                 observer,
@@ -248,6 +258,7 @@ impl Agent {
         viewer: Participant,
         counterpart: Participant,
         request_id: PromptRequestId,
+        acting_user_id: UserId,
         kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -286,6 +297,7 @@ impl Agent {
                     viewer_as_sender,
                     root_request_id,
                     request_id,
+                    acting_user_id,
                     kind_payload,
                     &mut send_message_calls,
                     &cancel,

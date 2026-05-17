@@ -392,8 +392,16 @@ async fn prompt_requests_kind_defaults_to_normal() {
         db.pool.clone(),
         relay_rs::clock::SystemClock::shared(),
     );
-    let session = common::pg::human_to_agent_session(&session_store, db.default_agent_id).await;
-    let id = common::pg::seed_prompt_request(&db.pool, session, db.default_agent_id).await;
+    let session = common::pg::human_to_agent_session(
+        &session_store,
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
+    let id =
+        common::pg::seed_prompt_request(&db.pool, session, db.default_agent_id, db.default_org_id)
+            .await;
 
     let (kind, payload): (RequestKind, serde_json::Value) =
         sqlx::query_as("SELECT kind, kind_payload FROM prompt_requests WHERE id = $1")

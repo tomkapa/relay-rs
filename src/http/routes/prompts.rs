@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agents::AgentId;
+use crate::auth::Principal;
 use crate::runtime::{
     EnqueueOutcome, IdempotencyKey, NewPromptRequest, PromptRequestId, RequestStatus,
 };
@@ -59,6 +60,7 @@ struct SubmitPromptResponse {
 
 async fn submit_prompt(
     State(state): State<AppState>,
+    principal: Principal,
     Json(payload): Json<SubmitPromptRequest>,
 ) -> Result<(StatusCode, Json<SubmitPromptResponse>), HttpError> {
     let content =
@@ -77,20 +79,30 @@ async fn submit_prompt(
         Some(session_id) => session_agent_participant(&state, session_id).await?,
         None => match payload.agent_id {
             Some(id) => id,
-            None => state.agents.default_id().await?,
+            None => state.agents.default_id_for(principal.active_org_id).await?,
         },
     };
 
+    // Tenancy plumbing for the queue's implicit session-create path
+    // (`NewPromptRequest::session = None`). For a continuing session the
+    // queue won't mint a row, so the (org_id, user_id) we pass here is
+    // only consulted on first prompt — the runtime subsystem's retrofit
+    // will pick them up onto `prompt_requests` itself.
     let outcome = state
         .queue
-        .enqueue(NewPromptRequest::normal(
-            payload.session_id,
-            Participant::Human,
-            receiver_agent_id,
-            None,
-            content,
-            idempotency_key,
-        ))
+        .enqueue_for_user(
+            principal.user_id,
+            NewPromptRequest::normal(
+                payload.session_id,
+                Participant::Human,
+                receiver_agent_id,
+                None,
+                content,
+                idempotency_key,
+                principal.active_org_id,
+                principal.user_id,
+            ),
+        )
         .await?;
 
     let status_code = match outcome {
@@ -125,9 +137,27 @@ async fn session_agent_participant(
 
 async fn cancel_request(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, HttpError> {
     let request_id = PromptRequestId::from(id);
+    // Tenant gate: confirm the principal can see the request before
+    // dispatching the privileged cancellation write. Inside
+    // `begin_as`, RLS on `prompt_requests` filters cross-org rows so
+    // the lookup returns `None` for ids the caller can't see — we
+    // 404 cleanly without leaking existence. Mirrors the agents /
+    // mcp_servers route pattern.
+    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
+    let visible: Option<bool> =
+        sqlx::query_scalar("SELECT TRUE FROM prompt_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(crate::auth::AuthError::from)?;
+    tx.commit().await.map_err(crate::auth::AuthError::from)?;
+    if visible.is_none() {
+        return Err(HttpError::NotFound);
+    }
     state.queue.request_cancellation(request_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -31,6 +31,8 @@ async fn enqueue_reflection_row(
     agent_id: relay_rs::agents::AgentId,
     up_to: PromptRequestId,
     key: &str,
+    org_id: relay_rs::auth::OrgId,
+    user_id: relay_rs::auth::UserId,
 ) -> PromptRequestId {
     let req = NewPromptRequest {
         session: Some(session),
@@ -39,6 +41,8 @@ async fn enqueue_reflection_row(
         parent_session: None,
         content: Prompt::try_from("(reflection)").expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
+        org_id,
+        created_by_user_id: user_id,
         kind_payload: RequestKindPayload::Reflection {
             session_id: session,
             up_to_turn_id: up_to,
@@ -55,12 +59,27 @@ async fn claim_returns_reflection_kind_and_payload() {
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let queue: SharedPromptQueue = Arc::new(PgPromptQueue::new(db.pool.clone(), clock));
 
-    let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
+    let session = human_to_agent_session(
+        sessions.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     // The reflection's `since_turn_id` references a real prompt row to
     // satisfy the JSON payload's UUID — any id works since the worker
     // does not dereference it during a claim.
     let since = PromptRequestId::new();
-    let _ = enqueue_reflection_row(&queue, session, db.default_agent_id, since, "k1").await;
+    let _ = enqueue_reflection_row(
+        &queue,
+        session,
+        db.default_agent_id,
+        since,
+        "k1",
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
 
     let claimed = queue
         .claim_next_session(WorkerId::new())
@@ -93,11 +112,26 @@ async fn per_agent_serialization_skips_session_with_in_flight_reflection() {
     let queue: SharedPromptQueue = Arc::new(PgPromptQueue::new(db.pool.clone(), clock));
 
     let agent_id = db.default_agent_id;
-    let s1 = human_to_agent_session(sessions.as_ref(), agent_id).await;
+    let s1 = human_to_agent_session(
+        sessions.as_ref(),
+        agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
 
     // Enqueue + claim the first reflection — it goes to `processing`
     // and holds a lease.
-    let _ = enqueue_reflection_row(&queue, s1, agent_id, PromptRequestId::new(), "k1").await;
+    let _ = enqueue_reflection_row(
+        &queue,
+        s1,
+        agent_id,
+        PromptRequestId::new(),
+        "k1",
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let first = queue
         .claim_next_session(WorkerId::new())
         .await
@@ -114,6 +148,8 @@ async fn per_agent_serialization_skips_session_with_in_flight_reflection() {
             Participant::Human,
             Participant::agent(agent_id),
             None,
+            db.default_org_id,
+            db.default_user_id,
         )
         .await
         .expect("s2");
@@ -124,6 +160,8 @@ async fn per_agent_serialization_skips_session_with_in_flight_reflection() {
         None,
         Prompt::try_from("hello").expect("p"),
         IdempotencyKey::try_from("normal-k").expect("k"),
+        db.default_org_id,
+        db.default_user_id,
     );
     let outcome = queue.enqueue(normal).await.expect("enqueue normal");
     let claim = queue
@@ -143,6 +181,8 @@ async fn per_agent_serialization_skips_session_with_in_flight_reflection() {
         agent_id,
         PromptRequestId::new(),
         "k2",
+        db.default_org_id,
+        db.default_user_id,
     )
     .await;
     let second = queue
@@ -165,17 +205,25 @@ async fn scheduler_tick_enqueues_for_idle_session_with_unprocessed_turns() {
 
     // Mint a session, append one message back-dated past the idle
     // threshold so the scheduler's "idle" predicate fires immediately.
-    let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
-    let request_id = common::pg::seed_prompt_request(&db.pool, session, db.default_agent_id).await;
+    let session = human_to_agent_session(
+        sessions.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
+    let request_id =
+        common::pg::seed_prompt_request(&db.pool, session, db.default_agent_id, db.default_org_id)
+            .await;
     let stale_ts = Utc::now() - chrono::Duration::seconds(60 * 60);
     sqlx::query(
         "INSERT INTO session_messages
              (session_id, seq, request_id, body,
               sender_kind, sender_agent_id,
-              receiver_kind, receiver_agent_id, created_at)
+              receiver_kind, receiver_agent_id, created_at, org_id)
          VALUES ($1, 1, $2, $3,
                  'human', NULL,
-                 'agent', $4, $5)",
+                 'agent', $4, $5, $6)",
     )
     .bind(session)
     .bind(request_id)
@@ -185,6 +233,7 @@ async fn scheduler_tick_enqueues_for_idle_session_with_unprocessed_turns() {
     }))
     .bind(db.default_agent_id)
     .bind(stale_ts)
+    .bind(db.default_org_id)
     .execute(&db.pool)
     .await
     .expect("seed message");
@@ -235,13 +284,28 @@ async fn scheduler_does_not_duplicate_pending_reflection() {
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let queue: SharedPromptQueue = Arc::new(PgPromptQueue::new(db.pool.clone(), clock));
-    let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
+    let session = human_to_agent_session(
+        sessions.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let since = PromptRequestId::new();
 
     // Pre-seed a reflection row in `pending`. The scheduler's predicate
     // (NOT EXISTS pending/processing reflection) should refuse to add
     // another for the same session.
-    let _ = enqueue_reflection_row(&queue, session, db.default_agent_id, since, "preseeded").await;
+    let _ = enqueue_reflection_row(
+        &queue,
+        session,
+        db.default_agent_id,
+        since,
+        "preseeded",
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let count_before: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM prompt_requests
          WHERE session_id = $1 AND kind = 'reflection'",
@@ -254,15 +318,17 @@ async fn scheduler_does_not_duplicate_pending_reflection() {
 
     // Now back-date a message so the scheduler would otherwise enqueue
     // a fresh reflection. The dedup predicate must keep the count at 1.
-    let request_id = common::pg::seed_prompt_request(&db.pool, session, db.default_agent_id).await;
+    let request_id =
+        common::pg::seed_prompt_request(&db.pool, session, db.default_agent_id, db.default_org_id)
+            .await;
     sqlx::query(
         "INSERT INTO session_messages
              (session_id, seq, request_id, body,
               sender_kind, sender_agent_id,
-              receiver_kind, receiver_agent_id, created_at)
+              receiver_kind, receiver_agent_id, created_at, org_id)
          VALUES ($1, 1, $2, $3,
                  'human', NULL,
-                 'agent', $4, $5)",
+                 'agent', $4, $5, $6)",
     )
     .bind(session)
     .bind(request_id)
@@ -272,6 +338,7 @@ async fn scheduler_does_not_duplicate_pending_reflection() {
     }))
     .bind(db.default_agent_id)
     .bind(Utc::now() - chrono::Duration::seconds(60 * 60))
+    .bind(db.default_org_id)
     .execute(&db.pool)
     .await
     .expect("seed message");
@@ -314,7 +381,13 @@ async fn scheduler_skips_session_whose_seed_turn_is_reflection() {
     let queue: SharedPromptQueue = Arc::new(PgPromptQueue::new(db.pool.clone(), clock.clone()));
 
     let agent_id = db.default_agent_id;
-    let session = human_to_agent_session(sessions.as_ref(), agent_id).await;
+    let session = human_to_agent_session(
+        sessions.as_ref(),
+        agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
 
     // Insert a seed prompt_request whose id matches the session's
     // root_request_id and whose kind is 'reflection' — i.e. the shape of
@@ -328,11 +401,11 @@ async fn scheduler_skips_session_whose_seed_turn_is_reflection() {
     let now = chrono::Utc::now();
     sqlx::query(
         "INSERT INTO prompt_requests
-             (id, session_id, content, idempotency_key, status,
+             (id, session_id, org_id, content, idempotency_key, status,
               sender_kind, sender_agent_id,
               receiver_kind, receiver_agent_id, root_request_id,
               kind, kind_payload, created_at, updated_at)
-         VALUES ($1, $2, '(reflection)', $3, 'done',
+         VALUES ($1, $2, $7, '(reflection)', $3, 'done',
                  'agent', $4,
                  'agent', $4, $1,
                  'reflection', $5, $6, $6)",
@@ -346,6 +419,7 @@ async fn scheduler_skips_session_whose_seed_turn_is_reflection() {
         "data": { "session_id": session, "up_to_turn_id": root_id }
     }))
     .bind(now)
+    .bind(db.default_org_id)
     .execute(&db.pool)
     .await
     .expect("seed reflection-kind root request");
@@ -356,10 +430,10 @@ async fn scheduler_skips_session_whose_seed_turn_is_reflection() {
         "INSERT INTO session_messages
              (session_id, seq, request_id, body,
               sender_kind, sender_agent_id,
-              receiver_kind, receiver_agent_id, created_at)
+              receiver_kind, receiver_agent_id, created_at, org_id)
          VALUES ($1, 1, $2, $3,
                  'agent', $4,
-                 'agent', $4, $5)",
+                 'agent', $4, $5, $6)",
     )
     .bind(session)
     .bind(root_id)
@@ -369,6 +443,7 @@ async fn scheduler_skips_session_whose_seed_turn_is_reflection() {
     }))
     .bind(agent_id)
     .bind(Utc::now() - chrono::Duration::seconds(60 * 60))
+    .bind(db.default_org_id)
     .execute(&db.pool)
     .await
     .expect("seed message");

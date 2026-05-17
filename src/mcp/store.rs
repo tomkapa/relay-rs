@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::auth::OrgId;
+
 use super::error::McpError;
 use super::types::{
     DiscoveredTool, McpDescription, McpServerAlias, McpServerId, McpServerRecord, McpTransport,
@@ -18,6 +20,9 @@ use super::types::{
 /// in HTTP) because the registry's own bootstrapping reaches the same trait method.
 #[derive(Debug, Clone)]
 pub struct McpServerCreate {
+    /// Owning organisation. Set by the HTTP handler from the request
+    /// principal; required because `mcp_servers.org_id` is `NOT NULL`.
+    pub org_id: OrgId,
     pub alias: McpServerAlias,
     pub config: McpTransport,
     pub description: Option<McpDescription>,

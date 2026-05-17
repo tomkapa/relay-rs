@@ -59,6 +59,7 @@ impl fmt::Debug for PgMcpServerStore {
 impl McpServerStore for PgMcpServerStore {
     async fn create(&self, payload: McpServerCreate) -> Result<McpServerRecord, McpError> {
         let McpServerCreate {
+            org_id,
             alias,
             config,
             description,
@@ -66,17 +67,23 @@ impl McpServerStore for PgMcpServerStore {
         } = payload;
         let now = self.now();
 
-        let mut tx = self.pool.begin().await?;
-        // §6: serialise the cap-check + insert window. Without this lock two concurrent
-        // creates can both observe `count == cap-1` and both insert, breaching the cap.
-        // The lock is transaction-scoped and released automatically on commit/rollback.
+        // Store-internal SQL runs privileged because the registry refresher
+        // and the HTTP handler share this trait; the per-org cap check
+        // below needs to count across the org (the RLS policy already
+        // restricts to the caller's orgs when an HTTP handler calls in
+        // through `begin_as`, but we serve both paths uniformly here).
+        // The tenant boundary is provided by the explicit `org_id`
+        // column on every row.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(MCP_CREATE_LOCK_KEY)
             .execute(&mut *tx)
             .await?;
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mcp_servers")
-            .fetch_one(&mut *tx)
-            .await?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mcp_servers WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&mut *tx)
+                .await?;
         let server_cap_i64 = i64::try_from(self.server_cap)
             .expect("invariant: MAX_MCP_SERVERS is a small constant that fits in i64");
         if count.0 >= server_cap_i64 {
@@ -91,10 +98,11 @@ impl McpServerStore for PgMcpServerStore {
 
         let result = sqlx::query(
             "INSERT INTO mcp_servers \
-             (id, alias, enabled, config, description, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+             (id, org_id, alias, enabled, config, description, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
         )
         .bind(id)
+        .bind(org_id)
         .bind(alias.as_str())
         .bind(enabled)
         .bind(&config_json)
@@ -110,6 +118,7 @@ impl McpServerStore for PgMcpServerStore {
 
         Ok(McpServerRecord {
             id,
+            org_id,
             alias,
             enabled,
             config,
@@ -123,36 +132,42 @@ impl McpServerStore for PgMcpServerStore {
     }
 
     async fn list(&self) -> Result<Vec<McpServerRecord>, McpError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
+            "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
                     discovered_tools, created_at, updated_at \
              FROM mcp_servers ORDER BY alias ASC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         rows.into_iter().map(McpServerRow::into_record).collect()
     }
 
     async fn list_enabled(&self) -> Result<Vec<McpServerRecord>, McpError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
+            "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
                     discovered_tools, created_at, updated_at \
              FROM mcp_servers WHERE enabled = TRUE ORDER BY alias ASC",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         rows.into_iter().map(McpServerRow::into_record).collect()
     }
 
     async fn read(&self, id: McpServerId) -> Result<McpServerRecord, McpError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
+            "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
                     discovered_tools, created_at, updated_at \
              FROM mcp_servers WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         row.map_or_else(|| Err(McpError::NotFound(id)), McpServerRow::into_record)
     }
 
@@ -162,10 +177,10 @@ impl McpServerStore for PgMcpServerStore {
         payload: McpServerUpdate,
     ) -> Result<McpServerRecord, McpError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         let existing: Option<McpServerRow> = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
+            "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
                     discovered_tools, created_at, updated_at \
              FROM mcp_servers WHERE id = $1 FOR UPDATE",
         )
@@ -213,10 +228,12 @@ impl McpServerStore for PgMcpServerStore {
     }
 
     async fn delete(&self, id: McpServerId) -> Result<(), McpError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let res = sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         if res.rows_affected() == 0 {
             return Err(McpError::NotFound(id));
         }
@@ -235,6 +252,7 @@ impl McpServerStore for PgMcpServerStore {
             .transpose()
             .map_err(|e| McpError::Backend(format!("serialize discovered_tools: {e}")))?;
         let now = self.now();
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let res = sqlx::query(
             "UPDATE mcp_servers SET last_seen_at = $2, last_error = $3, \
                                     discovered_tools = COALESCE($4, discovered_tools), \
@@ -246,8 +264,9 @@ impl McpServerStore for PgMcpServerStore {
         .bind(health.last_error.as_deref())
         .bind(discovered_json)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         if res.rows_affected() == 0 {
             return Err(McpError::NotFound(id));
         }
@@ -268,6 +287,7 @@ fn map_unique_violation(err: sqlx::Error, alias: &McpServerAlias) -> McpError {
 #[derive(sqlx::FromRow)]
 struct McpServerRow {
     id: McpServerId,
+    org_id: crate::auth::OrgId,
     alias: String,
     enabled: bool,
     config: serde_json::Value,
@@ -296,6 +316,7 @@ impl McpServerRow {
             .map_err(|e| McpError::Backend(format!("deserialize discovered: {e}")))?;
         Ok(McpServerRecord {
             id: self.id,
+            org_id: self.org_id,
             alias,
             enabled: self.enabled,
             config,

@@ -94,11 +94,14 @@ impl Tool for MemoryForgetTool {
         let outcome = self
             .deps
             .store()
-            .apply(MemoryMutation::Forget {
-                agent,
-                target: memory_id,
-                source: MutationSource::Turn(ctx.request_id),
-            })
+            .apply_for_user(
+                ctx.acting_user_id,
+                MemoryMutation::Forget {
+                    agent,
+                    target: memory_id,
+                    source: MutationSource::Turn(ctx.request_id),
+                },
+            )
             .await
             .map_err(store_to_tool_err)?;
 

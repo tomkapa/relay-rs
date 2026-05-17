@@ -23,6 +23,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sqlx::PgPool;
 
+use crate::auth::UserId;
+
 use super::error::PromptError;
 use super::types::PromptRequestId;
 
@@ -44,6 +46,18 @@ pub trait DagBudget: fmt::Debug + Send + Sync {
     /// surfaces the rejection to the model and leaves the offending row
     /// in place so callers can see which message broke the cap.
     async fn bump_or_fail(&self, root: PromptRequestId) -> Result<BudgetBumped, PromptError>;
+
+    /// Tenant-scoped variant of [`Self::bump_or_fail`]. Opens
+    /// `begin_as_user(acting_user_id)` so the UPDATE on
+    /// `prompt_request_dags` is filtered by RLS to rows the acting
+    /// principal can see — a cross-tenant bump silently no-ops and
+    /// surfaces as `DagNotFound` rather than touching another org's
+    /// counter.
+    async fn bump_or_fail_for_user(
+        &self,
+        acting_user_id: UserId,
+        root: PromptRequestId,
+    ) -> Result<BudgetBumped, PromptError>;
 
     /// True iff the DAG rooted at `root` has no live `prompt_requests` rows
     /// (no `pending` or `processing`). Used by the worker after a
@@ -86,58 +100,19 @@ impl DagBudget for PgDagBudget {
         ),
     )]
     async fn bump_or_fail(&self, root: PromptRequestId) -> Result<BudgetBumped, PromptError> {
-        // Atomic UPDATE … WHERE turns_used < turns_cap RETURNING new
-        // values. Empty result set means the row was at its cap (or did
-        // not exist) — the second arm distinguishes those cases so
-        // caller-side telemetry is accurate.
-        let row: Option<(i64, i64)> = sqlx::query_as(
-            "UPDATE prompt_request_dags
-                SET turns_used = turns_used + 1
-              WHERE root_request_id = $1
-                AND turns_used < turns_cap
-              RETURNING turns_used, turns_cap",
-        )
-        .bind(root)
-        .fetch_optional(&self.pool)
-        .await?;
+        let tx = crate::auth::begin_privileged(&self.pool).await?;
+        bump_or_fail_in_tx(tx, root).await
+    }
 
-        let span = tracing::Span::current();
-        if let Some((used, cap)) = row {
-            let bumped = BudgetBumped {
-                turns_used: u32_or_invariant(used, "turns_used"),
-                turns_cap: u32_or_invariant(cap, "turns_cap"),
-            };
-            span.record("relay.dag.bump.outcome", "ok");
-            span.record("relay.dag.turns_used", bumped.turns_used);
-            span.record("relay.dag.turns_cap", bumped.turns_cap);
-            return Ok(bumped);
-        }
-
-        // The bump did not match. Either the row is missing (caller
-        // error) or it is at its cap (budget exhausted). Read the row to
-        // disambiguate.
-        let exists: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT turns_used, turns_cap FROM prompt_request_dags WHERE root_request_id = $1",
-        )
-        .bind(root)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some((used, cap)) = exists {
-            let used = u32_or_invariant(used, "turns_used");
-            let cap = u32_or_invariant(cap, "turns_cap");
-            span.record("relay.dag.bump.outcome", "exceeded");
-            span.record("relay.dag.turns_used", used);
-            span.record("relay.dag.turns_cap", cap);
-            Err(PromptError::DagBudgetExceeded {
-                root,
-                turns_used: used,
-                turns_cap: cap,
-            })
-        } else {
-            span.record("relay.dag.bump.outcome", "not_found");
-            Err(PromptError::DagNotFound(root))
-        }
+    async fn bump_or_fail_for_user(
+        &self,
+        acting_user_id: UserId,
+        root: PromptRequestId,
+    ) -> Result<BudgetBumped, PromptError> {
+        let tx = crate::auth::begin_as_user(&self.pool, acting_user_id)
+            .await
+            .map_err(|e| PromptError::Backend(format!("begin_as_user: {e}")))?;
+        bump_or_fail_in_tx(tx, root).await
     }
 
     #[tracing::instrument(
@@ -149,6 +124,9 @@ impl DagBudget for PgDagBudget {
         ),
     )]
     async fn quiescent(&self, root: PromptRequestId) -> Result<bool, PromptError> {
+        // Privileged: worker-side check; cross-tenant infrastructure
+        // read. Same reasoning as `bump_or_fail`.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         // EXISTS short-circuits on the first live row so the cost is
         // bounded by index lookup, not the DAG's size.
         let (live,): (bool,) = sqlx::query_as(
@@ -159,10 +137,71 @@ impl DagBudget for PgDagBudget {
              )",
         )
         .bind(root)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         tracing::Span::current().record("relay.dag.quiescent", !live);
         Ok(!live)
+    }
+}
+
+/// Body of `bump_or_fail` / `bump_or_fail_for_user`. Takes the
+/// opened transaction by value (privileged or `begin_as_user`) and
+/// commits before returning so the same SQL lives in one place across
+/// both entry points.
+async fn bump_or_fail_in_tx(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    root: PromptRequestId,
+) -> Result<BudgetBumped, PromptError> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "UPDATE prompt_request_dags
+                SET turns_used = turns_used + 1
+              WHERE root_request_id = $1
+                AND turns_used < turns_cap
+              RETURNING turns_used, turns_cap",
+    )
+    .bind(root)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let span = tracing::Span::current();
+    if let Some((used, cap)) = row {
+        tx.commit().await?;
+        let bumped = BudgetBumped {
+            turns_used: u32_or_invariant(used, "turns_used"),
+            turns_cap: u32_or_invariant(cap, "turns_cap"),
+        };
+        span.record("relay.dag.bump.outcome", "ok");
+        span.record("relay.dag.turns_used", bumped.turns_used);
+        span.record("relay.dag.turns_cap", bumped.turns_cap);
+        return Ok(bumped);
+    }
+
+    // The bump did not match. Either the row is missing (caller
+    // error) or it is at its cap (budget exhausted). Read the row to
+    // disambiguate.
+    let exists: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT turns_used, turns_cap FROM prompt_request_dags WHERE root_request_id = $1",
+    )
+    .bind(root)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    if let Some((used, cap)) = exists {
+        let used = u32_or_invariant(used, "turns_used");
+        let cap = u32_or_invariant(cap, "turns_cap");
+        span.record("relay.dag.bump.outcome", "exceeded");
+        span.record("relay.dag.turns_used", used);
+        span.record("relay.dag.turns_cap", cap);
+        Err(PromptError::DagBudgetExceeded {
+            root,
+            turns_used: used,
+            turns_cap: cap,
+        })
+    } else {
+        span.record("relay.dag.bump.outcome", "not_found");
+        Err(PromptError::DagNotFound(root))
     }
 }
 

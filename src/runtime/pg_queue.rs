@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
+use crate::auth::{OrgId, UserId};
 use crate::clock::SharedClock;
 use crate::observability::propagation;
 use crate::session::SessionId;
@@ -94,8 +95,15 @@ impl PgPromptQueue {
     /// any request stuck in `processing` for that session either returns to `pending`
     /// or, if it has already exhausted [`Self::max_attempts`], is parked as `failed`
     /// with `reason = poison`.
+    ///
+    /// Runs privileged (cross-tenant): the orphan scan crosses every
+    /// org's lease table to reclaim work from crashed workers. The
+    /// underlying tables are RLS-forced as of migration 18 — without
+    /// `begin_privileged` the policy would filter to `app.user_id`'s
+    /// org (unset here, so no rows match) and orphans would never be
+    /// reclaimed.
     async fn reset_orphans(&self, now: DateTime<Utc>) -> Result<(), PromptError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         // Delete every expired lease in one shot, returning the (session, turn_seq)
         // pairs we need to fix up.
@@ -158,104 +166,30 @@ impl fmt::Debug for PgPromptQueue {
 // impl block (every method's body inlined), not any one method. Each method
 // is itself bounded; splitting the impl into multiple `impl` blocks would
 // just hide the count without changing the code shape.
+/// Transaction scope for [`enqueue_impl`]. Mirrors the session
+/// store's split: HTTP / tool / worker paths open `begin_as_user` so
+/// the implicit-session-create + `prompt_requests` INSERT both run
+/// RLS-checked; the librarian / reflection / scheduler enqueues
+/// (cross-tenant infrastructure) stay privileged.
+#[derive(Debug, Clone, Copy)]
+enum EnqueueTxScope {
+    Privileged,
+    AsUser(UserId),
+}
+
 #[allow(clippy::too_many_lines)]
 #[async_trait]
 impl PromptQueue for PgPromptQueue {
     async fn enqueue(&self, req: NewPromptRequest) -> Result<EnqueueOutcome, PromptError> {
-        let now = self.now();
-        // Reflection / Resolution sit in `(Agent, System)` sessions so their
-        // trace doesn't pollute the parent conversation; `receiver_agent_id`
-        // still drives worker dispatch.
-        let kind = req.kind_payload.kind();
-        let receiver = match kind {
-            RequestKind::Normal => Participant::agent(req.receiver_agent_id),
-            RequestKind::Reflection | RequestKind::Resolution => Participant::System,
-        };
-        // §1: parse, don't validate. Normal sessions cannot host equal
-        // participants; catch the violation before we hit Postgres.
-        if kind == RequestKind::Normal && req.sender == receiver {
-            return Err(PromptError::SelfSession);
-        }
+        enqueue_impl(self, EnqueueTxScope::Privileged, req).await
+    }
 
-        let mut tx = self.pool.begin().await?;
-
-        // Idempotent path — return the existing row's id, session, and status
-        // if the key is already known. Lock the row to keep concurrent enqueues
-        // consistent.
-        let existing: Option<(PromptRequestId, SessionId, RequestStatus)> = sqlx::query_as(
-            "SELECT id, session_id, status FROM prompt_requests
-             WHERE idempotency_key = $1
-             FOR UPDATE",
-        )
-        .bind(req.idempotency_key.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        if let Some((request_id, session, status)) = existing {
-            tx.commit().await?;
-            return Ok(EnqueueOutcome::Existing {
-                request_id,
-                session,
-                status,
-            });
-        }
-
-        // Resolve session: continuing an existing one, or minting a new one.
-        // For new sessions the request id IS the DAG root id, so we mint the
-        // request id first, then the session row referencing it, then the
-        // request row, then the dag row. The init.sql FK on
-        // prompt_requests.session_id requires the session to exist first.
-        let request_id = PromptRequestId::new();
-        let resolved = resolve_session(&mut tx, &req, receiver, request_id, now).await?;
-        let SessionResolution {
-            session,
-            root_request_id,
-            is_new_session,
-        } = resolved;
-
-        // Pending-cap check. Counted inside the same tx as the insert so a racing
-        // enqueue cannot push us past the cap.
-        let pending_cap_i64 = i64::from(self.pending_cap);
-        let (pending_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM prompt_requests
-             WHERE session_id = $1 AND status = $2",
-        )
-        .bind(session)
-        .bind(RequestStatus::Pending)
-        .fetch_one(&mut *tx)
-        .await?;
-        if pending_count >= pending_cap_i64 {
-            return Err(PromptError::PendingCapExceeded {
-                session,
-                max: self.pending_cap,
-            });
-        }
-
-        insert_prompt_request(&mut tx, &req, request_id, session, root_request_id, now).await?;
-
-        if is_new_session {
-            // Seed the DAG budget. `MAX_DAG_TURNS` is the per-DAG send_message
-            // ceiling enforced by the (future) send_message tool.
-            let cap = i64::from(MAX_DAG_TURNS);
-            sqlx::query(
-                "INSERT INTO prompt_request_dags
-                     (root_request_id, turns_used, turns_cap, created_at)
-                 VALUES ($1, 0, $2, $3)",
-            )
-            .bind(root_request_id)
-            .bind(cap)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-
-        Ok(EnqueueOutcome::Inserted {
-            request_id,
-            session,
-            status: RequestStatus::Pending,
-        })
+    async fn enqueue_for_user(
+        &self,
+        acting_user_id: UserId,
+        req: NewPromptRequest,
+    ) -> Result<EnqueueOutcome, PromptError> {
+        enqueue_impl(self, EnqueueTxScope::AsUser(acting_user_id), req).await
     }
 
     async fn claim_next_session(
@@ -269,7 +203,11 @@ impl PromptQueue for PgPromptQueue {
         // up-to-date world. Cheap when there's nothing to reset.
         self.reset_orphans(now).await?;
 
-        let mut tx = self.pool.begin().await?;
+        // Privileged: claim is cross-tenant by design — workers don't
+        // know which org has work next. The JOIN to `sessions` is the
+        // tenancy projection; RLS would otherwise filter the candidate
+        // scan to a single org and starve workers in others.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         // Find the oldest pending request whose session has no live lease.
         //
@@ -282,13 +220,22 @@ impl PromptQueue for PgPromptQueue {
         //    reflection and resolution per agent so two of them cannot
         //    race against the journal.
         //
-        // The partial index `prompt_requests_pending_idx (session_id,
-        // created_at) WHERE status = 'pending'` is the primary access
-        // path; the per-agent NOT EXISTS does a small lookup against
-        // the live leases table.
-        let candidate: Option<(SessionId,)> = sqlx::query_as(
-            "SELECT pr.session_id
+        // The partial index `prompt_requests_pending_idx (org_id,
+        // session_id, created_at) WHERE status = 'pending'` is the
+        // primary access path; the per-agent NOT EXISTS does a small
+        // lookup against the live leases table.
+        //
+        // The JOIN to `sessions` also carries the per-session
+        // tenancy projection (`org_id`, `created_by_user_id`) back to
+        // the worker so it can open a `begin_as_user` turn-tx when the
+        // turn-tx threading work lands. The queue itself runs
+        // privileged because the scan is cross-tenant by construction
+        // — workers pick up work for whichever org has pending rows
+        // next.
+        let candidate: Option<(SessionId, OrgId, UserId)> = sqlx::query_as(
+            "SELECT pr.session_id, s.org_id, s.created_by_user_id
              FROM prompt_requests pr
+             JOIN sessions s ON s.id = pr.session_id
              WHERE pr.status = $1
                AND NOT EXISTS (
                    SELECT 1 FROM session_leases sl
@@ -317,38 +264,42 @@ impl PromptQueue for PgPromptQueue {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some((session,)) = candidate else {
+        let Some((session, session_org_id, session_user_id)) = candidate else {
             tx.commit().await?;
             return Ok(None);
         };
 
         // Bump the per-session monotonic counter. The seq table uses INSERT ... ON
-        // CONFLICT to stay race-free.
+        // CONFLICT to stay race-free. `org_id` is denormalised onto the row;
+        // the parity trigger checks it matches the parent session's org.
         let (next_seq,): (TurnSeq,) = sqlx::query_as(
-            "INSERT INTO session_turn_seq (session_id, next_seq)
-             VALUES ($1, 1)
+            "INSERT INTO session_turn_seq (session_id, org_id, next_seq)
+             VALUES ($1, $2, 1)
              ON CONFLICT (session_id) DO UPDATE
                  SET next_seq = session_turn_seq.next_seq + 1
              RETURNING next_seq",
         )
         .bind(session)
+        .bind(session_org_id)
         .fetch_one(&mut *tx)
         .await?;
 
         // Try to take the lease. If another worker beat us to it (their lease is
         // still live), the WHERE clause on the ON CONFLICT branch fails and the
-        // statement returns 0 rows — race-loss path.
+        // statement returns 0 rows — race-loss path. `org_id` is denormalised
+        // onto the row; the parity trigger checks it matches the parent session.
         let lease: Option<(SessionId,)> = sqlx::query_as(
-            "INSERT INTO session_leases (session_id, worker_id, turn_seq, leased_until)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO session_leases (session_id, org_id, worker_id, turn_seq, leased_until)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (session_id) DO UPDATE
                  SET worker_id = EXCLUDED.worker_id,
                      turn_seq = EXCLUDED.turn_seq,
                      leased_until = EXCLUDED.leased_until
-                 WHERE session_leases.leased_until <= $5
+                 WHERE session_leases.leased_until <= $6
              RETURNING session_id",
         )
         .bind(session)
+        .bind(session_org_id)
         .bind(worker)
         .bind(next_seq)
         .bind(deadline)
@@ -445,6 +396,8 @@ impl PromptQueue for PgPromptQueue {
 
         Ok(Some(ClaimedSession {
             session,
+            org_id: session_org_id,
+            created_by_user_id: session_user_id,
             receiver_agent_id,
             prompts,
             lease,
@@ -467,6 +420,13 @@ impl PromptQueue for PgPromptQueue {
 
     async fn request_cancellation(&self, id: PromptRequestId) -> Result<(), PromptError> {
         let now = self.now();
+        // Privileged: the HTTP route gates this call by opening a
+        // `begin_as` tx, looking up the request to confirm visibility,
+        // then dispatches here for the actual mutation — the same
+        // pattern the agents / mcp_servers routes use. The store side
+        // doesn't carry the principal, so we run privileged and trust
+        // the caller's gate.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let res = sqlx::query(
             "UPDATE prompt_requests
              SET cancellation_requested = TRUE, updated_at = $1
@@ -474,8 +434,9 @@ impl PromptQueue for PgPromptQueue {
         )
         .bind(now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         if res.rows_affected() == 0 {
             return Err(PromptError::RequestNotFound(id));
         }
@@ -483,6 +444,12 @@ impl PromptQueue for PgPromptQueue {
     }
 
     async fn status(&self, id: PromptRequestId) -> Result<RequestStatusView, PromptError> {
+        // Privileged: status is called from the worker's cancel watcher
+        // (cross-tenant by construction — every worker polls every
+        // claim it holds across orgs) and from HTTP cancel/stream
+        // gates that have already verified the caller can see the
+        // request. The store itself can't see the principal.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row: Option<(
             PromptRequestId,
             SessionId,
@@ -495,8 +462,9 @@ impl PromptQueue for PgPromptQueue {
              WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let Some((request_id, session, status, cancellation_requested, failure_reason)) = row
         else {
@@ -522,6 +490,8 @@ impl PromptQueue for PgPromptQueue {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Same rationale as `status`: cross-tenant infrastructure read.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows: Vec<(
             PromptRequestId,
             SessionId,
@@ -534,8 +504,9 @@ impl PromptQueue for PgPromptQueue {
              WHERE id = ANY($1)",
         )
         .bind(ids)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -559,6 +530,10 @@ impl LeaseManager for PgPromptQueue {
     async fn heartbeat(&self, lease: &LeaseToken) -> Result<(), PromptError> {
         let now = self.now();
         let deadline = self.deadline(now);
+        // Privileged: lease management is cross-tenant infrastructure
+        // (workers heartbeat every claim they hold across orgs). Same
+        // reasoning as `reset_orphans`.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let res = sqlx::query(
             "UPDATE session_leases
              SET leased_until = $1
@@ -568,8 +543,9 @@ impl LeaseManager for PgPromptQueue {
         .bind(lease.session())
         .bind(lease.worker())
         .bind(lease.turn_seq())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         if res.rows_affected() == 0 {
             return Err(PromptError::LeaseStale {
                 session: lease.session(),
@@ -581,6 +557,8 @@ impl LeaseManager for PgPromptQueue {
     async fn release(&self, lease: &LeaseToken) -> Result<(), PromptError> {
         // Silent no-op if the lease has already moved on — the row count is not
         // checked, since release racing with orphan reclamation is benign.
+        // Privileged for the same reason as `heartbeat`.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         sqlx::query(
             "DELETE FROM session_leases
              WHERE session_id = $1 AND worker_id = $2 AND turn_seq = $3",
@@ -588,10 +566,115 @@ impl LeaseManager for PgPromptQueue {
         .bind(lease.session())
         .bind(lease.worker())
         .bind(lease.turn_seq())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
+}
+
+/// Body of `enqueue` / `enqueue_for_user`. Opens the right transaction
+/// scope (privileged for the librarian/reflection/scheduler paths,
+/// `begin_as_user` for HTTP / tool / worker paths so the
+/// implicit-session-create + INSERT are RLS-checked) and runs the
+/// shared idempotency / session / cap / dag-seed sequence.
+async fn enqueue_impl(
+    queue: &PgPromptQueue,
+    scope: EnqueueTxScope,
+    req: NewPromptRequest,
+) -> Result<EnqueueOutcome, PromptError> {
+    let now = queue.now();
+    // Reflection / Resolution sit in `(Agent, System)` sessions so their
+    // trace doesn't pollute the parent conversation; `receiver_agent_id`
+    // still drives worker dispatch.
+    let kind = req.kind_payload.kind();
+    let receiver = match kind {
+        RequestKind::Normal => Participant::agent(req.receiver_agent_id),
+        RequestKind::Reflection | RequestKind::Resolution => Participant::System,
+    };
+    // §1: parse, don't validate. Normal sessions cannot host equal
+    // participants; catch the violation before we hit Postgres.
+    if kind == RequestKind::Normal && req.sender == receiver {
+        return Err(PromptError::SelfSession);
+    }
+
+    let mut tx =
+        match scope {
+            EnqueueTxScope::Privileged => crate::auth::begin_privileged(&queue.pool).await?,
+            EnqueueTxScope::AsUser(user_id) => crate::auth::begin_as_user(&queue.pool, user_id)
+                .await
+                .map_err(|e| PromptError::Backend(format!("begin_as_user: {e}")))?,
+        };
+
+    // Idempotent path — return the existing row's id, session, and status
+    // if the (org_id, key) pair is already known.
+    let existing: Option<(PromptRequestId, SessionId, RequestStatus)> = sqlx::query_as(
+        "SELECT id, session_id, status FROM prompt_requests
+             WHERE org_id = $1 AND idempotency_key = $2
+             FOR UPDATE",
+    )
+    .bind(req.org_id)
+    .bind(req.idempotency_key.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((request_id, session, status)) = existing {
+        tx.commit().await?;
+        return Ok(EnqueueOutcome::Existing {
+            request_id,
+            session,
+            status,
+        });
+    }
+
+    let request_id = PromptRequestId::new();
+    let resolved = resolve_session(&mut tx, &req, receiver, request_id, now).await?;
+    let SessionResolution {
+        session,
+        root_request_id,
+        is_new_session,
+    } = resolved;
+
+    let pending_cap_i64 = i64::from(queue.pending_cap);
+    let (pending_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM prompt_requests
+             WHERE session_id = $1 AND status = $2",
+    )
+    .bind(session)
+    .bind(RequestStatus::Pending)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending_count >= pending_cap_i64 {
+        return Err(PromptError::PendingCapExceeded {
+            session,
+            max: queue.pending_cap,
+        });
+    }
+
+    insert_prompt_request(&mut tx, &req, request_id, session, root_request_id, now).await?;
+
+    if is_new_session {
+        let cap = i64::from(MAX_DAG_TURNS);
+        sqlx::query(
+            "INSERT INTO prompt_request_dags
+                     (root_request_id, org_id, turns_used, turns_cap, created_at)
+                 VALUES ($1, $2, 0, $3, $4)",
+        )
+        .bind(root_request_id)
+        .bind(req.org_id)
+        .bind(cap)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+
+    Ok(EnqueueOutcome::Inserted {
+        request_id,
+        session,
+        status: RequestStatus::Pending,
+    })
 }
 
 /// Insert a `prompt_requests` row inside the enqueue transaction. The
@@ -616,21 +699,22 @@ async fn insert_prompt_request(
 
     sqlx::query(
         "INSERT INTO prompt_requests
-             (id, session_id, content, idempotency_key, status,
+             (id, session_id, org_id, content, idempotency_key, status,
               attempts, turn_seq, cancellation_requested, failure_reason,
               sender_kind, sender_agent_id,
               receiver_kind, receiver_agent_id, root_request_id,
               traceparent,
               kind, kind_payload,
               created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 0, 0, FALSE, NULL,
-                 $6, $7, 'agent', $8, $9,
-                 $10,
-                 $11, $12,
-                 $13, $13)",
+         VALUES ($1, $2, $3, $4, $5, $6, 0, 0, FALSE, NULL,
+                 $7, $8, 'agent', $9, $10,
+                 $11,
+                 $12, $13,
+                 $14, $14)",
     )
     .bind(request_id)
     .bind(session)
+    .bind(req.org_id)
     .bind(req.content.as_str())
     .bind(req.idempotency_key.as_str())
     .bind(RequestStatus::Pending)
@@ -684,6 +768,8 @@ async fn resolve_session(
         req.sender,
         receiver,
         req.parent_session,
+        req.org_id,
+        req.created_by_user_id,
         now,
     )
     .await?;
@@ -703,26 +789,31 @@ async fn resolve_session(
 /// row first, hence the explicit ordering. No FK is enforced from
 /// `sessions.root_request_id` to `prompt_requests.id` so the
 /// session-before-request order is legal.
+#[allow(clippy::too_many_arguments)]
 async fn create_session_row(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     root_request_id: PromptRequestId,
     sender: Participant,
     receiver: Participant,
     parent_session: Option<SessionId>,
+    org_id: OrgId,
+    created_by_user_id: UserId,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<SessionId, PromptError> {
     let (a, b) = Participant::canonical_pair(sender, receiver).ok_or(PromptError::SelfSession)?;
     let session_id = SessionId::new();
     let res = sqlx::query(
         "INSERT INTO sessions
-             (id, created_at,
+             (id, created_at, org_id, created_by_user_id,
               parent_session_id, root_request_id,
               participant_a_kind, participant_a_agent_id,
               participant_b_kind, participant_b_agent_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(session_id)
     .bind(now)
+    .bind(org_id)
+    .bind(created_by_user_id)
     .bind(parent_session)
     .bind(root_request_id)
     .bind(a.kind())
@@ -780,7 +871,12 @@ async fn finalise(
     let new_status = outcome.status();
     let failure_reason = outcome.reason();
 
-    let mut tx = queue.pool.begin().await?;
+    // Privileged: finalise runs from the worker post-turn — the worker
+    // pool's tenancy plumbing is driven off `ClaimedSession.org_id` /
+    // `created_by_user_id`, not the per-store tx. The lease fence
+    // (`WHERE session_id = $1 AND worker_id = $2 AND turn_seq = $3`)
+    // is the safety net against cross-claim writes.
+    let mut tx = crate::auth::begin_privileged(&queue.pool).await?;
 
     let (lease_ok,): (bool,) = sqlx::query_as(
         "SELECT EXISTS(

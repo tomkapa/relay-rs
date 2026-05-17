@@ -31,9 +31,37 @@ fn store(db: &TestDb) -> Arc<PgScheduledTaskStore> {
     ))
 }
 
+/// Most contract tests use the seeded default agent/org/user, so the
+/// helper threads them through `NewScheduledTask`. Tests that need a
+/// different owner pass it explicitly via the longer-form constructor.
+struct Tenancy {
+    owner: AgentId,
+    org_id: relay_rs::auth::OrgId,
+    user_id: relay_rs::auth::UserId,
+}
+
+impl Tenancy {
+    fn default_for(db: &TestDb) -> Self {
+        Self {
+            owner: db.default_agent_id,
+            org_id: db.default_org_id,
+            user_id: db.default_user_id,
+        }
+    }
+
+    fn with_owner(db: &TestDb, owner: AgentId) -> Self {
+        Self {
+            owner,
+            org_id: db.default_org_id,
+            user_id: db.default_user_id,
+        }
+    }
+}
+
 async fn extra_agent(db: &TestDb, name: &str) -> AgentId {
     let agents = common::pg::agent_store(db.pool.clone(), SystemClock::shared());
     let payload = NewAgent {
+        org_id: db.default_org_id,
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from("p").expect("valid prompt"),
         description: relay_rs::agents::AgentDescription::try_from("p").expect("desc"),
@@ -60,10 +88,12 @@ fn recurring_workdays_05_bkk() -> ScheduleSpec {
     }
 }
 
-fn new_task(owner: AgentId, name: &str, schedule: ScheduleSpec) -> NewScheduledTask {
+fn new_task(t: &Tenancy, name: &str, schedule: ScheduleSpec) -> NewScheduledTask {
     let next = schedule.next_after(Utc::now());
     NewScheduledTask {
-        owner_agent_id: owner,
+        owner_agent_id: t.owner,
+        org_id: t.org_id,
+        created_by_user_id: t.user_id,
         name: ScheduledTaskName::try_from(name).expect("valid name"),
         prompt: ScheduledPrompt::try_from("Summarize new email since last check.")
             .expect("valid prompt"),
@@ -77,14 +107,13 @@ async fn create_round_trips_once_schedule() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
-    let payload = new_task(
-        db.default_agent_id,
-        "drafts due tomorrow",
-        once_at(2030, 1, 1, 9),
-    );
+    let t = Tenancy::default_for(&db);
+    let payload = new_task(&t, "drafts due tomorrow", once_at(2030, 1, 1, 9));
     let row = store.create(payload).await.expect("create");
 
     assert_eq!(row.owner_agent_id, db.default_agent_id);
+    assert_eq!(row.org_id, db.default_org_id);
+    assert_eq!(row.created_by_user_id, db.default_user_id);
     assert_eq!(row.name.as_str(), "drafts due tomorrow");
     assert_eq!(row.state, ScheduledTaskState::Active);
     assert!(row.next_run_at.is_some(), "Once in future has next_run_at");
@@ -103,11 +132,8 @@ async fn create_round_trips_recurring_schedule() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
-    let payload = new_task(
-        db.default_agent_id,
-        "morning email",
-        recurring_workdays_05_bkk(),
-    );
+    let t = Tenancy::default_for(&db);
+    let payload = new_task(&t, "morning email", recurring_workdays_05_bkk());
     let row = store.create(payload).await.expect("create");
 
     match row.schedule {
@@ -126,28 +152,22 @@ async fn list_for_agent_returns_only_own_active_rows() {
     let db = TestDb::fresh().await;
     let store = store(&db);
     let other = extra_agent(&db, "other-agent").await;
+    let default_t = Tenancy::default_for(&db);
+    let other_t = Tenancy::with_owner(&db, other);
 
     // Two tasks for the default agent, one for the other agent.
     let mine_a = store
-        .create(new_task(
-            db.default_agent_id,
-            "mine-a",
-            once_at(2030, 1, 1, 9),
-        ))
+        .create(new_task(&default_t, "mine-a", once_at(2030, 1, 1, 9)))
         .await
         .expect("ok")
         .id;
     let mine_b = store
-        .create(new_task(
-            db.default_agent_id,
-            "mine-b",
-            recurring_workdays_05_bkk(),
-        ))
+        .create(new_task(&default_t, "mine-b", recurring_workdays_05_bkk()))
         .await
         .expect("ok")
         .id;
     let _theirs = store
-        .create(new_task(other, "theirs", once_at(2030, 1, 1, 9)))
+        .create(new_task(&other_t, "theirs", once_at(2030, 1, 1, 9)))
         .await
         .expect("ok")
         .id;
@@ -167,21 +187,14 @@ async fn list_excludes_cancelled_rows() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
+    let t = Tenancy::default_for(&db);
     let kept = store
-        .create(new_task(
-            db.default_agent_id,
-            "kept",
-            once_at(2030, 1, 1, 9),
-        ))
+        .create(new_task(&t, "kept", once_at(2030, 1, 1, 9)))
         .await
         .expect("ok")
         .id;
     let dropped = store
-        .create(new_task(
-            db.default_agent_id,
-            "drop",
-            once_at(2030, 1, 1, 9),
-        ))
+        .create(new_task(&t, "drop", once_at(2030, 1, 1, 9)))
         .await
         .expect("ok")
         .id;
@@ -205,8 +218,9 @@ async fn cancel_rejects_cross_owner() {
     let store = store(&db);
     let other = extra_agent(&db, "intruder").await;
 
+    let t = Tenancy::default_for(&db);
     let task = store
-        .create(new_task(db.default_agent_id, "t", once_at(2030, 1, 1, 9)))
+        .create(new_task(&t, "t", once_at(2030, 1, 1, 9)))
         .await
         .expect("ok")
         .id;
@@ -243,8 +257,9 @@ async fn cancel_is_idempotent_on_already_cancelled() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
+    let t = Tenancy::default_for(&db);
     let id = store
-        .create(new_task(db.default_agent_id, "t", once_at(2030, 1, 1, 9)))
+        .create(new_task(&t, "t", once_at(2030, 1, 1, 9)))
         .await
         .expect("ok")
         .id;
@@ -263,13 +278,14 @@ async fn claim_due_returns_only_due_active_rows_in_order() {
     let later_due = now - ChronoDuration::seconds(30);
     let future = now + ChronoDuration::days(7);
 
+    let t = Tenancy::default_for(&db);
     // Three rows: earliest due, later due, far-future (not due).
-    let early = insert_with_next_run(&store, db.default_agent_id, "early", earliest_due).await;
-    let later = insert_with_next_run(&store, db.default_agent_id, "later", later_due).await;
-    let _far = insert_with_next_run(&store, db.default_agent_id, "far", future).await;
+    let early = insert_with_next_run(&store, &t, "early", earliest_due).await;
+    let later = insert_with_next_run(&store, &t, "later", later_due).await;
+    let _far = insert_with_next_run(&store, &t, "far", future).await;
 
     // Cancelled row that is "due" — must be excluded.
-    let cancelled = insert_with_next_run(&store, db.default_agent_id, "cxl", earliest_due).await;
+    let cancelled = insert_with_next_run(&store, &t, "cxl", earliest_due).await;
     store
         .cancel(cancelled, db.default_agent_id)
         .await
@@ -285,10 +301,11 @@ async fn claim_due_respects_limit() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
+    let t = Tenancy::default_for(&db);
     let now = Utc::now();
     let due = now - ChronoDuration::seconds(60);
     for i in 0..5 {
-        insert_with_next_run(&store, db.default_agent_id, &format!("t-{i}"), due).await;
+        insert_with_next_run(&store, &t, &format!("t-{i}"), due).await;
     }
 
     let claimed = store.claim_due(now, 2).await.expect("claim");
@@ -300,14 +317,9 @@ async fn record_fired_advances_when_next_is_some() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
+    let t = Tenancy::default_for(&db);
     let now = Utc::now();
-    let id = insert_with_next_run(
-        &store,
-        db.default_agent_id,
-        "advance",
-        now - ChronoDuration::seconds(10),
-    )
-    .await;
+    let id = insert_with_next_run(&store, &t, "advance", now - ChronoDuration::seconds(10)).await;
     let request_id = PromptRequestId::new();
     let next = now + ChronoDuration::days(1);
 
@@ -337,14 +349,9 @@ async fn record_fired_marks_done_when_next_is_none() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
+    let t = Tenancy::default_for(&db);
     let now = Utc::now();
-    let id = insert_with_next_run(
-        &store,
-        db.default_agent_id,
-        "exhausted",
-        now - ChronoDuration::seconds(10),
-    )
-    .await;
+    let id = insert_with_next_run(&store, &t, "exhausted", now - ChronoDuration::seconds(10)).await;
     let request_id = PromptRequestId::new();
 
     store
@@ -369,12 +376,14 @@ async fn record_fired_marks_done_when_next_is_none() {
 /// tests don't rely on `ScheduleSpec::next_after`'s wall-clock.
 async fn insert_with_next_run(
     store: &Arc<PgScheduledTaskStore>,
-    owner: AgentId,
+    t: &Tenancy,
     name: &str,
     next_run_at: chrono::DateTime<Utc>,
 ) -> relay_rs::scheduling::ScheduledTaskId {
     let payload = NewScheduledTask {
-        owner_agent_id: owner,
+        owner_agent_id: t.owner,
+        org_id: t.org_id,
+        created_by_user_id: t.user_id,
         name: ScheduledTaskName::try_from(name).expect("valid"),
         prompt: ScheduledPrompt::try_from("body").expect("valid"),
         // Recurring with a single weekday so the row is reusable across fires

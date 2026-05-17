@@ -5,9 +5,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::PgPool;
 use tracing::{info, warn};
 
+use crate::auth::begin_as_user;
 use crate::scheduling::{ScheduledTaskError, ScheduledTaskId, SharedScheduledTaskStore};
+use crate::session::SharedSessionStore;
 use crate::tools::{Tool, ToolCallContext, ToolError};
 use crate::types::ToolName;
 
@@ -34,6 +37,8 @@ pub struct CancelScheduledTaskTool {
     description: &'static str,
     input_schema: Arc<Value>,
     store: SharedScheduledTaskStore,
+    sessions: SharedSessionStore,
+    pool: PgPool,
 }
 
 impl std::fmt::Debug for CancelScheduledTaskTool {
@@ -45,7 +50,11 @@ impl std::fmt::Debug for CancelScheduledTaskTool {
 
 impl CancelScheduledTaskTool {
     #[must_use]
-    pub fn new(store: SharedScheduledTaskStore) -> Self {
+    pub fn new(
+        store: SharedScheduledTaskStore,
+        sessions: SharedSessionStore,
+        pool: PgPool,
+    ) -> Self {
         let name =
             ToolName::try_from(TOOL_NAME).expect("invariant: cancel_scheduled_task valid name");
         let input_schema = Arc::new(json!({
@@ -61,6 +70,8 @@ impl CancelScheduledTaskTool {
             description: TOOL_DESCRIPTION,
             input_schema,
             store,
+            sessions,
+            pool,
         }
     }
 }
@@ -87,7 +98,52 @@ impl Tool for CancelScheduledTaskTool {
         let owner = ctx.viewer.agent_id().ok_or_else(|| {
             ToolError::InvalidInput("cancel_scheduled_task: caller must be an agent".into())
         })?;
-        match self.store.cancel(parsed.task_id, owner).await {
+
+        // Tenant-side gate: a privileged store would happily let a
+        // misrouted call delete a row in another org if the caller
+        // somehow guessed both `(task_id, owner_agent_id)`. Open a
+        // `begin_as_user` tx pinned to the session's principal and
+        // confirm the row is visible under RLS before delegating to
+        // the privileged-tx store; cross-tenant calls see zero rows
+        // here and fold into `NotFound` exactly like the cross-owner
+        // case.
+        let tenancy = self.sessions.tenancy(ctx.session_id).await.map_err(|e| {
+            warn!(error = %e, relay.session.id = %ctx.session_id,
+                "cancel_scheduled_task.session_lookup_failed");
+            ToolError::Backend(format!("cancel_scheduled_task: session lookup: {e}"))
+        })?;
+        let mut tx = begin_as_user(&self.pool, tenancy.created_by_user_id)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "cancel_scheduled_task.begin_as_user_failed");
+                ToolError::Backend(format!("cancel_scheduled_task: tx: {e}"))
+            })?;
+        let visible: Option<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT id FROM scheduled_tasks \
+             WHERE id = $1 AND owner_agent_id = $2",
+        )
+        .bind(parsed.task_id)
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, relay.scheduled_task.id = %parsed.task_id,
+                "cancel_scheduled_task.visibility_check_failed");
+            ToolError::Backend(format!("cancel_scheduled_task: visibility: {e}"))
+        })?;
+        drop(tx);
+        if visible.is_none() {
+            return Err(ToolError::InvalidInput(format!(
+                "cancel_scheduled_task: task {} not found",
+                parsed.task_id
+            )));
+        }
+
+        match self
+            .store
+            .cancel_for_user(ctx.acting_user_id, parsed.task_id, owner)
+            .await
+        {
             Ok(()) => {
                 info!(
                     relay.scheduled_task.id = %parsed.task_id,

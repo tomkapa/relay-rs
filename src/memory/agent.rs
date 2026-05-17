@@ -173,7 +173,7 @@ impl Memory for AgentMemory {
         // we hit `AgentStore::list_names`. Empty deployments and
         // self-only deployments yield an empty string; the renderer
         // omits the envelope entirely (§8).
-        let agents_block = match self.names_cache.get_or_load(&self.agents).await {
+        let agents_block = match self.names_cache.get_or_load(agent_id, &self.agents).await {
             Ok(names) => render_agents_block(names.as_ref(), agent_id),
             Err(e) => {
                 tracing::warn!(error = %e, "agents.list_names.error");

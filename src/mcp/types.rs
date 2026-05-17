@@ -390,6 +390,7 @@ impl<'de> Deserialize<'de> for McpHeaderValue {
 #[derive(Debug, Clone)]
 pub struct McpServerRecord {
     pub id: McpServerId,
+    pub org_id: crate::auth::OrgId,
     pub alias: McpServerAlias,
     pub enabled: bool,
     pub config: McpTransport,

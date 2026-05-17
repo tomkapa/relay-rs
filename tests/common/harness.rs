@@ -83,6 +83,12 @@ pub struct WorkerHarness {
     pub sessions: SharedSessionStore,
     pub dag: SharedDagBudget,
     pub default_agent_id: relay_rs::agents::AgentId,
+    /// Seeded owning org id — needed by `NewPromptRequest` and any
+    /// helper that mints a fresh session under this harness's tenant.
+    pub default_org_id: relay_rs::auth::OrgId,
+    /// Seeded owning user id — pairs with `default_org_id` to pin
+    /// sessions created via this harness to the test principal.
+    pub default_user_id: relay_rs::auth::UserId,
     pub workers: WorkerPoolHandle,
     /// Held only so its `Drop` reaps the schema at end-of-scope.
     #[allow(dead_code)]
@@ -167,12 +173,16 @@ pub async fn build_harness(provider: Arc<ScriptedProvider>) -> WorkerHarness {
     .spawn();
 
     let default_agent_id = db.default_agent_id;
+    let default_org_id = db.default_org_id;
+    let default_user_id = db.default_user_id;
     WorkerHarness {
         queue,
         hub,
         sessions,
         dag,
         default_agent_id,
+        default_org_id,
+        default_user_id,
         workers,
         db,
     }

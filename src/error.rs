@@ -46,4 +46,7 @@ pub enum AppError {
 
     #[error("agent store: {0}")]
     AgentStore(#[from] AgentStoreError),
+
+    #[error("auth: {0}")]
+    Auth(String),
 }

@@ -13,9 +13,11 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::agents::AgentId;
+use crate::auth::{AuthError, Principal};
 use crate::memory::{
     MemoryContent, MemoryEventId, MemoryEventPayload, MemoryId, MemoryKind, MemoryMutation,
     MemoryRow, MemoryState, MutationKind, MutationSource, MutationSourceKind, ValidationOrigin,
@@ -23,6 +25,31 @@ use crate::memory::{
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
+
+/// Tenant gate for every memory route: open a `begin_as` tx as the
+/// principal and confirm the path-scoped `agent_id` is visible under
+/// RLS. A cross-org id resolves to `None` (RLS hides it) and surfaces
+/// as 404 — the same shape as "this agent doesn't exist", which is the
+/// right behaviour because we don't leak the existence of cross-org
+/// agents.
+///
+/// All five memory tables are RLS-forced via migration 17, but the
+/// memory store opens its own privileged tx and so wouldn't enforce
+/// the visibility check on its own. Gating here keeps the route a
+/// thin shell over the store without duplicating the membership rule.
+async fn gate_agent(pool: &PgPool, principal: &Principal, agent: AgentId) -> Result<(), HttpError> {
+    let mut tx = crate::auth::begin_as(pool, principal).await?;
+    let visible: Option<(AgentId,)> = sqlx::query_as("SELECT id FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(AuthError::from)?;
+    tx.commit().await.map_err(AuthError::from)?;
+    if visible.is_none() {
+        return Err(HttpError::NotFound);
+    }
+    Ok(())
+}
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -72,11 +99,14 @@ impl From<MemoryRow> for MemoryRowResponse {
 
 async fn list_memory(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<MemoryRowResponse>>, HttpError> {
+    let agent = AgentId::from(id);
+    gate_agent(&state.pool, &principal, agent).await?;
     let rows = state
         .memory_store
-        .list(AgentId::from(id))
+        .list(agent)
         .await
         .map_err(|e| HttpError::BadRequest(e.to_string()))?;
     Ok(Json(
@@ -98,10 +128,12 @@ struct CreateNoteRequest {
 
 async fn create_memory_note(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<Uuid>,
     Json(payload): Json<CreateNoteRequest>,
 ) -> Result<(StatusCode, Json<MemoryRowResponse>), HttpError> {
     let agent = AgentId::from(id);
+    gate_agent(&state.pool, &principal, agent).await?;
     let content = MemoryContent::try_from(payload.content).map_err(HttpError::Parse)?;
     let chosen_state = payload.state.unwrap_or(MemoryState::Held);
     let outcome = state
@@ -165,10 +197,12 @@ struct ListEventsQuery {
 
 async fn list_events(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<Uuid>,
     Query(filter): Query<ListEventsQuery>,
 ) -> Result<Json<Vec<EventResponse>>, HttpError> {
     let agent = AgentId::from(id);
+    gate_agent(&state.pool, &principal, agent).await?;
     let events = state
         .memory_store
         .list_events(agent)
@@ -213,11 +247,14 @@ impl From<crate::memory::MemoryEvent> for EventResponse {
 
 async fn pin_memory(
     State(state): State<AppState>,
+    principal: Principal,
     Path((id, memory)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MemoryRowResponse>, HttpError> {
+    let agent = AgentId::from(id);
+    gate_agent(&state.pool, &principal, agent).await?;
     let row = state
         .memory_store
-        .set_pinned(AgentId::from(id), MemoryId::from(memory), true)
+        .set_pinned(agent, MemoryId::from(memory), true)
         .await
         .map_err(|e| HttpError::BadRequest(e.to_string()))?;
     Ok(Json(row.into()))
@@ -225,11 +262,14 @@ async fn pin_memory(
 
 async fn unpin_memory(
     State(state): State<AppState>,
+    principal: Principal,
     Path((id, memory)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MemoryRowResponse>, HttpError> {
+    let agent = AgentId::from(id);
+    gate_agent(&state.pool, &principal, agent).await?;
     let row = state
         .memory_store
-        .set_pinned(AgentId::from(id), MemoryId::from(memory), false)
+        .set_pinned(agent, MemoryId::from(memory), false)
         .await
         .map_err(|e| HttpError::BadRequest(e.to_string()))?;
     Ok(Json(row.into()))
@@ -244,9 +284,11 @@ enum RevertResponse {
 
 async fn revert_event(
     State(state): State<AppState>,
+    principal: Principal,
     Path((id, event)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<RevertResponse>, HttpError> {
     let agent = AgentId::from(id);
+    gate_agent(&state.pool, &principal, agent).await?;
     let event_id = MemoryEventId::from(event);
     let row = state
         .memory_store

@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId};
 use crate::clock::SharedClock;
 use crate::provider::{AssistantContent, ChatMessage, UserContent};
 use crate::runtime::PromptRequestId;
@@ -26,7 +27,7 @@ use crate::types::{
 
 use super::error::SessionError;
 use super::limits::MAX_MESSAGES_PER_SESSION;
-use super::traits::{SessionId, SessionStore};
+use super::traits::{SessionId, SessionStore, SessionTenancy};
 
 /// Postgres-backed [`SessionStore`]. Holds a cheap clone of a [`PgPool`] and a
 /// [`SharedClock`]; safe to share across the runtime.
@@ -73,6 +74,7 @@ impl SessionStore for PgSessionStore {
         fields(
             relay.dag.root = %root_request_id,
             relay.parent.session.id = parent_session_id.map(tracing::field::display),
+            relay.org.id = %org_id,
             relay.session.id = tracing::field::Empty,
             relay.session.created = tracing::field::Empty,
         ),
@@ -83,46 +85,62 @@ impl SessionStore for PgSessionStore {
         a: Participant,
         b: Participant,
         parent_session_id: Option<SessionId>,
+        org_id: OrgId,
+        created_by_user_id: UserId,
     ) -> Result<SessionId, SessionError> {
-        // §1: parse, don't validate — canonicalise inside the store so
-        // a caller cannot accidentally insert the reversed-order row.
-        let (a, b) = Participant::canonical_pair(a, b).ok_or(SessionError::SelfSession)?;
-        let now = self.now();
-        let new_id = SessionId::new();
-
-        // The unique index `sessions_dag_pair_unique` is on
-        // (root_request_id, a*, b*), and `xmax = 0` distinguishes a
-        // fresh insert from a hit on the existing row. We always
-        // RETURNING `id` so the caller gets the canonical row id
-        // either way.
-        let (id, inserted): (SessionId, bool) = sqlx::query_as(
-            "INSERT INTO sessions
-                 (id, created_at,
-                  parent_session_id, root_request_id,
-                  participant_a_kind, participant_a_agent_id,
-                  participant_b_kind, participant_b_agent_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (root_request_id,
-                          participant_a_kind, participant_a_agent_id,
-                          participant_b_kind, participant_b_agent_id)
-                 DO UPDATE SET id = sessions.id
-             RETURNING id, (xmax = 0) AS inserted",
+        // Privileged tx: the store is reachable from both
+        // tenant-gated HTTP handlers and from infrastructure paths
+        // (the queue's implicit-session-create) that lack a principal.
+        // Tenant scoping is provided by the explicit `org_id` bound
+        // on every statement and by the trigger that pins a child
+        // session's org to its parent.
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
+        let id = resolve_or_create_for_pair_inner(
+            self,
+            &mut tx,
+            root_request_id,
+            a,
+            b,
+            parent_session_id,
+            org_id,
+            created_by_user_id,
         )
-        .bind(new_id)
-        .bind(now)
-        .bind(parent_session_id)
-        .bind(root_request_id)
-        .bind(a.kind())
-        .bind(a.agent_id())
-        .bind(b.kind())
-        .bind(b.agent_id())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_agent_fk)?;
+        .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
+        Ok(id)
+    }
 
-        let span = tracing::Span::current();
-        span.record("relay.session.id", tracing::field::display(id));
-        span.record("relay.session.created", inserted);
+    async fn resolve_or_create_for_pair_for_user(
+        &self,
+        acting_user_id: UserId,
+        root_request_id: PromptRequestId,
+        a: Participant,
+        b: Participant,
+        parent_session_id: Option<SessionId>,
+        org_id: OrgId,
+        created_by_user_id: UserId,
+    ) -> Result<SessionId, SessionError> {
+        // Tenant-scoped tx — the RLS WITH CHECK on `sessions.org_id`
+        // rejects a row whose `org_id` is not in the acting user's
+        // memberships. Worker / tool callers source `acting_user_id`
+        // from the claimed session's `created_by_user_id`.
+        let mut tx = crate::auth::begin_as_user(&self.pool, acting_user_id)
+            .await
+            .map_err(|e| SessionError::Backend(format!("begin_as_user: {e}")))?;
+        let id = resolve_or_create_for_pair_inner(
+            self,
+            &mut tx,
+            root_request_id,
+            a,
+            b,
+            parent_session_id,
+            org_id,
+            created_by_user_id,
+        )
+        .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
         Ok(id)
     }
 
@@ -143,7 +161,37 @@ impl SessionStore for PgSessionStore {
         message: ChatMessage,
         request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
-        append_row(self, id, sender, receiver, message, request_id).await
+        append_row(
+            self,
+            AppendTxScope::Privileged,
+            id,
+            sender,
+            receiver,
+            message,
+            request_id,
+        )
+        .await
+    }
+
+    async fn append_for_user(
+        &self,
+        acting_user_id: UserId,
+        id: SessionId,
+        sender: MessageSender,
+        receiver: Participant,
+        message: ChatMessage,
+        request_id: PromptRequestId,
+    ) -> Result<(), SessionError> {
+        append_row(
+            self,
+            AppendTxScope::AsUser(acting_user_id),
+            id,
+            sender,
+            receiver,
+            message,
+            request_id,
+        )
+        .await
     }
 
     #[tracing::instrument(
@@ -166,7 +214,37 @@ impl SessionStore for PgSessionStore {
         // prompt as user-side context — exactly how a system reminder
         // renders to the model.
         let body = ChatMessage::User(vec![UserContent::Text(note)]);
-        append_row(self, id, MessageSender::System, receiver, body, request_id).await
+        append_row(
+            self,
+            AppendTxScope::Privileged,
+            id,
+            MessageSender::System,
+            receiver,
+            body,
+            request_id,
+        )
+        .await
+    }
+
+    async fn append_system_nudge_for_user(
+        &self,
+        acting_user_id: UserId,
+        id: SessionId,
+        receiver: Participant,
+        note: String,
+        request_id: PromptRequestId,
+    ) -> Result<(), SessionError> {
+        let body = ChatMessage::User(vec![UserContent::Text(note)]);
+        append_row(
+            self,
+            AppendTxScope::AsUser(acting_user_id),
+            id,
+            MessageSender::System,
+            receiver,
+            body,
+            request_id,
+        )
+        .await
     }
 
     // TODO: revisit when we need tuning prompt, currently we attach
@@ -186,9 +264,12 @@ impl SessionStore for PgSessionStore {
         id: SessionId,
         viewer: Participant,
     ) -> Result<Vec<ChatMessage>, SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
         let exists: Option<(SessionId,)> = sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         if exists.is_none() {
             return Err(SessionError::NotFound(id));
@@ -209,8 +290,9 @@ impl SessionStore for PgSessionStore {
                  ORDER BY seq ASC",
         )
         .bind(id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
 
         tracing::Span::current().record("relay.history.count", rows.len());
         let mut out = Vec::with_capacity(rows.len());
@@ -245,9 +327,12 @@ impl SessionStore for PgSessionStore {
         limit: u32,
         before_seq: Option<i64>,
     ) -> Result<Vec<(i64, ChatMessage)>, SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
         let exists: Option<(SessionId,)> = sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         if exists.is_none() {
             return Err(SessionError::NotFound(id));
@@ -277,8 +362,9 @@ impl SessionStore for PgSessionStore {
         .bind(id)
         .bind(cursor)
         .bind(limit_i64)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
         rows.reverse();
 
         tracing::Span::current().record("relay.history.count", rows.len());
@@ -303,6 +389,9 @@ impl SessionStore for PgSessionStore {
         &self,
         id: SessionId,
     ) -> Result<(Participant, Participant), SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
         let row: Option<(
             ParticipantKind,
             Option<AgentId>,
@@ -315,8 +404,9 @@ impl SessionStore for PgSessionStore {
              WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
 
         let (ak, aid, bk, bid) = row.ok_or(SessionError::NotFound(id))?;
         let a = Participant::from_kind_id(ak, aid).map_err(invariant_to_backend)?;
@@ -325,11 +415,15 @@ impl SessionStore for PgSessionStore {
     }
 
     async fn parent(&self, id: SessionId) -> Result<Option<SessionId>, SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
         let row: Option<(Option<SessionId>,)> =
             sqlx::query_as("SELECT parent_session_id FROM sessions WHERE id = $1")
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
         let (parent,) = row.ok_or(SessionError::NotFound(id))?;
         Ok(parent)
     }
@@ -353,6 +447,9 @@ impl SessionStore for PgSessionStore {
         id: SessionId,
         viewer: Participant,
     ) -> Result<Vec<ChatMessage>, SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
         let rows: Vec<(
             MessageSenderKind,
             Option<AgentId>,
@@ -380,8 +477,9 @@ impl SessionStore for PgSessionStore {
         .bind(id)
         .bind(viewer.kind())
         .bind(viewer.agent_id())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
 
         tracing::Span::current().record("relay.history.count", rows.len());
         let mut out = Vec::with_capacity(rows.len());
@@ -399,20 +497,45 @@ impl SessionStore for PgSessionStore {
     }
 
     async fn root_request_id(&self, id: SessionId) -> Result<PromptRequestId, SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
         let row: Option<(PromptRequestId,)> =
             sqlx::query_as("SELECT root_request_id FROM sessions WHERE id = $1")
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
         let (root,) = row.ok_or(SessionError::NotFound(id))?;
         Ok(root)
     }
 
+    async fn tenancy(&self, id: SessionId) -> Result<SessionTenancy, SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
+        let row: Option<(OrgId, UserId)> =
+            sqlx::query_as("SELECT org_id, created_by_user_id FROM sessions WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
+        let (org_id, created_by_user_id) = row.ok_or(SessionError::NotFound(id))?;
+        Ok(SessionTenancy {
+            org_id,
+            created_by_user_id,
+        })
+    }
+
     async fn delete(&self, id: SessionId) -> Result<(), SessionError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool)
+            .await
+            .map_err(SessionError::Db)?;
         let res = sqlx::query("DELETE FROM sessions WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await.map_err(SessionError::Db)?;
         if res.rows_affected() == 0 {
             return Err(SessionError::NotFound(id));
         }
@@ -420,7 +543,78 @@ impl SessionStore for PgSessionStore {
     }
 }
 
-/// Single-row insert path shared by `append` and `append_system_nudge`.
+/// Shared body of `resolve_or_create_for_pair` (privileged) and
+/// `resolve_or_create_for_pair_for_user` (tenant-scoped). The caller
+/// opens the transaction and commits / rolls back; this helper only
+/// runs the INSERT … ON CONFLICT statement so the same SQL is reused
+/// across both entry points.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_or_create_for_pair_inner(
+    store: &PgSessionStore,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    root_request_id: PromptRequestId,
+    a: Participant,
+    b: Participant,
+    parent_session_id: Option<SessionId>,
+    org_id: OrgId,
+    created_by_user_id: UserId,
+) -> Result<SessionId, SessionError> {
+    // §1: parse, don't validate — canonicalise inside the store so
+    // a caller cannot accidentally insert the reversed-order row.
+    let (a, b) = Participant::canonical_pair(a, b).ok_or(SessionError::SelfSession)?;
+    let now = DateTime::<Utc>::from(store.clock.now_wall());
+    let new_id = SessionId::new();
+
+    // The unique index `sessions_dag_pair_unique` is on
+    // (org_id, root_request_id, a*, b*), and `xmax = 0` distinguishes a
+    // fresh insert from a hit on the existing row. We always
+    // RETURNING `id` so the caller gets the canonical row id
+    // either way.
+    let (id, inserted): (SessionId, bool) = sqlx::query_as(
+        "INSERT INTO sessions
+             (id, created_at, org_id, created_by_user_id,
+              parent_session_id, root_request_id,
+              participant_a_kind, participant_a_agent_id,
+              participant_b_kind, participant_b_agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (org_id, root_request_id,
+                      participant_a_kind, participant_a_agent_id,
+                      participant_b_kind, participant_b_agent_id)
+             DO UPDATE SET id = sessions.id
+         RETURNING id, (xmax = 0) AS inserted",
+    )
+    .bind(new_id)
+    .bind(now)
+    .bind(org_id)
+    .bind(created_by_user_id)
+    .bind(parent_session_id)
+    .bind(root_request_id)
+    .bind(a.kind())
+    .bind(a.agent_id())
+    .bind(b.kind())
+    .bind(b.agent_id())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(map_agent_fk)?;
+
+    let span = tracing::Span::current();
+    span.record("relay.session.id", tracing::field::display(id));
+    span.record("relay.session.created", inserted);
+    Ok(id)
+}
+
+/// Transaction scope for [`append_row`]: privileged for HTTP routes /
+/// schedulers that have already gated through `begin_as`, or
+/// tenant-scoped for worker / tool paths so the `session_messages`
+/// INSERT is RLS-checked against the acting principal.
+#[derive(Debug, Clone, Copy)]
+enum AppendTxScope {
+    Privileged,
+    AsUser(UserId),
+}
+
+/// Single-row insert path shared by `append` and `append_system_nudge`
+/// in both their privileged and tenant-scoped flavours.
 ///
 /// One round-trip: a CTE locks the session row (`FOR UPDATE` serialises
 /// concurrent appends), computes `next_seq`/`row_count` against the
@@ -430,8 +624,10 @@ impl SessionStore for PgSessionStore {
 /// row lock is held for exactly the read-modify-write window — same
 /// concurrency story as the prior `BEGIN; SELECT FOR UPDATE; SELECT MAX/COUNT;
 /// INSERT; COMMIT;` sequence, but at one third the round-trips.
+#[allow(clippy::too_many_arguments)]
 async fn append_row(
     store: &PgSessionStore,
+    scope: AppendTxScope,
     id: SessionId,
     sender: MessageSender,
     receiver: Participant,
@@ -446,9 +642,24 @@ async fn append_row(
     let cap = store.message_cap;
     let cap_i64 = i64::from(cap);
 
+    // Tenant-scoped variants open `begin_as_user` so the
+    // `session_messages` INSERT's RLS WITH CHECK fires against the
+    // acting principal. Privileged variants are reserved for HTTP
+    // routes and schedulers that have already established
+    // visibility upstream. The trigger on `session_messages` raises
+    // if our bound `org_id` ever drifts from the parent session's;
+    // RLS adds the cross-tenant defence on top.
+    let mut tx = match scope {
+        AppendTxScope::Privileged => crate::auth::begin_privileged(&store.pool)
+            .await
+            .map_err(SessionError::Db)?,
+        AppendTxScope::AsUser(user_id) => crate::auth::begin_as_user(&store.pool, user_id)
+            .await
+            .map_err(|e| SessionError::Backend(format!("begin_as_user: {e}")))?,
+    };
     let row: Option<(bool, i64)> = sqlx::query_as(
         "WITH locked AS (
-             SELECT id FROM sessions WHERE id = $1 FOR UPDATE
+             SELECT id, org_id FROM sessions WHERE id = $1 FOR UPDATE
          ),
          stats AS (
              SELECT
@@ -462,8 +673,9 @@ async fn append_row(
                  (session_id, seq,
                   sender_kind, sender_agent_id,
                   receiver_kind, receiver_agent_id,
-                  body, created_at, request_id)
-             SELECT $1, stats.next_seq, $3, $4, $5, $6, $7, $8, $9
+                  body, created_at, request_id, org_id)
+             SELECT $1, stats.next_seq, $3, $4, $5, $6, $7, $8, $9,
+                    (SELECT org_id FROM locked)
              FROM stats
              WHERE stats.row_count < $2
                AND EXISTS (SELECT 1 FROM locked)
@@ -484,9 +696,10 @@ async fn append_row(
     .bind(body)
     .bind(now)
     .bind(request_id)
-    .fetch_optional(&store.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(map_agent_fk)?;
+    tx.commit().await.map_err(SessionError::Db)?;
 
     let Some((inserted, row_count)) = row else {
         // Outer SELECT had no rows ⇒ the `locked` CTE found no session row

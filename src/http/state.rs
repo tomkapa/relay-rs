@@ -1,6 +1,8 @@
 use sqlx::PgPool;
 
 use crate::agents::SharedAgentStore;
+use crate::auth::{GoogleOAuth, JwtSigner, SharedUserStore};
+use crate::clock::SharedClock;
 use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore};
 use crate::memory::SharedMemoryStore;
 use crate::runtime::{
@@ -38,4 +40,32 @@ pub struct AppState {
     /// inline in the route module rather than spinning up another store
     /// abstraction; this field is the seam.
     pub pool: PgPool,
+    /// JWT signer used by the auth middleware to verify cookies and by
+    /// the OAuth callback route to mint them.
+    pub jwt: JwtSigner,
+    /// Google OAuth client — owns the redirect URL, client id/secret,
+    /// and the HTTP exchanger.
+    pub oauth: GoogleOAuth,
+    /// Identity-table store.
+    ///
+    /// Used by the OAuth callback to upsert users + personal org, and
+    /// by the auth middleware for membership lookups.
+    pub users: SharedUserStore,
+    /// Injected clock. Auth code uses this to stamp `oauth_login_states`
+    /// expiry; per CLAUDE.md §11 nothing in app code calls
+    /// `SystemTime::now` directly.
+    pub clock: SharedClock,
+    /// Whether to set the `Secure` flag on the session cookie. Off in
+    /// local-dev (plain http://localhost), on in any prod-shaped
+    /// deployment. Sourced from [`crate::config::AuthSettings`].
+    pub cookie_secure: bool,
+}
+
+impl AppState {
+    /// Accessor for the cookie-Secure flag. Convenience over reading
+    /// the public field; keeps the route module readable.
+    #[must_use]
+    pub fn cookie_secure(&self) -> bool {
+        self.cookie_secure
+    }
 }

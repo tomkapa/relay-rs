@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId, begin_as_user, begin_privileged};
 use crate::clock::SharedClock;
 use crate::runtime::PromptRequestId;
 
@@ -47,14 +48,19 @@ impl fmt::Debug for PgScheduledTaskStore {
 }
 
 /// SELECT projection used by every read path. Order must match
-/// [`row_to_record`].
-const SELECT_COLUMNS: &str = "id, owner_agent_id, name, prompt, schedule, \
+/// [`row_to_record`]. `org_id` + `created_by_user_id` are the tenancy
+/// columns added by migration 19; they round-trip on every read so the
+/// scheduler can enqueue without a follow-up JOIN.
+const SELECT_COLUMNS: &str = "id, owner_agent_id, org_id, created_by_user_id, \
+     name, prompt, schedule, \
      next_run_at, last_fired_at, last_request_id, state, created_at, updated_at";
 
 #[allow(clippy::type_complexity)]
 type Row = (
     ScheduledTaskId,
     AgentId,
+    OrgId,
+    UserId,
     String,
     String,
     serde_json::Value,
@@ -70,6 +76,8 @@ fn row_to_record(row: Row) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
     let (
         id,
         owner_agent_id,
+        org_id,
+        created_by_user_id,
         name,
         prompt,
         schedule,
@@ -83,6 +91,8 @@ fn row_to_record(row: Row) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
     Ok(ScheduledTaskRecord {
         id,
         owner_agent_id,
+        org_id,
+        created_by_user_id,
         name: ScheduledTaskName::try_from(name)?,
         prompt: ScheduledPrompt::try_from(prompt)?,
         schedule: serde_json::from_value(schedule)?,
@@ -101,61 +111,31 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         &self,
         payload: NewScheduledTask,
     ) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
-        let id = ScheduledTaskId::new();
-        let now = self.now();
-        let schedule_json = serde_json::to_value(&payload.schedule)?;
-        let owner = payload.owner_agent_id;
-        let cap_label = format!("relay:sched_cap:{owner}");
+        let tx = begin_privileged(&self.pool).await?;
+        create_in_tx(self, tx, payload).await
+    }
 
-        let mut tx = self.pool.begin().await?;
-        // Per-agent advisory lock — pg_advisory_xact_lock serializes
-        // concurrent create-for-same-owner transactions so the count +
-        // insert below cannot race past the cap (READ COMMITTED alone
-        // does not prevent the TOCTOU).
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-            .bind(&cap_label)
-            .execute(&mut *tx)
-            .await?;
+    async fn create_for_user(
+        &self,
+        acting_user_id: UserId,
+        payload: NewScheduledTask,
+    ) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
+        let tx = begin_as_user(&self.pool, acting_user_id)
+            .await
+            .map_err(|e| ScheduledTaskError::Backend(format!("begin_as_user: {e}")))?;
+        create_in_tx(self, tx, payload).await
+    }
 
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scheduled_tasks \
-             WHERE owner_agent_id = $1 AND state = $2",
-        )
-        .bind(owner)
-        .bind(ScheduledTaskState::Active)
-        .fetch_one(&mut *tx)
-        .await?;
-        let count_usize = usize::try_from(count).map_err(|_| {
-            ScheduledTaskError::Db(sqlx::Error::Decode(
-                format!("invariant: negative count {count}").into(),
-            ))
-        })?;
-        if count_usize >= MAX_SCHEDULED_TASKS_PER_AGENT {
-            return Err(ScheduledTaskError::PerAgentCapExceeded {
-                agent: owner,
-                max: MAX_SCHEDULED_TASKS_PER_AGENT,
-            });
-        }
-
-        let row: Row = sqlx::query_as(&format!(
-            "INSERT INTO scheduled_tasks \
-                ({SELECT_COLUMNS}) \
-             VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, $7, $8, $8) \
-             RETURNING {SELECT_COLUMNS}"
-        ))
-        .bind(id)
-        .bind(owner)
-        .bind(payload.name.as_str())
-        .bind(payload.prompt.as_str())
-        .bind(&schedule_json)
-        .bind(payload.next_run_at)
-        .bind(ScheduledTaskState::Active)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        row_to_record(row)
+    async fn cancel_for_user(
+        &self,
+        acting_user_id: UserId,
+        task: ScheduledTaskId,
+        owner: AgentId,
+    ) -> Result<(), ScheduledTaskError> {
+        let tx = begin_as_user(&self.pool, acting_user_id)
+            .await
+            .map_err(|e| ScheduledTaskError::Backend(format!("begin_as_user: {e}")))?;
+        cancel_in_tx(self, tx, task, owner).await
     }
 
     async fn list_for_agent(
@@ -170,6 +150,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
                 format!("invariant: cap {MAX_SCHEDULED_TASKS_PER_AGENT} exceeds i64").into(),
             ))
         })?;
+        let mut tx = begin_privileged(&self.pool).await?;
         let rows: Vec<Row> = sqlx::query_as(&format!(
             "SELECT {SELECT_COLUMNS} FROM scheduled_tasks \
              WHERE owner_agent_id = $1 AND state = $2 \
@@ -179,8 +160,9 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         .bind(owner)
         .bind(ScheduledTaskState::Active)
         .bind(cap)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         assert!(
             rows.len() <= MAX_SCHEDULED_TASKS_PER_AGENT,
             "invariant: list_for_agent exceeded per-agent cap"
@@ -194,42 +176,8 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         task: ScheduledTaskId,
         owner: AgentId,
     ) -> Result<(), ScheduledTaskError> {
-        let now = self.now();
-        let mut tx = self.pool.begin().await?;
-
-        // Lock by `(id, owner_agent_id)` — a cross-owner caller sees
-        // zero rows here, which folds into `NotFound` at the bottom.
-        let existing: Option<(ScheduledTaskState,)> = sqlx::query_as(
-            "SELECT state FROM scheduled_tasks \
-             WHERE id = $1 AND owner_agent_id = $2 FOR UPDATE",
-        )
-        .bind(task)
-        .bind(owner)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some((state,)) = existing else {
-            return Err(ScheduledTaskError::NotFound(task));
-        };
-        if !matches!(state, ScheduledTaskState::Active) {
-            // Already cancelled / done — idempotent no-op.
-            tx.commit().await?;
-            return Ok(());
-        }
-
-        sqlx::query(
-            "UPDATE scheduled_tasks \
-             SET state = $1, next_run_at = NULL, updated_at = $2 \
-             WHERE id = $3",
-        )
-        .bind(ScheduledTaskState::Cancelled)
-        .bind(now)
-        .bind(task)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(())
+        let tx = begin_privileged(&self.pool).await?;
+        cancel_in_tx(self, tx, task, owner).await
     }
 
     async fn claim_due(
@@ -241,6 +189,13 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         // (future) dedupe at the queue layer via the
         // `sched-{task_id}-{fire_ts}` idempotency key; `record_fired`
         // is idempotent over the same `(fired_at, next_run_at)` pair.
+        //
+        // Cross-tenant scan: the scheduler ticks across every org, so
+        // the privileged tx bypasses the RLS policy installed in
+        // migration 19. Each returned row carries its own `org_id` +
+        // `created_by_user_id` so the caller pins the enqueued
+        // `NewPromptRequest` to the right tenant per row.
+        let mut tx = begin_privileged(&self.pool).await?;
         let rows: Vec<Row> = sqlx::query_as(&format!(
             "SELECT {SELECT_COLUMNS} FROM scheduled_tasks \
              WHERE state = $1 \
@@ -256,8 +211,9 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
                 format!("invariant: limit {limit} exceeds i64").into(),
             ))
         })?)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         rows.into_iter().map(row_to_record).collect()
     }
@@ -276,6 +232,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         } else {
             ScheduledTaskState::Done
         };
+        let mut tx = begin_privileged(&self.pool).await?;
         sqlx::query(
             "UPDATE scheduled_tasks \
              SET last_fired_at = $1, \
@@ -291,8 +248,116 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         .bind(next_state)
         .bind(now)
         .bind(task)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
+}
+
+/// Body of `create` / `create_for_user`. Takes the opened tx by value
+/// (privileged for scheduler / HTTP; `begin_as_user` for the
+/// `schedule_task` tool so the INSERT runs RLS-checked).
+async fn create_in_tx(
+    store: &PgScheduledTaskStore,
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    payload: NewScheduledTask,
+) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
+    let id = ScheduledTaskId::new();
+    let now = store.now();
+    let schedule_json = serde_json::to_value(&payload.schedule)?;
+    let owner = payload.owner_agent_id;
+    let cap_label = format!("relay:sched_cap:{owner}");
+
+    // Per-agent advisory lock — pg_advisory_xact_lock serializes
+    // concurrent create-for-same-owner transactions so the count +
+    // insert below cannot race past the cap (READ COMMITTED alone
+    // does not prevent the TOCTOU).
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&cap_label)
+        .execute(&mut *tx)
+        .await?;
+
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM scheduled_tasks \
+             WHERE owner_agent_id = $1 AND state = $2",
+    )
+    .bind(owner)
+    .bind(ScheduledTaskState::Active)
+    .fetch_one(&mut *tx)
+    .await?;
+    let count_usize = usize::try_from(count).map_err(|_| {
+        ScheduledTaskError::Db(sqlx::Error::Decode(
+            format!("invariant: negative count {count}").into(),
+        ))
+    })?;
+    if count_usize >= MAX_SCHEDULED_TASKS_PER_AGENT {
+        return Err(ScheduledTaskError::PerAgentCapExceeded {
+            agent: owner,
+            max: MAX_SCHEDULED_TASKS_PER_AGENT,
+        });
+    }
+
+    let row: Row = sqlx::query_as(&format!(
+        "INSERT INTO scheduled_tasks \
+                ({SELECT_COLUMNS}) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, $9, $10, $10) \
+             RETURNING {SELECT_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(owner)
+    .bind(payload.org_id)
+    .bind(payload.created_by_user_id)
+    .bind(payload.name.as_str())
+    .bind(payload.prompt.as_str())
+    .bind(&schedule_json)
+    .bind(payload.next_run_at)
+    .bind(ScheduledTaskState::Active)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    row_to_record(row)
+}
+
+/// Body of `cancel` / `cancel_for_user`.
+async fn cancel_in_tx(
+    store: &PgScheduledTaskStore,
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    task: ScheduledTaskId,
+    owner: AgentId,
+) -> Result<(), ScheduledTaskError> {
+    let now = store.now();
+
+    let existing: Option<(ScheduledTaskState,)> = sqlx::query_as(
+        "SELECT state FROM scheduled_tasks \
+             WHERE id = $1 AND owner_agent_id = $2 FOR UPDATE",
+    )
+    .bind(task)
+    .bind(owner)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some((state,)) = existing else {
+        return Err(ScheduledTaskError::NotFound(task));
+    };
+    if !matches!(state, ScheduledTaskState::Active) {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    sqlx::query(
+        "UPDATE scheduled_tasks \
+             SET state = $1, next_run_at = NULL, updated_at = $2 \
+             WHERE id = $3",
+    )
+    .bind(ScheduledTaskState::Cancelled)
+    .bind(now)
+    .bind(task)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
 }

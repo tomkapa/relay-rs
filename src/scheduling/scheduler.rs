@@ -129,6 +129,10 @@ impl SchedulerInner {
         let fire_at = task.next_run_at.unwrap_or(now);
         let prompt = Prompt::try_from(task.prompt.as_str().to_string())?;
         let key = IdempotencyKey::try_from(format!("sched-{}-{}", task.id, fire_at.timestamp(),))?;
+        // Tenancy flows directly off the row — migration 19 added
+        // `org_id` + `created_by_user_id` to `scheduled_tasks`, so the
+        // scheduler no longer needs to JOIN through `agents` /
+        // `org_members` at fire-time.
         let req = NewPromptRequest::normal(
             None,
             Participant::Human,
@@ -136,6 +140,8 @@ impl SchedulerInner {
             None,
             prompt,
             key,
+            task.org_id,
+            task.created_by_user_id,
         );
         let outcome = self.queue.enqueue(req).await?;
         let request_id = outcome.request_id();

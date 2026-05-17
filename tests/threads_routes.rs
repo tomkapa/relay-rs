@@ -44,6 +44,10 @@ struct ThreadsHarness {
     sink: SharedResponseSink,
     thread_stream: SharedThreadStream,
     state: AppState,
+    /// `Cookie:` header carrying a valid JWT for the seeded test
+    /// principal. Threaded into every request so the auth layer admits
+    /// the call.
+    auth_cookie: String,
     /// Held so its `Drop` reaps the coordinator task.
     #[allow(dead_code)]
     refresher: McpRefresher,
@@ -85,6 +89,9 @@ impl ThreadsHarness {
                 clock.clone(),
                 common::embedding::FakeEmbeddingProvider::shared(),
             ));
+        let jwt = common::auth::test_jwt(clock.clone());
+        let oauth = common::auth::test_oauth();
+        let users = common::auth::user_store(pool.clone());
         let state = AppState {
             queue: queue.clone(),
             leases,
@@ -97,7 +104,22 @@ impl ThreadsHarness {
             mcp_refresh,
             thread_stream: thread_stream.clone(),
             pool,
+            jwt,
+            oauth,
+            users,
+            clock: clock.clone(),
+            cookie_secure: false,
         };
+
+        // The threads we enqueue belong to `db.default_org_id`, so the
+        // principal we mint must be a member of that same org —
+        // otherwise the new RLS policies on `sessions` /
+        // `session_messages` filter every row out of the response.
+        let seeded = common::auth::principal_for_default_org(
+            db.default_user_id,
+            db.default_org_id,
+            &state.jwt,
+        );
 
         Self {
             db,
@@ -106,6 +128,7 @@ impl ThreadsHarness {
             thread_stream,
             state,
             refresher,
+            auth_cookie: seeded.cookie_header(),
         }
     }
 }
@@ -120,6 +143,8 @@ async fn enqueue_human_root(harness: &ThreadsHarness, content: &str, key: &str) 
             parent_session: None,
             content: Prompt::try_from(content).expect("prompt"),
             idempotency_key: IdempotencyKey::try_from(key).expect("key"),
+            org_id: harness.db.default_org_id,
+            created_by_user_id: harness.db.default_user_id,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
@@ -138,6 +163,7 @@ async fn list_threads_returns_one_row_per_human_root() {
         .oneshot(
             axum::http::Request::builder()
                 .uri("/threads")
+                .header("cookie", &h.auth_cookie)
                 .body(axum::body::Body::empty())
                 .expect("request"),
         )
@@ -177,6 +203,7 @@ async fn thread_messages_returns_empty_for_fresh_dag() {
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!("/threads/{}/messages", root.as_uuid()))
+                .header("cookie", &h.auth_cookie)
                 .body(axum::body::Body::empty())
                 .expect("request"),
         )
@@ -210,7 +237,14 @@ async fn thread_messages_includes_request_id_per_row() {
     let session = h
         .state
         .sessions
-        .resolve_or_create_for_pair(root, Participant::Human, agent, None)
+        .resolve_or_create_for_pair(
+            root,
+            Participant::Human,
+            agent,
+            None,
+            h.db.default_org_id,
+            h.db.default_user_id,
+        )
         .await
         .expect("create session");
     h.state
@@ -230,6 +264,7 @@ async fn thread_messages_includes_request_id_per_row() {
         .oneshot(
             axum::http::Request::builder()
                 .uri(format!("/threads/{}/messages", root.as_uuid()))
+                .header("cookie", &h.auth_cookie)
                 .body(axum::body::Body::empty())
                 .expect("request"),
         )

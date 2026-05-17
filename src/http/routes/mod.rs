@@ -3,23 +3,42 @@
 //! attaches global middleware once.
 
 mod agents;
+mod auth;
+mod healthz;
 mod mcp;
+mod me;
 mod memory;
 mod prompts;
 mod threads;
 
 use axum::Router;
+use axum::middleware;
 use tower_http::trace::TraceLayer;
 
+use super::auth_layer::require_principal;
 use super::state::AppState;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new().merge(auth::router()).merge(healthz::router());
+
+    let private = Router::new()
         .merge(prompts::router())
         .merge(agents::router())
         .merge(mcp::router())
         .merge(memory::router())
         .merge(threads::router())
+        .merge(me::router())
+        // route_layer is the only correct place for auth middleware —
+        // applying it via `.layer` would also wrap the public subtree
+        // below and reject `/auth/google/*` with 401.
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_principal,
+        ));
+
+    Router::new()
+        .merge(public)
+        .merge(private)
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

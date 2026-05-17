@@ -14,4 +14,4 @@ mod traits;
 pub use error::SessionError;
 pub use limits::MAX_MESSAGES_PER_SESSION;
 pub use pg_store::PgSessionStore;
-pub use traits::{SessionId, SessionStore, SharedSessionStore};
+pub use traits::{SessionId, SessionStore, SessionTenancy, SharedSessionStore};

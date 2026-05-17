@@ -101,13 +101,16 @@ impl Tool for MemoryUpdateTool {
         let outcome = self
             .deps
             .store()
-            .apply(MemoryMutation::Update {
-                agent,
-                target: memory_id,
-                content,
-                state: MemoryState::Tentative,
-                source: MutationSource::Turn(ctx.request_id),
-            })
+            .apply_for_user(
+                ctx.acting_user_id,
+                MemoryMutation::Update {
+                    agent,
+                    target: memory_id,
+                    content,
+                    state: MemoryState::Tentative,
+                    source: MutationSource::Turn(ctx.request_id),
+                },
+            )
             .await
             .map_err(store_to_tool_err)?;
 

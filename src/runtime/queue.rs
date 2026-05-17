@@ -12,6 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId};
 use crate::session::SessionId;
 use crate::types::{Participant, Prompt};
 
@@ -86,6 +87,20 @@ impl Default for LeaseTiming {
 #[async_trait]
 pub trait PromptQueue: fmt::Debug + Send + Sync {
     async fn enqueue(&self, req: NewPromptRequest) -> Result<EnqueueOutcome, PromptError>;
+
+    /// Tenant-scoped variant of [`Self::enqueue`]. Opens
+    /// `begin_as_user(acting_user_id)` so the implicit-session
+    /// create + the `prompt_requests` INSERT both run under the
+    /// caller's principal. HTTP and tool callers thread the user id
+    /// from their respective surfaces (request `Principal` /
+    /// claimed session); the scheduler-side enqueue (librarian,
+    /// reflection, scheduler) stays on the privileged entry point
+    /// because it is cross-tenant by construction.
+    async fn enqueue_for_user(
+        &self,
+        acting_user_id: UserId,
+        req: NewPromptRequest,
+    ) -> Result<EnqueueOutcome, PromptError>;
     async fn claim_next_session(
         &self,
         worker: WorkerId,
@@ -156,6 +171,16 @@ pub struct NewPromptRequest {
     pub parent_session: Option<SessionId>,
     pub content: Prompt,
     pub idempotency_key: IdempotencyKey,
+    /// Owning organisation. Required because every session this enqueue
+    /// might mint is `NOT NULL` on `sessions.org_id` and the trigger
+    /// rejects cross-org child sessions; HTTP callers pull this from the
+    /// request principal, worker / tool callers pull it from the
+    /// parent session's `tenancy`.
+    pub org_id: OrgId,
+    /// Human at the DAG root. Mirrors `sessions.created_by_user_id` so
+    /// the worker pool can later set `app.user_id` from the claimed
+    /// session and reads inside the turn run as that principal.
+    pub created_by_user_id: UserId,
     /// Kind-specific payload — the job kind itself (doc/memory.md §2.1)
     /// is its variant discriminator, read via
     /// [`RequestKindPayload::kind`]. HTTP-triggered prompts default to
@@ -171,6 +196,7 @@ impl NewPromptRequest {
     /// Build a normal user-facing prompt — the shape every
     /// HTTP-triggered enqueue takes.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn normal(
         session: Option<SessionId>,
         sender: Participant,
@@ -178,6 +204,8 @@ impl NewPromptRequest {
         parent_session: Option<SessionId>,
         content: Prompt,
         idempotency_key: IdempotencyKey,
+        org_id: OrgId,
+        created_by_user_id: UserId,
     ) -> Self {
         Self {
             session,
@@ -186,6 +214,8 @@ impl NewPromptRequest {
             parent_session,
             content,
             idempotency_key,
+            org_id,
+            created_by_user_id,
             kind_payload: RequestKindPayload::Normal {},
         }
     }
@@ -252,6 +282,14 @@ impl EnqueueOutcome {
 #[derive(Debug, Clone)]
 pub struct ClaimedSession {
     pub session: SessionId,
+    /// Owning organisation of the session. Joined from `sessions.org_id`
+    /// during the claim so the worker can open a tenant-scoped turn-tx
+    /// (`auth::begin_as_user`) without an extra round-trip per turn.
+    pub org_id: OrgId,
+    /// Human at the DAG root — `sessions.created_by_user_id`. Drives the
+    /// `app.user_id` GUC inside the worker's turn-tx so RLS policies on
+    /// reads from within the turn evaluate against the right principal.
+    pub created_by_user_id: UserId,
     pub receiver_agent_id: AgentId,
     pub prompts: Vec<ClaimedPrompt>,
     pub lease: LeaseToken,
@@ -275,6 +313,7 @@ impl ClaimedSession {
         ClaimReceipt {
             lease: self.lease.clone(),
             ids: self.prompts.iter().map(|p| p.request_id).collect(),
+            acting_user_id: self.created_by_user_id,
         }
     }
 }
@@ -296,6 +335,12 @@ pub struct ClaimedPrompt {
 pub struct ClaimReceipt {
     lease: LeaseToken,
     ids: Vec<PromptRequestId>,
+    /// Mirrors [`ClaimedSession::created_by_user_id`] so worker-side
+    /// helpers that need to open a `begin_as_user` tx (publish a
+    /// `Done` / `Error` chunk, mark the DAG row's quiescence) can
+    /// reach the right principal through the receipt alone — the
+    /// helper doesn't have to thread the claim through.
+    acting_user_id: UserId,
 }
 
 impl ClaimReceipt {
@@ -307,6 +352,14 @@ impl ClaimReceipt {
     #[must_use]
     pub fn ids(&self) -> &[PromptRequestId] {
         &self.ids
+    }
+
+    /// Human at the DAG root of the claimed session. Threaded into
+    /// every `_for_user` store call the worker makes during finalise
+    /// / quiescence / failure publish so the writes are RLS-checked.
+    #[must_use]
+    pub const fn acting_user_id(&self) -> UserId {
+        self.acting_user_id
     }
 }
 

@@ -35,6 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId};
 use crate::clock::SharedClock;
 use crate::runtime::{IdempotencyKey, NewPromptRequest, RequestKindPayload, SharedPromptQueue};
 use crate::tools::truncate_from_start;
@@ -270,7 +271,7 @@ impl SchedulerInner {
         let now: DateTime<Utc> = self.clock.now_wall().into();
         let agents = self.list_agents().await?;
 
-        for agent in agents.into_iter().take(self.batch_limit) {
+        for (agent, org_id, owner_user_id) in agents.into_iter().take(self.batch_limit) {
             // Sweep first so any new contradictions become eligible for
             // enqueue in the same tick.
             match super::librarian::run_librarian_sweep(self.store.as_ref(), agent, now).await {
@@ -291,26 +292,54 @@ impl SchedulerInner {
                 }
             }
 
-            if let Err(e) = self.enqueue_resolutions(agent).await {
+            if let Err(e) = self.enqueue_resolutions(agent, org_id, owner_user_id).await {
                 warn!(error = %e, relay.agent.id = %agent, "librarian.enqueue.error");
             }
         }
         Ok(())
     }
 
-    async fn list_agents(&self) -> Result<Vec<AgentId>, super::store::MemoryStoreError> {
+    /// Each agent comes back with its owning org and a representative
+    /// user for that org — both are needed by the resolution enqueue path
+    /// to fill `NewPromptRequest::{org_id, created_by_user_id}`, which
+    /// the queue stamps onto the off-DAG `(agent, system)` session it
+    /// mints. The `LIMIT 1` member is deterministic by `created_at` so
+    /// repeated ticks pick the same surrogate; the resolution is purely
+    /// agent-side work, so any member of the agent's org is a valid
+    /// principal for the row.
+    async fn list_agents(
+        &self,
+    ) -> Result<Vec<(AgentId, OrgId, UserId)>, super::store::MemoryStoreError> {
         let limit = i64::try_from(self.batch_limit).expect("invariant: batch limit fits in i64");
-        let rows: Vec<(AgentId,)> =
-            sqlx::query_as("SELECT id FROM agents ORDER BY created_at LIMIT $1")
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
+        // Privileged tx — the librarian is infrastructure: it sweeps
+        // across every tenant's agents and resolves contradictions on
+        // each. RLS on `agents` / `org_members` would otherwise hide
+        // every row.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+        let rows: Vec<(AgentId, OrgId, UserId)> = sqlx::query_as(
+            "SELECT a.id, a.org_id, m.user_id
+                 FROM agents a
+                 JOIN LATERAL (
+                     SELECT user_id FROM org_members
+                     WHERE org_id = a.org_id
+                     ORDER BY created_at ASC
+                     LIMIT 1
+                 ) m ON TRUE
+                 ORDER BY a.created_at
+                 LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
     }
 
     async fn enqueue_resolutions(
         &self,
         agent: AgentId,
+        org_id: OrgId,
+        owner_user_id: UserId,
     ) -> Result<(), super::store::MemoryStoreError> {
         let unresolved = self.store.unresolved_contradictions(agent).await?;
         for ev in unresolved {
@@ -331,6 +360,8 @@ impl SchedulerInner {
                 parent_session: None,
                 content,
                 idempotency_key: key,
+                org_id,
+                created_by_user_id: owner_user_id,
                 kind_payload: RequestKindPayload::Resolution {
                     contradiction_event_id: ev.id,
                 },
@@ -462,6 +493,7 @@ mod tests {
         MemoryRow {
             id,
             agent_id: AgentId::new(),
+            org_id: crate::auth::OrgId::new(),
             kind,
             content: MemoryContent::try_from(content).expect("valid"),
             state,
@@ -478,6 +510,7 @@ mod tests {
         ContradictionEventRow {
             id: crate::memory::ContradictionEventId::new(),
             agent_id: AgentId::new(),
+            org_id: crate::auth::OrgId::new(),
             memory_a: a,
             memory_b: b,
             reason: reason.into(),

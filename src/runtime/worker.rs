@@ -242,7 +242,7 @@ impl Worker {
         let cancel = CancellationToken::new();
 
         if self.any_cancelled(receipt.ids()).await {
-            self.publish_failure(receipt.ids(), &FailureReason::Cancelled)
+            self.publish_failure(&receipt, &FailureReason::Cancelled)
                 .await;
             self.finalise(&receipt, FailureReason::Cancelled).await;
             return;
@@ -259,7 +259,7 @@ impl Worker {
                     "worker.agent.resolve.error",
                 );
                 let reason = FailureReason::Unrecoverable(format!("agent resolve: {e}"));
-                self.publish_failure(receipt.ids(), &reason).await;
+                self.publish_failure(&receipt, &reason).await;
                 self.finalise(&receipt, reason).await;
                 if let Err(e) = self.leases.release(receipt.lease()).await {
                     warn!(error = %e, "worker.lease.release.error");
@@ -334,6 +334,7 @@ impl Worker {
                 viewer,
                 prompts,
                 request_id,
+                claim.created_by_user_id,
                 claim.kind_payload.clone(),
                 cancel,
                 None,
@@ -391,6 +392,7 @@ impl Worker {
                         *conversation_session,
                         *up_to_turn_id,
                         claim.session,
+                        claim.created_by_user_id,
                     )
                     .await
                 {
@@ -400,8 +402,12 @@ impl Worker {
             RequestKindPayload::Resolution {
                 contradiction_event_id,
             } => {
-                self.close_no_action_if_unresolved(*contradiction_event_id, reply.final_text())
-                    .await;
+                self.close_no_action_if_unresolved(
+                    *contradiction_event_id,
+                    reply.final_text(),
+                    claim.created_by_user_id,
+                )
+                .await;
             }
         }
     }
@@ -415,6 +421,7 @@ impl Worker {
         &self,
         target: crate::memory::ContradictionEventId,
         final_text: &str,
+        acting_user_id: crate::auth::UserId,
     ) {
         match self.memory_store.read_contradiction(target).await {
             Ok(Some(row)) if row.resolved_at.is_none() => {
@@ -436,7 +443,8 @@ impl Worker {
                     .expect("invariant: 1..=cap enforced by trim+sentinel+truncate");
                 if let Err(e) = self
                     .memory_store
-                    .resolve_contradiction(
+                    .resolve_contradiction_for_user(
+                        acting_user_id,
                         target,
                         crate::memory::ResolutionOutcome::NoAction { reason },
                     )
@@ -463,13 +471,24 @@ impl Worker {
         conversation_session: SessionId,
         up_to_turn_id: PromptRequestId,
         reflection_session: SessionId,
+        acting_user_id: crate::auth::UserId,
     ) -> Result<(), sqlx::Error> {
         let now = Utc::now();
+        // Tenant-scoped tx: `reflection_checkpoints` is RLS-forced
+        // post-migration-17. `org_id` is derived from the parent agent
+        // and parity-checked by `reflection_checkpoints_enforce_org`;
+        // the `begin_as_user` here pins `app.user_id` to the same
+        // principal the reflection claim was minted under so the
+        // WITH CHECK fires against the right org.
+        let mut tx = crate::auth::begin_as_user(&self.pool, acting_user_id)
+            .await
+            .map_err(|e| sqlx::Error::Protocol(format!("begin_as_user: {e}")))?;
         sqlx::query(
             "INSERT INTO reflection_checkpoints
-                 (agent_id, session_id, last_turn_id, reflection_event_id,
+                 (agent_id, org_id, session_id, last_turn_id, reflection_event_id,
                   reflection_session_ids, created_at)
-             VALUES ($1, $2, $3, NULL, ARRAY[$4]::UUID[], $5)
+             VALUES ($1, (SELECT org_id FROM agents WHERE id = $1),
+                     $2, $3, NULL, ARRAY[$4]::UUID[], $5)
              ON CONFLICT (agent_id, session_id) DO UPDATE
                  SET last_turn_id = EXCLUDED.last_turn_id,
                      reflection_event_id = EXCLUDED.reflection_event_id,
@@ -484,11 +503,13 @@ impl Worker {
         .bind(up_to_turn_id)
         .bind(reflection_session)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_with_pingpong_guard(
         &self,
         agent: &Agent,
@@ -521,6 +542,7 @@ impl Worker {
                     viewer,
                     prompts.clone(),
                     request_id,
+                    claim.created_by_user_id,
                     cancel.clone(),
                     observer.clone(),
                     prompts_consumed,
@@ -536,7 +558,7 @@ impl Worker {
                             text.preview = %preview(reply.final_text()),
                             "worker.turn.no_egress.exceeded",
                         );
-                        self.publish_failure(receipt.ids(), &FailureReason::NoEgress)
+                        self.publish_failure(receipt, &FailureReason::NoEgress)
                             .await;
                         self.finalise(receipt, FailureReason::NoEgress).await;
                         return;
@@ -548,10 +570,13 @@ impl Worker {
                         text.preview = %preview(reply.final_text()),
                         "worker.turn.no_egress.retried",
                     );
-                    if let Err(e) = self.inject_pingpong_nudge(claim, request_id).await {
+                    if let Err(e) = self
+                        .inject_pingpong_nudge(claim, request_id, claim.created_by_user_id)
+                        .await
+                    {
                         warn!(error = %e, "worker.pingpong.nudge.error");
                         let reason = FailureReason::Unrecoverable(format!("nudge append: {e}"));
-                        self.publish_failure(receipt.ids(), &reason).await;
+                        self.publish_failure(receipt, &reason).await;
                         self.finalise(receipt, reason).await;
                         return;
                     }
@@ -566,8 +591,7 @@ impl Worker {
                 }
                 Err(_elapsed) => {
                     warn!(relay.session.id = %claim.session, "worker.turn.timeout");
-                    self.publish_failure(receipt.ids(), &FailureReason::Timeout)
-                        .await;
+                    self.publish_failure(receipt, &FailureReason::Timeout).await;
                     self.finalise(receipt, FailureReason::Timeout).await;
                     return;
                 }
@@ -585,6 +609,7 @@ impl Worker {
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
+        acting_user_id: crate::auth::UserId,
         cancel: CancellationToken,
         observer: SharedTurnObserver,
         prompts_consumed: bool,
@@ -596,6 +621,7 @@ impl Worker {
                     session,
                     viewer,
                     request_id,
+                    acting_user_id,
                     RequestKindPayload::Normal {},
                     cancel,
                     Some(observer),
@@ -610,6 +636,7 @@ impl Worker {
                     viewer,
                     prompts,
                     request_id,
+                    acting_user_id,
                     RequestKindPayload::Normal {},
                     cancel,
                     Some(observer),
@@ -623,9 +650,11 @@ impl Worker {
         &self,
         claim: &ClaimedSession,
         request_id: PromptRequestId,
+        acting_user_id: crate::auth::UserId,
     ) -> Result<(), super::error::PromptError> {
         self.sessions
-            .append_system_nudge(
+            .append_system_nudge_for_user(
+                acting_user_id,
                 claim.session,
                 Participant::agent(claim.receiver_agent_id),
                 PINGPONG_NUDGE.to_string(),
@@ -686,20 +715,21 @@ impl Worker {
             detail = %reason,
             "worker.turn.error",
         );
-        self.publish_failure(receipt.ids(), &reason).await;
+        self.publish_failure(receipt, &reason).await;
         self.finalise(receipt, reason).await;
     }
 
-    async fn publish_failure(&self, ids: &[PromptRequestId], reason: &FailureReason) {
-        for id in ids {
+    async fn publish_failure(&self, receipt: &ClaimReceipt, reason: &FailureReason) {
+        let user_id = receipt.acting_user_id();
+        for id in receipt.ids() {
             if let Err(e) = self
                 .sink
-                .publish(*id, ResponseChunk::from_failure(reason))
+                .publish_for_user(user_id, *id, ResponseChunk::from_failure(reason))
                 .await
             {
                 warn!(error = %e, "worker.publish.error.error");
             }
-            if let Err(e) = self.sink.close(*id).await {
+            if let Err(e) = self.sink.close_for_user(user_id, *id).await {
                 warn!(error = %e, "worker.sink.close.error");
             }
         }
@@ -725,6 +755,7 @@ impl Worker {
     /// the terminal chunk regardless of which prompt it was published on.
     async fn maybe_emit_quiescence(&self, receipt: &ClaimReceipt) {
         let session = receipt.lease().session();
+        let user_id = receipt.acting_user_id();
         let root = match self.sessions.root_request_id(session).await {
             Ok(r) => r,
             Err(e) => {
@@ -737,7 +768,8 @@ impl Worker {
                 for id in receipt.ids() {
                     if let Err(e) = self
                         .sink
-                        .publish(
+                        .publish_for_user(
+                            user_id,
                             *id,
                             ResponseChunk::Done {
                                 final_text: String::new(),
@@ -750,7 +782,7 @@ impl Worker {
                         debug!(error = %e, relay.request.id = %id, "worker.quiescence.publish.skipped");
                         continue;
                     }
-                    if let Err(e) = self.sink.close(*id).await {
+                    if let Err(e) = self.sink.close_for_user(user_id, *id).await {
                         debug!(error = %e, relay.request.id = %id, "worker.quiescence.close.skipped");
                     }
                 }
@@ -837,8 +869,13 @@ struct FanOutObserver {
 
 impl FanOutObserver {
     async fn fanout(&self, chunk: ResponseChunk) {
+        let user_id = self.receipt.acting_user_id();
         for id in self.receipt.ids() {
-            if let Err(e) = self.sink.publish(*id, chunk.clone()).await {
+            if let Err(e) = self
+                .sink
+                .publish_for_user(user_id, *id, chunk.clone())
+                .await
+            {
                 warn!(error = %e, "fanout.publish.error");
             }
         }

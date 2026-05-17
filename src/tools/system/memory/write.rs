@@ -101,14 +101,17 @@ impl Tool for MemoryWriteTool {
         let outcome = self
             .deps
             .store()
-            .apply(MemoryMutation::Write {
-                agent,
-                kind: parsed.kind,
-                content,
-                state: MemoryState::Tentative,
-                pinned: false,
-                source: MutationSource::Turn(ctx.request_id),
-            })
+            .apply_for_user(
+                ctx.acting_user_id,
+                MemoryMutation::Write {
+                    agent,
+                    kind: parsed.kind,
+                    content,
+                    state: MemoryState::Tentative,
+                    pinned: false,
+                    source: MutationSource::Turn(ctx.request_id),
+                },
+            )
             .await
             .map_err(store_to_tool_err)?;
 

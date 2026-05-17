@@ -7,6 +7,7 @@
 pub mod agent_core;
 pub mod agents;
 pub mod app;
+pub mod auth;
 pub mod cache;
 pub mod clock;
 pub mod config;

@@ -5,24 +5,31 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::auth::{OrgId, UserId};
+
 use super::error::AgentStoreError;
 use super::types::{
     AgentCard, AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt,
-    AllowedMcpServers,
+    AllowedMcpServers, DefaultAgentSeed,
 };
 
 /// Input to [`AgentStore::create`]. Server-side fields (`id`, `created_at`,
 /// `updated_at`) are minted by the store; never carried in.
 #[derive(Debug, Clone)]
 pub struct NewAgent {
+    /// Owning organisation. Set by the HTTP handler from the request
+    /// principal or by tool-driven creators from the caller agent's
+    /// `org_id`; required because `agents.org_id` is `NOT NULL`.
+    pub org_id: OrgId,
     pub name: AgentName,
     pub system_prompt: AgentSystemPrompt,
     /// Operator-curated, model-facing one-sentence blurb. Required at
     /// create time — there is no "empty description" path.
     pub description: AgentDescription,
-    /// When `true`, the new row becomes the default; the previously-default row
-    /// is demoted in the same transaction so the partial unique index is
-    /// satisfied.
+    /// When `true`, the new row becomes the default within `org_id`; the
+    /// previously-default row in the same org is demoted in the same
+    /// transaction so the partial unique index `agents_default_unique`
+    /// stays satisfied.
     pub is_default: bool,
     /// Initial MCP allowlist. Empty for the no-MCP-tools default; the operator
     /// supplies it explicitly when granting access at create time.
@@ -54,6 +61,30 @@ pub trait AgentStore: fmt::Debug + Send + Sync {
     /// Mint a new agent row.
     async fn create(&self, payload: NewAgent) -> Result<AgentRecord, AgentStoreError>;
 
+    /// Tenant-scoped variant of [`Self::create`]. Opens
+    /// `begin_as_user(acting_user_id)` so the `agents` INSERT runs
+    /// RLS-checked — a tool acting on behalf of a foreign-org user
+    /// is rejected at the WITH CHECK boundary. The `create_agent`
+    /// tool sources `acting_user_id` from the claimed session's
+    /// `created_by_user_id`; HTTP and seeder paths keep the
+    /// privileged entry point.
+    async fn create_for_user(
+        &self,
+        acting_user_id: UserId,
+        payload: NewAgent,
+    ) -> Result<AgentRecord, AgentStoreError>;
+
+    /// Idempotent per-org seed: insert `seed` as the default agent for
+    /// `org_id` if no default row exists for that org. Returns the id of
+    /// the resulting default row, whether minted here or already present.
+    /// Called from the OAuth callback on first sign-up so the freshly
+    /// minted personal org has a usable default agent immediately.
+    async fn seed_default(
+        &self,
+        org_id: OrgId,
+        seed: DefaultAgentSeed,
+    ) -> Result<AgentId, AgentStoreError>;
+
     /// Snapshot of every row, ordered by `created_at` ascending.
     async fn list(&self) -> Result<Vec<AgentRecord>, AgentStoreError>;
 
@@ -71,28 +102,41 @@ pub trait AgentStore: fmt::Debug + Send + Sync {
     /// (returns [`AgentStoreError::DefaultDeletionForbidden`]).
     async fn delete(&self, id: AgentId) -> Result<(), AgentStoreError>;
 
-    /// Id of the row whose `is_default` flag is `TRUE`.
-    async fn default_id(&self) -> Result<AgentId, AgentStoreError>;
+    /// Id of the row flagged `is_default = TRUE` within `org_id`. Each
+    /// org has exactly one default agent (enforced by the
+    /// `agents_default_unique` partial unique index on
+    /// `(org_id) WHERE is_default`), seeded when the org is created.
+    async fn default_id_for(&self, org_id: OrgId) -> Result<AgentId, AgentStoreError>;
 
-    /// Case-insensitive lookup by [`AgentName`]. Returns the matching
-    /// record on success; [`AgentStoreError::NameNotFound`] when no row
+    /// Case-insensitive lookup by [`AgentName`] scoped to the viewer
+    /// agent's org. Returns the matching record on success;
+    /// [`AgentStoreError::NameNotFound`] when no row in the same org
     /// matches. Powers the model-facing addressing surfaces — the
     /// `send_message` tool resolves `{kind:"agent", name:<role>}` through
     /// here.
-    async fn read_by_name(&self, name: &AgentName) -> Result<AgentRecord, AgentStoreError>;
+    async fn read_by_name_for_viewer(
+        &self,
+        viewer: AgentId,
+        name: &AgentName,
+    ) -> Result<AgentRecord, AgentStoreError>;
 
-    /// Snapshot of every row's `(id, name)` pair, ordered alphabetically
-    /// by `lower(name)`. Used to render the `<agents>` block; the renderer
-    /// excludes the caller before formatting. Distinct from [`Self::list`]
-    /// so the caller can skip hydrating columns it does not need.
-    async fn list_names(&self) -> Result<Vec<(AgentId, AgentName)>, AgentStoreError>;
+    /// Snapshot of every `(id, name)` pair in `viewer`'s org, ordered
+    /// alphabetically by `lower(name)`. Used to render the `<agents>`
+    /// block; the renderer excludes the caller before formatting.
+    /// Distinct from [`Self::list`] so the caller can skip hydrating
+    /// columns it does not need.
+    async fn list_names_for_viewer(
+        &self,
+        viewer: AgentId,
+    ) -> Result<Vec<(AgentId, AgentName)>, AgentStoreError>;
 
-    /// Top-K cosine-similarity search over agents' description embeddings.
-    /// Returns slim cards sorted by descending similarity, capped at `k`,
-    /// with `viewer` excluded at the SQL boundary so the caller never
-    /// pays decode cost for the self row. Rows whose embedding is null
-    /// (not yet backfilled) are skipped — the caller treats an empty
-    /// result as a degraded layer rather than an error.
+    /// Top-K cosine-similarity search over agents' description
+    /// embeddings, restricted to rows in the viewer's org. Returns slim
+    /// cards sorted by descending similarity, capped at `k`, with
+    /// `viewer` excluded at the SQL boundary so the caller never pays
+    /// decode cost for the self row. Rows whose embedding is null (not
+    /// yet backfilled) are skipped — the caller treats an empty result
+    /// as a degraded layer rather than an error.
     async fn search_by_description(
         &self,
         embedding: &[f32],

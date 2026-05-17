@@ -147,7 +147,12 @@ impl Tool for RecallTool {
         // Reading does NOT advance validation (doc/memory.md §1.7) — only
         // the access counter and last_accessed_at update.
         let ids: Vec<MemoryId> = results.iter().map(|s| s.row.id).collect();
-        if let Err(e) = self.deps.store().record_access(&ids).await {
+        if let Err(e) = self
+            .deps
+            .store()
+            .record_access_for_user(ctx.acting_user_id, &ids)
+            .await
+        {
             warn!(error = %e, "recall.record_access.error");
         }
 

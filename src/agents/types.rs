@@ -10,6 +10,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::auth::OrgId;
 use crate::mcp::McpServerId;
 use crate::types::ParseError;
 
@@ -243,6 +244,10 @@ pub struct AgentCard {
 #[derive(Debug, Clone)]
 pub struct AgentRecord {
     pub id: AgentId,
+    /// Owning organisation. Set at insert time from the request principal
+    /// (HTTP create) or the calling agent's org (tool-driven create);
+    /// required because `agents.org_id` is `NOT NULL`.
+    pub org_id: OrgId,
     pub name: AgentName,
     pub system_prompt: AgentSystemPrompt,
     pub description: AgentDescription,

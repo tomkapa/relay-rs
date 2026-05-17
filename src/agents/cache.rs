@@ -55,39 +55,43 @@ impl AgentPromptCache {
     }
 }
 
-/// Bounded TTL cache for the global agent name index.
+/// Bounded TTL cache for the per-viewer agent name index.
 ///
 /// Caches the `(id, name)` pairs that feed the `<agents>` block on every
-/// turn. Single-slot (`cap = 1`) because the snapshot is global, not
-/// keyed; same TTL as [`AgentPromptCache`] so an admin's rename / create
-/// / delete becomes visible to live workers within the same window.
-/// Cheap-clone — the inner `Arc<[..]>` makes the hot-path clone two
-/// atomic increments, not a per-element copy.
+/// turn. Keyed by the viewer [`AgentId`] because the listing is scoped
+/// to the viewer's org under multi-tenancy — two agents in different orgs
+/// see different snapshots. Same TTL as [`AgentPromptCache`] so an
+/// admin's rename / create / delete becomes visible to live workers
+/// within the same window. Cheap-clone — the inner `Arc<[..]>` makes the
+/// hot-path clone two atomic increments, not a per-element copy.
 #[derive(Debug, Clone)]
 pub struct AgentNamesCache {
-    inner: BoundedTtlCache<(), Arc<[(AgentId, AgentName)]>>,
+    inner: BoundedTtlCache<AgentId, Arc<[(AgentId, AgentName)]>>,
 }
 
 impl AgentNamesCache {
     /// `ttl` should match [`AgentPromptCache`]'s TTL so the two surfaces
-    /// share a single liveness window.
+    /// share a single liveness window. `cap` matches [`AgentPromptCache`]
+    /// for the same reason — each cached agent has at most one name
+    /// snapshot, so the two caches grow in lockstep.
     #[must_use]
-    pub fn new(ttl: Duration, clock: SharedClock) -> Self {
+    pub fn new(cap: usize, ttl: Duration, clock: SharedClock) -> Self {
         Self {
-            inner: BoundedTtlCache::new(1, ttl, clock, "AgentNamesCache"),
+            inner: BoundedTtlCache::new(cap, ttl, clock, "AgentNamesCache"),
         }
     }
 
-    /// Return the cached name index, refreshing from `store` on miss or
-    /// expiry. The lock is released before the store call so a slow
-    /// database does not block other workers.
+    /// Return the cached name index for `viewer`, refreshing from
+    /// `store` on miss or expiry. The lock is released before the store
+    /// call so a slow database does not block other workers.
     pub async fn get_or_load(
         &self,
+        viewer: AgentId,
         store: &SharedAgentStore,
     ) -> Result<Arc<[(AgentId, AgentName)]>, AgentStoreError> {
         self.inner
-            .get_or_load((), || async move {
-                let names = store.list_names().await?;
+            .get_or_load(viewer, || async move {
+                let names = store.list_names_for_viewer(viewer).await?;
                 Ok::<_, AgentStoreError>(Arc::from(names))
             })
             .await

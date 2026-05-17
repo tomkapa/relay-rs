@@ -28,13 +28,20 @@ struct Fixture {
     agents: SharedAgentStore,
     ctx: ToolCallContext,
     viewer_agent_id: relay_rs::agents::AgentId,
+    org_id: relay_rs::auth::OrgId,
 }
 
 async fn fixture(db: &TestDb) -> Fixture {
     let agents = shared_agent_store(db.pool.clone(), SystemClock::shared());
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), SystemClock::shared()));
-    let session = human_to_agent_session(sessions.as_ref(), db.default_agent_id).await;
+    let session = human_to_agent_session(
+        sessions.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let request_id = PromptRequestId::new();
     let ctx = ToolCallContext {
         session_id: session,
@@ -42,12 +49,14 @@ async fn fixture(db: &TestDb) -> Fixture {
         root_request_id: request_id,
         request_id,
         kind_payload: RequestKindPayload::Normal {},
+        acting_user_id: db.default_user_id,
     };
     Fixture {
         tool: CreateAgentTool::new(agents.clone()),
         agents,
         ctx,
         viewer_agent_id: db.default_agent_id,
+        org_id: db.default_org_id,
     }
 }
 
@@ -58,6 +67,7 @@ fn human_ctx(f: &Fixture) -> ToolCallContext {
         root_request_id: f.ctx.root_request_id,
         request_id: f.ctx.request_id,
         kind_payload: RequestKindPayload::Normal {},
+        acting_user_id: f.ctx.acting_user_id,
     }
 }
 
@@ -87,7 +97,11 @@ async fn happy_path_persists_record_with_is_default_false_and_empty_mcp() {
     let parsed_id: Uuid = agent_id_str.parse().expect("agent_id is uuid");
 
     let name = AgentName::try_from("translator").expect("name");
-    let record = f.agents.read_by_name(&name).await.expect("read");
+    let record = f
+        .agents
+        .read_by_name_for_viewer(f.viewer_agent_id, &name)
+        .await
+        .expect("read");
     assert_eq!(record.id.as_uuid(), parsed_id);
     assert!(!record.is_default);
     assert_eq!(record.allowed_mcp_servers, AllowedMcpServers::empty());
@@ -120,7 +134,11 @@ async fn allowlist_round_trips_on_persisted_record() {
     let agent_uuid: Uuid = agent_id_str.parse().expect("uuid");
 
     let name = AgentName::try_from("ops").expect("name");
-    let record = f.agents.read_by_name(&name).await.expect("read");
+    let record = f
+        .agents
+        .read_by_name_for_viewer(f.viewer_agent_id, &name)
+        .await
+        .expect("read");
     assert_eq!(record.id.as_uuid(), agent_uuid);
     assert_eq!(record.allowed_mcp_servers.len(), 2);
     assert!(record.allowed_mcp_servers.contains(server_a));
@@ -252,7 +270,16 @@ async fn is_default_is_rejected_by_schema() {
         ToolError::InvalidInput(_) | ToolError::Json(_)
     ));
     let name = AgentName::try_from("usurper").expect("name");
-    assert!(f.agents.read_by_name(&name).await.is_err());
-    let default = f.agents.default_id().await.expect("default present");
+    assert!(
+        f.agents
+            .read_by_name_for_viewer(f.viewer_agent_id, &name)
+            .await
+            .is_err()
+    );
+    let default = f
+        .agents
+        .default_id_for(f.org_id)
+        .await
+        .expect("default present");
     assert_eq!(default, f.viewer_agent_id);
 }

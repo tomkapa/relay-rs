@@ -27,6 +27,8 @@ fn queue(db: &TestDb) -> Arc<PgPromptQueue> {
 async fn enqueue_root(
     q: &Arc<PgPromptQueue>,
     agent_id: relay_rs::agents::AgentId,
+    org_id: relay_rs::auth::OrgId,
+    user_id: relay_rs::auth::UserId,
 ) -> PromptRequestId {
     q.enqueue(NewPromptRequest {
         session: None,
@@ -36,6 +38,8 @@ async fn enqueue_root(
         content: Prompt::try_from("hi").expect("prompt"),
         idempotency_key: IdempotencyKey::try_from(format!("k-{}", uuid::Uuid::new_v4()))
             .expect("key"),
+        org_id,
+        created_by_user_id: user_id,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     })
     .await
@@ -48,7 +52,13 @@ async fn pending_row_keeps_dag_live() {
     let db = TestDb::fresh().await;
     let q = queue(&db);
     let dag = PgDagBudget::new(db.pool.clone());
-    let root = enqueue_root(&q, db.default_agent_id).await;
+    let root = enqueue_root(
+        &q,
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
 
     assert!(
         !dag.quiescent(root).await.expect("query"),
@@ -61,7 +71,13 @@ async fn processing_row_keeps_dag_live() {
     let db = TestDb::fresh().await;
     let q = queue(&db);
     let dag = PgDagBudget::new(db.pool.clone());
-    let root = enqueue_root(&q, db.default_agent_id).await;
+    let root = enqueue_root(
+        &q,
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     // Claim moves the row from pending → processing without finishing it.
     let _ = q
         .claim_next_session(WorkerId::new())
@@ -79,7 +95,13 @@ async fn done_row_drains_dag() {
     let db = TestDb::fresh().await;
     let q = queue(&db);
     let dag = PgDagBudget::new(db.pool.clone());
-    let root = enqueue_root(&q, db.default_agent_id).await;
+    let root = enqueue_root(
+        &q,
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let claim = q
         .claim_next_session(WorkerId::new())
         .await
@@ -111,7 +133,13 @@ async fn second_pending_row_still_blocks_quiescence() {
     let db = TestDb::fresh().await;
     let q = queue(&db);
     let dag = PgDagBudget::new(db.pool.clone());
-    let root = enqueue_root(&q, db.default_agent_id).await;
+    let root = enqueue_root(
+        &q,
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
 
     // Claim & mark done the first row.
     let claim = q
@@ -130,6 +158,8 @@ async fn second_pending_row_still_blocks_quiescence() {
         parent_session: None,
         content: Prompt::try_from("again").expect("prompt"),
         idempotency_key: IdempotencyKey::try_from("second").expect("key"),
+        org_id: db.default_org_id,
+        created_by_user_id: db.default_user_id,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     })
     .await

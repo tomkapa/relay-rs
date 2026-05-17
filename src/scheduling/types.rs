@@ -13,6 +13,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId};
 use crate::runtime::PromptRequestId;
 use crate::types::{PROMPT_MAX_BYTES, ParseError};
 
@@ -567,10 +568,17 @@ crate::str_enum! {
 }
 
 /// Materialised view of one `scheduled_tasks` row.
+///
+/// `org_id` + `created_by_user_id` are the tenancy projection added by
+/// migration 19. The scheduler reads them off the row at fire-time and
+/// pins the enqueued `prompt_requests` row to the same tenant; no
+/// downstream JOIN through `agents`/`org_members` is needed.
 #[derive(Clone, Debug)]
 pub struct ScheduledTaskRecord {
     pub id: ScheduledTaskId,
     pub owner_agent_id: AgentId,
+    pub org_id: OrgId,
+    pub created_by_user_id: UserId,
     pub name: ScheduledTaskName,
     pub prompt: ScheduledPrompt,
     pub schedule: ScheduleSpec,

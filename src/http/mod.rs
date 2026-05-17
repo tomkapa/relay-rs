@@ -1,6 +1,7 @@
 //! HTTP surface (axum). Tower's `TraceLayer` opens a root span per request per
 //! CLAUDE.md §2; handlers stay thin and call into `prompt::*` traits.
 
+mod auth_layer;
 mod error;
 mod routes;
 mod state;
