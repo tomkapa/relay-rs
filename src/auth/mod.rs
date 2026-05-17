@@ -5,7 +5,8 @@
 //! - Google OAuth wrapper ([`GoogleOAuth`]).
 //! - Store contract over `users`, `organizations`, `org_members`,
 //!   `user_identities`, `oauth_login_states` ([`UserStore`]).
-//! - Tenant-context helpers ([`begin_as`], [`begin_privileged`], [`TxScope`]).
+//! - Tenant-context helpers ([`TenantTx`], [`PrivilegedTx`], [`run_as_user`],
+//!   [`run_privileged`]).
 
 mod error;
 mod jwt;
@@ -27,7 +28,97 @@ pub use types::{
     Principal, Role, User, UserId,
 };
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+
+/// Tenant-scoped transaction.
+///
+/// The wrapper is the proof that `SET LOCAL app.user_id` ran and that we
+/// dropped to the non-super `relay_app` role, so RLS policies on every
+/// domain table fire as expected. The only way to mint one is
+/// [`run_as_user`].
+#[derive(Debug)]
+pub struct TenantTx<'a> {
+    inner: Transaction<'a, Postgres>,
+    user: UserId,
+}
+
+impl<'a> TenantTx<'a> {
+    fn new(inner: Transaction<'a, Postgres>, user: UserId) -> Self {
+        Self { inner, user }
+    }
+
+    /// The user id pinned into `app.user_id` for this transaction.
+    /// Stores reach for it when stamping audit columns
+    /// (`created_by_user_id`, `acting_user_id`) so the value can't
+    /// disagree with the GUC RLS reads.
+    #[must_use]
+    pub fn acting_user(&self) -> UserId {
+        self.user
+    }
+
+    async fn commit(self) -> Result<(), sqlx::Error> {
+        self.inner.commit().await
+    }
+
+    async fn rollback(self) -> Result<(), sqlx::Error> {
+        self.inner.rollback().await
+    }
+}
+
+/// `Deref` targets `PgConnection` (not `Transaction`) so the
+/// `&mut **tx` idiom used everywhere with `&mut Transaction` parameters
+/// keeps working unchanged when the parameter type becomes
+/// `&mut TenantTx<'_>`. The runner owns commit/rollback, so users have
+/// no business reaching for the underlying `Transaction`.
+impl std::ops::Deref for TenantTx<'_> {
+    type Target = PgConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for TenantTx<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+/// Privileged transaction. RLS is bypassed via `SET LOCAL row_security = off`.
+///
+/// Use only for infrastructure paths (queue claim, scheduler scans, worker
+/// fan-out) where the tenant context cannot be derived from a single
+/// principal. The only way to mint one is [`run_privileged`].
+#[derive(Debug)]
+pub struct PrivilegedTx<'a> {
+    inner: Transaction<'a, Postgres>,
+}
+
+impl<'a> PrivilegedTx<'a> {
+    fn new(inner: Transaction<'a, Postgres>) -> Self {
+        Self { inner }
+    }
+
+    async fn commit(self) -> Result<(), sqlx::Error> {
+        self.inner.commit().await
+    }
+
+    async fn rollback(self) -> Result<(), sqlx::Error> {
+        self.inner.rollback().await
+    }
+}
+
+impl std::ops::Deref for PrivilegedTx<'_> {
+    type Target = PgConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for PrivilegedTx<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 
 /// Open a transaction with `app.user_id` set to the principal's user id.
 ///
@@ -38,23 +129,6 @@ use sqlx::{PgPool, Postgres, Transaction};
 /// check membership through `app_user_is_member(row.org_id)`, so
 /// subsequent queries automatically filter to rows the principal can
 /// see.
-#[allow(clippy::elidable_lifetime_names)]
-pub async fn begin_as<'a>(
-    pool: &'a PgPool,
-    principal: &Principal,
-) -> Result<Transaction<'a, Postgres>, AuthError> {
-    begin_as_user(pool, principal.user_id)
-        .await
-        .map_err(AuthError::from)
-}
-
-/// Like [`begin_as`] but for worker-side code paths where the principal
-/// is derived from a row (e.g. `sessions.created_by_user_id`) rather
-/// than a request cookie.
-///
-/// Returns `sqlx::Error` (not `AuthError`) so every subsystem's error
-/// enum can absorb it via its existing `Db(#[from] sqlx::Error)` variant.
-/// Every inner failure here is a Postgres error.
 #[allow(clippy::elidable_lifetime_names)]
 pub async fn begin_as_user<'a>(
     pool: &'a PgPool,
@@ -91,29 +165,78 @@ pub async fn begin_privileged(pool: &PgPool) -> Result<Transaction<'_, Postgres>
     Ok(tx)
 }
 
-/// Tenant-context discriminator shared by every domain store.
+/// Run `f` inside a tenant-scoped transaction.
 ///
-/// `Privileged` opens a [`begin_privileged`] tx for cross-tenant
-/// infrastructure paths (queue claim, scheduler scans); `AsUser` opens
-/// a [`begin_as_user`] tx pinned to the acting principal so RLS WITH
-/// CHECK fires on writes. Used by `memory`, `agents`, `session`,
-/// `mcp`, `runtime`, and `scheduling` stores.
-#[derive(Debug, Clone, Copy)]
-pub enum TxScope {
-    Privileged,
-    AsUser(UserId),
-}
-
-impl TxScope {
-    /// Open the appropriate transaction for this scope. Returns
-    /// `sqlx::Error` so any module error enum carrying
-    /// `Db(#[from] sqlx::Error)` absorbs failures via `?`.
-    pub async fn begin(self, pool: &PgPool) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
-        match self {
-            Self::Privileged => begin_privileged(pool).await,
-            Self::AsUser(user_id) => begin_as_user(pool, user_id).await,
+/// The closure receives a `&mut TenantTx<'_>`; the runner opens the tx
+/// (with `SET LOCAL app.user_id` + `SET LOCAL ROLE relay_app`), invokes
+/// `f`, and commits on `Ok` or rolls back on `Err`. `.commit()` does not
+/// exist at call sites.
+///
+/// The `E: From<sqlx::Error>` bound lets every subsystem error enum's
+/// existing `Db(#[from] sqlx::Error)` variant absorb the commit /
+/// rollback failure via `?`.
+pub async fn run_as_user<T, E>(
+    pool: &PgPool,
+    user_id: UserId,
+    f: impl AsyncFnOnce(&mut TenantTx<'_>) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<sqlx::Error>,
+{
+    let raw = begin_as_user(pool, user_id).await.map_err(E::from)?;
+    let mut tx = TenantTx::new(raw, user_id);
+    match f(&mut tx).await {
+        Ok(value) => {
+            tx.commit().await.map_err(E::from)?;
+            Ok(value)
+        }
+        Err(err) => {
+            // Best-effort rollback; sqlx also rolls back on drop, but
+            // an explicit call gives the failure a span and surfaces a
+            // secondary error (rare; we still propagate the original).
+            let _ = tx.rollback().await;
+            Err(err)
         }
     }
+}
+
+/// Run `f` inside a privileged (RLS-bypassing) transaction. Same
+/// commit/rollback contract as [`run_as_user`].
+pub async fn run_privileged<T, E>(
+    pool: &PgPool,
+    f: impl AsyncFnOnce(&mut PrivilegedTx<'_>) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<sqlx::Error>,
+{
+    let raw = begin_privileged(pool).await.map_err(E::from)?;
+    let mut tx = PrivilegedTx::new(raw);
+    match f(&mut tx).await {
+        Ok(value) => {
+            tx.commit().await.map_err(E::from)?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    }
+}
+
+/// Open a tenant-scoped transaction for the given principal.
+///
+/// Kept as a building block for the rare caller that needs an
+/// externally-managed transaction lifecycle — prefer [`run_as_user`]
+/// which owns commit/rollback. See [`begin_as_user`] for the
+/// worker-side variant that takes a `UserId` directly.
+#[allow(clippy::elidable_lifetime_names)]
+pub async fn begin_as<'a>(
+    pool: &'a PgPool,
+    principal: &Principal,
+) -> Result<Transaction<'a, Postgres>, AuthError> {
+    begin_as_user(pool, principal.user_id)
+        .await
+        .map_err(AuthError::from)
 }
 
 /// `(user_id, org_id)` pair carried by tool / worker code paths.
@@ -160,8 +283,8 @@ impl VisibilityTable {
 /// Tenant-visibility probe shared by the HTTP routes.
 ///
 /// Routes that delegate to a privileged-tx store must first 404
-/// cross-org / unknown ids without leaking existence. Opens a
-/// `begin_as` tx so RLS filters to rows the principal can see, runs
+/// cross-org / unknown ids without leaking existence. Opens a tenant
+/// tx so RLS filters to rows the principal can see, runs
 /// `SELECT EXISTS(SELECT 1 FROM <table> WHERE id = $1)`, commits, and
 /// returns the boolean.
 pub async fn visible_to(
@@ -170,15 +293,16 @@ pub async fn visible_to(
     table: VisibilityTable,
     id: uuid::Uuid,
 ) -> Result<bool, AuthError> {
-    let mut tx = begin_as(pool, principal).await?;
-    let sql = format!(
-        "SELECT EXISTS(SELECT 1 FROM {} WHERE id = $1)",
-        table.table()
-    );
-    let exists: bool = sqlx::query_scalar(&sql)
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(exists)
+    run_as_user(pool, principal.user_id, async |tx| {
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE id = $1)",
+            table.table()
+        );
+        let exists: bool = sqlx::query_scalar(&sql)
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+        Ok::<bool, AuthError>(exists)
+    })
+    .await
 }

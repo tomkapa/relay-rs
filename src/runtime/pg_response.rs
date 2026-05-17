@@ -26,7 +26,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::warn;
 
-use crate::auth::TxScope;
+use crate::auth::{run_as_user, run_privileged};
 use crate::clock::SharedClock;
 
 use super::error::ResponseError;
@@ -203,7 +203,11 @@ impl ResponseSink for PgResponseHub {
         request_id: PromptRequestId,
         chunk: ResponseChunk,
     ) -> Result<ChunkSeq, ResponseError> {
-        publish_impl(self, TxScope::Privileged, request_id, chunk).await
+        let persisted = run_privileged(&self.pool, async |tx| {
+            publish_in_tx(self, tx, request_id, chunk).await
+        })
+        .await?;
+        self.fanout_after_commit(request_id, persisted)
     }
 
     async fn publish_for_user(
@@ -212,11 +216,17 @@ impl ResponseSink for PgResponseHub {
         request_id: PromptRequestId,
         chunk: ResponseChunk,
     ) -> Result<ChunkSeq, ResponseError> {
-        publish_impl(self, TxScope::AsUser(acting_user_id), request_id, chunk).await
+        let persisted = run_as_user(&self.pool, acting_user_id, async |tx| {
+            publish_in_tx(self, tx, request_id, chunk).await
+        })
+        .await?;
+        self.fanout_after_commit(request_id, persisted)
     }
 
     async fn close(&self, request_id: PromptRequestId) -> Result<(), ResponseError> {
-        close_impl(self, TxScope::Privileged, request_id).await
+        run_privileged(&self.pool, async |tx| close_in_tx(tx, request_id).await).await?;
+        self.mark_closed(request_id);
+        Ok(())
     }
 
     async fn close_for_user(
@@ -224,7 +234,35 @@ impl ResponseSink for PgResponseHub {
         acting_user_id: crate::auth::UserId,
         request_id: PromptRequestId,
     ) -> Result<(), ResponseError> {
-        close_impl(self, TxScope::AsUser(acting_user_id), request_id).await
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            close_in_tx(tx, request_id).await
+        })
+        .await?;
+        self.mark_closed(request_id);
+        Ok(())
+    }
+}
+
+/// Side effects produced inside the publish tx and fanned out *after*
+/// the runner commits. Subscribers must never observe a chunk whose
+/// row isn't yet visible.
+struct PersistedChunk {
+    seq: ChunkSeq,
+    envelope: ResponseChunkEnvelope,
+    terminal: bool,
+}
+
+impl PgResponseHub {
+    fn fanout_after_commit(
+        &self,
+        request_id: PromptRequestId,
+        persisted: PersistedChunk,
+    ) -> Result<ChunkSeq, ResponseError> {
+        let sender = self.publish_sender(request_id, persisted.terminal)?;
+        // `send` returns Err only when there are no receivers — fine,
+        // late subscribers replay from the chunks table.
+        let _ = sender.send(persisted.envelope);
+        Ok(persisted.seq)
     }
 }
 
@@ -262,12 +300,12 @@ const PUBLISH_CTE_SQL: &str = "WITH req AS (
  )
  SELECT bumped.next_seq FROM bumped, notify";
 
-async fn publish_impl(
+async fn publish_in_tx(
     hub: &PgResponseHub,
-    scope: TxScope,
+    tx: &mut sqlx::PgConnection,
     request_id: PromptRequestId,
     chunk: ResponseChunk,
-) -> Result<ChunkSeq, ResponseError> {
+) -> Result<PersistedChunk, ResponseError> {
     let now = hub.now();
     let terminal = chunk.is_terminal();
     let payload = serde_json::to_value(&chunk)
@@ -277,7 +315,6 @@ async fn publish_impl(
         .min(usize::try_from(i32::MAX).expect("invariant: i32::MAX fits in usize"));
     let bytes = i32::try_from(weight_capped).expect("invariant: weight clamped to i32 range");
 
-    let mut tx = scope.begin(&hub.pool).await?;
     let row: Option<(ChunkSeq,)> = sqlx::query_as(PUBLISH_CTE_SQL)
         .bind(request_id)
         .bind(terminal)
@@ -292,36 +329,28 @@ async fn publish_impl(
             "publish: request {request_id} has no prompt_requests row"
         ))
     })?;
-    let assigned = next_seq
+    let seq = next_seq
         .get()
         .checked_sub(1)
         .map(ChunkSeq::from)
         .expect("invariant: post-bump next_seq is at least 1");
-    tx.commit().await?;
 
-    // After DB commit, broadcast to live subscribers. Send returns Err only when
-    // there are no receivers — fine, late subscribers replay from the chunks
-    // table.
-    let envelope = ResponseChunkEnvelope {
-        seq: assigned,
-        chunk,
-    };
-    let sender = hub.publish_sender(request_id, terminal)?;
-    let _ = sender.send(envelope);
-
-    Ok(assigned)
+    Ok(PersistedChunk {
+        seq,
+        envelope: ResponseChunkEnvelope { seq, chunk },
+        terminal,
+    })
 }
 
-async fn close_impl(
-    hub: &PgResponseHub,
-    scope: TxScope,
+/// One round-trip: read `org_id` from the parent request and upsert
+/// the closed flag in a single CTE. If `req` resolves to zero rows
+/// (synthetic test id) the INSERT does nothing — benign, matches
+/// the prior explicit None branch. The hub-side `mark_closed` runs
+/// after the runner commits.
+async fn close_in_tx(
+    tx: &mut sqlx::PgConnection,
     request_id: PromptRequestId,
 ) -> Result<(), ResponseError> {
-    let mut tx = scope.begin(&hub.pool).await?;
-    // One round-trip: read `org_id` from the parent request and upsert
-    // the closed flag in a single CTE. If `req` resolves to zero rows
-    // (synthetic test id) the INSERT does nothing — benign, matches
-    // the prior explicit None branch.
     sqlx::query(
         "WITH req AS (SELECT id, org_id FROM prompt_requests WHERE id = $1)
          INSERT INTO prompt_response_streams (request_id, org_id, next_seq, closed)
@@ -331,8 +360,6 @@ async fn close_impl(
     .bind(request_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    hub.mark_closed(request_id);
     Ok(())
 }
 

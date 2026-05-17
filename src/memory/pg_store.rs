@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use crate::agents::AgentId;
-use crate::auth::{TxScope, UserId};
+use crate::auth::{UserId, run_as_user, run_privileged};
 use crate::clock::SharedClock;
 use crate::pg_vector;
 use crate::provider::SharedEmbeddingProvider;
@@ -82,7 +82,11 @@ impl fmt::Debug for PgMemoryStore {
 #[allow(clippy::too_many_lines)] // exhaustive dispatch on a 3-arm enum
 impl MemoryStore for PgMemoryStore {
     async fn apply(&self, mutation: MemoryMutation) -> Result<MutationOutcome, MemoryStoreError> {
-        apply_impl(self, TxScope::Privileged, mutation).await
+        let embedding = embed_for_mutation(self, &mutation).await?;
+        run_privileged(&self.pool, async |tx| {
+            apply_in_tx(self, tx, mutation, embedding).await
+        })
+        .await
     }
 
     async fn apply_for_user(
@@ -90,7 +94,11 @@ impl MemoryStore for PgMemoryStore {
         acting_user_id: UserId,
         mutation: MemoryMutation,
     ) -> Result<MutationOutcome, MemoryStoreError> {
-        apply_impl(self, TxScope::AsUser(acting_user_id), mutation).await
+        let embedding = embed_for_mutation(self, &mutation).await?;
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            apply_in_tx(self, tx, mutation, embedding).await
+        })
+        .await
     }
 
     async fn record_validation_for_user(
@@ -101,14 +109,9 @@ impl MemoryStore for PgMemoryStore {
         origin: ValidationOrigin,
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError> {
-        record_validation_impl(
-            self,
-            TxScope::AsUser(acting_user_id),
-            agent,
-            memory,
-            origin,
-            detail,
-        )
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            record_validation_in_tx(self, tx, agent, memory, origin, detail).await
+        })
         .await
     }
 
@@ -118,7 +121,10 @@ impl MemoryStore for PgMemoryStore {
         id: ContradictionEventId,
         outcome: ResolutionOutcome,
     ) -> Result<(), MemoryStoreError> {
-        resolve_contradiction_impl(self, TxScope::AsUser(acting_user_id), id, outcome).await
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            resolve_contradiction_in_tx(self, tx, id, outcome).await
+        })
+        .await
     }
 
     async fn record_access_for_user(
@@ -126,7 +132,10 @@ impl MemoryStore for PgMemoryStore {
         acting_user_id: UserId,
         ids: &[MemoryId],
     ) -> Result<(), MemoryStoreError> {
-        record_access_impl(self, TxScope::AsUser(acting_user_id), ids).await
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            record_access_in_tx(self, tx, ids).await
+        })
+        .await
     }
 
     async fn list(&self, agent: AgentId) -> Result<Vec<MemoryRow>, MemoryStoreError> {
@@ -484,7 +493,10 @@ impl MemoryStore for PgMemoryStore {
         origin: ValidationOrigin,
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError> {
-        record_validation_impl(self, TxScope::Privileged, agent, memory, origin, detail).await
+        run_privileged(&self.pool, async |tx| {
+            record_validation_in_tx(self, tx, agent, memory, origin, detail).await
+        })
+        .await
     }
 
     async fn record_contradiction(
@@ -595,7 +607,10 @@ impl MemoryStore for PgMemoryStore {
         id: ContradictionEventId,
         outcome: ResolutionOutcome,
     ) -> Result<(), MemoryStoreError> {
-        resolve_contradiction_impl(self, TxScope::Privileged, id, outcome).await
+        run_privileged(&self.pool, async |tx| {
+            resolve_contradiction_in_tx(self, tx, id, outcome).await
+        })
+        .await
     }
 
     async fn evict_overflow(
@@ -761,13 +776,16 @@ impl MemoryStore for PgMemoryStore {
     }
 
     async fn record_access(&self, ids: &[MemoryId]) -> Result<(), MemoryStoreError> {
-        record_access_impl(self, TxScope::Privileged, ids).await
+        run_privileged(&self.pool, async |tx| {
+            record_access_in_tx(self, tx, ids).await
+        })
+        .await
     }
 }
 
 /// Load the `memory_events` row to be reverted, gated by `(id, agent_id)`.
 async fn load_event(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     event: MemoryEventId,
 ) -> Result<MemoryEvent, MemoryStoreError> {
@@ -777,7 +795,7 @@ async fn load_event(
     let row = sqlx::query(&sql)
         .bind(event)
         .bind(agent)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *tx)
         .await?;
     row.map_or_else(
         || Err(MemoryStoreError::EventNotFound { id: event }),
@@ -788,7 +806,7 @@ async fn load_event(
 /// Inverse of a `Write` event: forget the materialised row and journal
 /// the deletion (with the now-current content captured as `before`).
 async fn revert_write(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     target: MemoryId,
     inverse_event: MemoryEventId,
@@ -810,7 +828,7 @@ async fn revert_write(
     .await?;
     sqlx::query("DELETE FROM agent_memories WHERE id = $1")
         .bind(target)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     Ok(())
 }
@@ -820,7 +838,7 @@ async fn revert_write(
 /// content.
 #[allow(clippy::too_many_arguments)]
 async fn revert_update(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     target: MemoryId,
     inverse_event: MemoryEventId,
@@ -853,7 +871,7 @@ async fn revert_update(
         .bind(state)
         .bind(pinned)
         .bind(target)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     Ok(())
 }
@@ -862,7 +880,7 @@ async fn revert_update(
 /// lifecycle attrs, write a fresh `agent_memories` row with the prior
 /// `before` content, and journal a `Write` event marking the restore.
 async fn revert_forget(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     target: MemoryId,
     inverse_event: MemoryEventId,
@@ -909,7 +927,7 @@ async fn revert_forget(
     .bind(attrs.state)
     .bind(attrs.pinned)
     .bind(now)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     Ok(())
 }
@@ -917,24 +935,28 @@ async fn revert_forget(
 /// Body of `apply` / `apply_for_user`. Opens the tx via `scope` so the
 /// journal + materialized writes run privileged (librarian sweeps) or
 /// RLS-checked (worker / tool mutations).
-async fn apply_impl(
+/// Embed the mutation content. Runs before any `run_*` runner so the
+/// network call doesn't hold row locks. `Forget` touches no content so
+/// it returns `None`.
+async fn embed_for_mutation(
     store: &PgMemoryStore,
-    scope: TxScope,
-    mutation: MemoryMutation,
-) -> Result<MutationOutcome, MemoryStoreError> {
-    // Embed BEFORE opening the transaction — embedding can be slow,
-    // and we don't want to hold locks across a network call. `Forget`
-    // touches no content so it skips the call.
-    let embedding: Option<Vec<f32>> = match &mutation {
+    mutation: &MemoryMutation,
+) -> Result<Option<Vec<f32>>, MemoryStoreError> {
+    match mutation {
         MemoryMutation::Write { content, .. } | MemoryMutation::Update { content, .. } => {
-            Some(store.embed(content.as_str()).await?)
+            Ok(Some(store.embed(content.as_str()).await?))
         }
-        MemoryMutation::Forget { .. } => None,
-    };
+        MemoryMutation::Forget { .. } => Ok(None),
+    }
+}
 
+async fn apply_in_tx(
+    store: &PgMemoryStore,
+    tx: &mut sqlx::PgConnection,
+    mutation: MemoryMutation,
+    embedding: Option<Vec<f32>>,
+) -> Result<MutationOutcome, MemoryStoreError> {
     let now = store.now();
-    let mut tx = scope.begin(&store.pool).await?;
-
     let outcome = match mutation {
         MemoryMutation::Write {
             agent,
@@ -946,7 +968,7 @@ async fn apply_impl(
         } => {
             let embedding = embedding.expect("invariant: Write produced an embedding above");
             apply_write(
-                &mut tx, agent, kind, content, state, pinned, source, embedding, now,
+                tx, agent, kind, content, state, pinned, source, embedding, now,
             )
             .await?
         }
@@ -958,36 +980,31 @@ async fn apply_impl(
             source,
         } => {
             let embedding = embedding.expect("invariant: Update produced an embedding above");
-            apply_update(
-                &mut tx, agent, target, content, state, source, embedding, now,
-            )
-            .await?
+            apply_update(tx, agent, target, content, state, source, embedding, now).await?
         }
         MemoryMutation::Forget {
             agent,
             target,
             source,
-        } => apply_forget(&mut tx, agent, target, source, now).await?,
+        } => apply_forget(tx, agent, target, source, now).await?,
     };
-
-    tx.commit().await?;
     Ok(outcome)
 }
 
-/// Body of `record_validation` / `record_validation_for_user`.
-async fn record_validation_impl(
+/// Body of `record_validation` / `record_validation_for_user`. The
+/// runner owns commit/rollback; this helper just runs SQL.
+async fn record_validation_in_tx(
     store: &PgMemoryStore,
-    scope: TxScope,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     memory: MemoryId,
     origin: ValidationOrigin,
     detail: Option<&str>,
 ) -> Result<MemoryRow, MemoryStoreError> {
     let now = store.now();
-    let mut tx = scope.begin(&store.pool).await?;
     let wrapping_source = origin.mutation_source();
 
-    let prior = lock_existing(&mut tx, agent, memory, wrapping_source).await?;
+    let prior = lock_existing(tx, agent, memory, wrapping_source).await?;
 
     sqlx::query(
         "INSERT INTO validation_events
@@ -1018,7 +1035,7 @@ async fn record_validation_impl(
         pinned: prior.pinned,
     };
     insert_event(
-        &mut tx,
+        tx,
         MemoryEventId::new(),
         agent,
         memory,
@@ -1040,15 +1057,13 @@ async fn record_validation_impl(
         .bind(memory)
         .fetch_one(&mut *tx)
         .await?;
-
-    tx.commit().await?;
     decode_memory_row(&row)
 }
 
 /// Body of `resolve_contradiction` / `resolve_contradiction_for_user`.
-async fn resolve_contradiction_impl(
+async fn resolve_contradiction_in_tx(
     store: &PgMemoryStore,
-    scope: TxScope,
+    tx: &mut sqlx::PgConnection,
     id: ContradictionEventId,
     outcome: ResolutionOutcome,
 ) -> Result<(), MemoryStoreError> {
@@ -1057,7 +1072,6 @@ async fn resolve_contradiction_impl(
         ResolutionOutcome::Mutation(event_id) => (Some(event_id), None),
         ResolutionOutcome::NoAction { reason } => (None, Some(reason.into_inner())),
     };
-    let mut tx = scope.begin(&store.pool).await?;
     let result = sqlx::query(
         "UPDATE contradiction_events
          SET resolved_at = $1, resolution_event_id = $2, resolution_reason = $3
@@ -1074,7 +1088,7 @@ async fn resolve_contradiction_impl(
     // success, preserving the original stamped time (a contract the
     // librarian and `resolve_contradiction_is_idempotent` test both
     // rely on); (2) the row doesn't exist, or is filtered out by RLS
-    // in `AsUser` scope — real error, must surface so retry-loops
+    // in tenant scope — real error, must surface so retry-loops
     // don't mistake silent skips for resolution.
     if result.rows_affected() == 0 {
         let exists: bool =
@@ -1087,14 +1101,13 @@ async fn resolve_contradiction_impl(
         }
         // Row exists and was already resolved → idempotent no-op.
     }
-    tx.commit().await?;
     Ok(())
 }
 
 /// Body of `record_access` / `record_access_for_user`.
-async fn record_access_impl(
+async fn record_access_in_tx(
     store: &PgMemoryStore,
-    scope: TxScope,
+    tx: &mut sqlx::PgConnection,
     ids: &[MemoryId],
 ) -> Result<(), MemoryStoreError> {
     if ids.is_empty() {
@@ -1105,7 +1118,6 @@ async fn record_access_impl(
         "invariant: record_access batch ≤ MAX_MEMORIES_PER_AGENT"
     );
     let now = store.now();
-    let mut tx = scope.begin(&store.pool).await?;
     sqlx::query(
         "UPDATE agent_memories
          SET last_accessed_at = $1, access_count = access_count + 1
@@ -1115,7 +1127,6 @@ async fn record_access_impl(
     .bind(ids)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -1130,7 +1141,7 @@ struct RestoredAttrs {
 }
 
 async fn restore_attrs_for(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     target: MemoryId,
 ) -> Result<RestoredAttrs, MemoryStoreError> {
@@ -1141,7 +1152,7 @@ async fn restore_attrs_for(
     )
     .bind(agent)
     .bind(target)
-    .fetch_optional(&mut **tx)
+    .fetch_optional(&mut *tx)
     .await?;
     let (kind, state, pinned) = row.ok_or(MemoryStoreError::NotFound { id: target })?;
     let kind = kind
@@ -1162,7 +1173,7 @@ async fn restore_attrs_for(
 
 #[allow(clippy::too_many_arguments)]
 async fn apply_write(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     kind: MemoryKind,
     content: MemoryContent,
@@ -1205,7 +1216,7 @@ async fn apply_write(
         .bind(source.turn_id())
         .bind(now)
         .bind(embedding_lit)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
 
     Ok(MutationOutcome {
@@ -1217,7 +1228,7 @@ async fn apply_write(
 
 #[allow(clippy::too_many_arguments)]
 async fn apply_update(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     target: MemoryId,
     content: MemoryContent,
@@ -1248,7 +1259,7 @@ async fn apply_update(
         .bind(state)
         .bind(embedding_lit)
         .bind(target)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
 
     Ok(MutationOutcome {
@@ -1259,7 +1270,7 @@ async fn apply_update(
 }
 
 async fn apply_forget(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     target: MemoryId,
     source: MutationSource,
@@ -1275,7 +1286,7 @@ async fn apply_forget(
 
     sqlx::query("DELETE FROM agent_memories WHERE id = $1")
         .bind(target)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
 
     Ok(MutationOutcome {
@@ -1288,7 +1299,7 @@ async fn apply_forget(
 /// Single insert path for the journal — the payload variant determines which
 /// columns are bound and which are NULL, mirroring the CHECK constraints.
 async fn insert_event(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     event_id: MemoryEventId,
     agent: AgentId,
     target: MemoryId,
@@ -1359,7 +1370,7 @@ async fn insert_event(
     .bind(kind)
     .bind(state)
     .bind(pinned)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     Ok(())
 }
@@ -1370,7 +1381,7 @@ async fn insert_event(
 /// `source` determines whether pinned rows are reachable
 /// (`MutationSource::Operator` bypasses; everything else is rejected).
 async fn lock_existing(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     target: MemoryId,
     source: MutationSource,
@@ -1378,7 +1389,7 @@ async fn lock_existing(
     let sql = format!("SELECT {MEMORY_ROW_COLUMNS} FROM agent_memories WHERE id = $1 FOR UPDATE");
     let row = sqlx::query(&sql)
         .bind(target)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(&mut *tx)
         .await?;
 
     let row = row.ok_or(MemoryStoreError::NotFound { id: target })?;
@@ -1399,7 +1410,7 @@ async fn lock_existing(
 /// reading from it) and the pinned-immunity check (replay must be
 /// faithful — if the original mutation was allowed, the rebuild is too).
 async fn apply_replay(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &mut sqlx::PgConnection,
     agent: AgentId,
     event: &MemoryEvent,
 ) -> Result<(), MemoryStoreError> {
@@ -1429,7 +1440,7 @@ async fn apply_replay(
             .bind(pinned)
             .bind(event.source.turn_id())
             .bind(event.created_at)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         }
         MemoryEventPayload::Update {
@@ -1445,13 +1456,13 @@ async fn apply_replay(
             .bind(state)
             .bind(pinned)
             .bind(event.target_memory_id)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         }
         MemoryEventPayload::Forget { .. } => {
             sqlx::query("DELETE FROM agent_memories WHERE id = $1")
                 .bind(event.target_memory_id)
-                .execute(&mut **tx)
+                .execute(&mut *tx)
                 .await?;
         }
     }
