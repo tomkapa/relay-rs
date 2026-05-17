@@ -284,8 +284,12 @@ impl TryFrom<String> for PkceVerifier {
 pub struct OAuthState(Arc<str>);
 
 impl OAuthState {
-    pub const MIN_BYTES: usize = 16;
-    pub const MAX_BYTES: usize = 256;
+    // Aligned with the `oauth_login_states.state` CHECK constraint
+    // (octet_length BETWEEN 32 AND 128). Keeping the type stricter than
+    // the bound a hostile caller might supply lets the DB serve as defense
+    // in depth, not as the only validator.
+    pub const MIN_BYTES: usize = 32;
+    pub const MAX_BYTES: usize = 128;
 
     #[must_use]
     pub fn as_str(&self) -> &str {

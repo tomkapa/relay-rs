@@ -96,7 +96,11 @@ impl GoogleOAuth {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         let (url, csrf) = self
             .client
-            .authorize_url(CsrfToken::new_random)
+            // 32 random bytes → 43-char base64url state, comfortably inside
+            // the DB CHECK constraint (oauth_login_states.state octet_length
+            // BETWEEN 32 AND 128) and the OAuthState newtype bounds. The
+            // crate's `new_random` default emits only 16 bytes / 22 chars.
+            .authorize_url(|| CsrfToken::new_random_len(32))
             .add_scope(Scope::new("openid".to_owned()))
             .add_scope(Scope::new("email".to_owned()))
             .add_scope(Scope::new("profile".to_owned()))
@@ -211,4 +215,50 @@ struct GoogleUserinfo {
     email_verified: Option<bool>,
     name: Option<String>,
     picture: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SecretString;
+
+    fn dummy() -> GoogleOAuth {
+        let cid = SecretString::try_from("test-client-id".to_owned()).expect("non-empty");
+        let csec = SecretString::try_from("test-client-secret".to_owned()).expect("non-empty");
+        GoogleOAuth::new(&cid, &csec, "http://localhost:8080/auth/google/callback")
+            .expect("dummy client builds")
+    }
+
+    // Regression: the oauth2 crate's `CsrfToken::new_random` emits 16
+    // random bytes → 22 base64url chars, which violates both the
+    // `OAuthState::MIN_BYTES` newtype bound and the
+    // `oauth_login_states.state` DB CHECK (octet_length BETWEEN 32 AND 128).
+    // `start()` must produce a state that satisfies both.
+    #[test]
+    fn start_state_satisfies_newtype_and_db_check() {
+        let oauth = dummy();
+        let start = oauth.start().expect("start yields a valid AuthStart");
+        let len = start.state.as_str().len();
+        assert!(
+            len >= OAuthState::MIN_BYTES,
+            "state len {len} < newtype MIN {}",
+            OAuthState::MIN_BYTES
+        );
+        assert!(
+            len <= OAuthState::MAX_BYTES,
+            "state len {len} > newtype MAX {}",
+            OAuthState::MAX_BYTES
+        );
+        assert!(len >= 32, "state len {len} < DB CHECK min 32");
+        assert!(len <= 128, "state len {len} > DB CHECK max 128");
+    }
+
+    #[test]
+    fn start_pkce_verifier_satisfies_db_check() {
+        let oauth = dummy();
+        let start = oauth.start().expect("start yields a valid AuthStart");
+        let len = start.pkce_verifier.as_str().len();
+        assert!(len >= 32, "pkce_verifier len {len} < DB CHECK min 32");
+        assert!(len <= 128, "pkce_verifier len {len} > DB CHECK max 128");
+    }
 }

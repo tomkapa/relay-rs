@@ -32,10 +32,16 @@ export async function request<T>(
   const res = await fetch(path, { ...init, credentials: "include", headers });
 
   if (res.status === 401) {
-    const back = encodeURIComponent(
-      window.location.pathname + window.location.search,
-    );
-    window.location.href = `/auth/google/login?return_to=${back}`;
+    // First-touch UX: bounce to the FE /sign-in page so the user sees a
+    // "Sign in with Google" affordance before we punt them to Google's
+    // consent screen. The page itself picks up `?from=…` to return them
+    // to where they were headed once auth completes.
+    if (window.location.pathname !== "/sign-in") {
+      const back = encodeURIComponent(
+        window.location.pathname + window.location.search,
+      );
+      window.location.href = `/sign-in?from=${back}`;
+    }
     throw new AuthRedirect();
   }
 

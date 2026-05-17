@@ -13,9 +13,13 @@ export function SignIn() {
   }, [location.search]);
 
   const returnTo = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    const fromQuery = params.get("from");
+    if (fromQuery && fromQuery !== "/sign-in") return fromQuery;
     const state = location.state as { from?: string } | null;
-    return state?.from && state.from !== "/sign-in" ? state.from : "/";
-  }, [location.state]);
+    if (state?.from && state.from !== "/sign-in") return state.from;
+    return "/";
+  }, [location.search, location.state]);
 
   const onSignIn = () => {
     window.location.href = `/auth/google/login?return_to=${encodeURIComponent(returnTo)}`;
