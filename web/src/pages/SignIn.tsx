@@ -1,24 +1,55 @@
 import { useMemo } from "react";
 import { useLocation } from "react-router-dom";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Radio } from "lucide-react";
 import { Banner } from "../components/molecules/Banner";
 import { Button } from "../components/atoms/Button";
+import signinArtwork from "../assets/signin.png";
+
+function GoogleG() {
+  return (
+    <svg
+      aria-hidden="true"
+      width="16"
+      height="16"
+      viewBox="0 0 18 18"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <path
+        fill="#EA4335"
+        d="M9 3.48c1.69 0 2.83.73 3.48 1.34l2.54-2.48C13.46.89 11.43 0 9 0 5.48 0 2.44 2.02.96 4.96l2.91 2.26C4.6 5.05 6.62 3.48 9 3.48z"
+      />
+      <path
+        fill="#4285F4"
+        d="M17.64 9.2c0-.74-.06-1.28-.19-1.84H9v3.34h4.96c-.1.83-.64 2.08-1.84 2.92l2.84 2.2c1.7-1.57 2.68-3.88 2.68-6.62z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M3.88 10.78A5.54 5.54 0 0 1 3.58 9c0-.62.11-1.22.29-1.78L.96 4.96A9 9 0 0 0 0 9c0 1.45.35 2.82.96 4.04l2.92-2.26z"
+      />
+      <path
+        fill="#34A853"
+        d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.84-2.2c-.76.53-1.78.9-3.12.9-2.38 0-4.4-1.57-5.12-3.74L.97 13.04C2.45 15.98 5.48 18 9 18z"
+      />
+    </svg>
+  );
+}
 
 export function SignIn() {
   const location = useLocation();
 
-  const oauthDown = useMemo(() => {
-    const params = new URLSearchParams(location.search);
-    return params.get("error") === "oauth_unavailable";
-  }, [location.search]);
-
-  const returnTo = useMemo(() => {
+  const { oauthDown, returnTo } = useMemo(() => {
     const params = new URLSearchParams(location.search);
     const fromQuery = params.get("from");
-    if (fromQuery && fromQuery !== "/sign-in") return fromQuery;
     const state = location.state as { from?: string } | null;
-    if (state?.from && state.from !== "/sign-in") return state.from;
-    return "/";
+    const candidate = fromQuery ?? state?.from ?? "/";
+    const isSafeInternalPath =
+      candidate.startsWith("/") &&
+      !candidate.startsWith("//") &&
+      candidate !== "/sign-in";
+    return {
+      oauthDown: params.get("error") === "oauth_unavailable",
+      returnTo: isSafeInternalPath ? candidate : "/",
+    };
   }, [location.search, location.state]);
 
   const onSignIn = () => {
@@ -26,40 +57,89 @@ export function SignIn() {
   };
 
   return (
-    <div className="grain-paper flex h-screen w-screen items-center justify-center bg-[var(--color-paper)]">
-      <div className="w-[420px] max-w-[90vw] border border-[var(--color-line)] bg-[var(--color-card)] px-8 py-9 shadow-sm">
-        <div className="font-[var(--font-mono)] text-[10.5px] uppercase tracking-[0.22em] text-[var(--color-muted)]">
-          Relay
-        </div>
-        <h1 className="mt-1 font-[var(--font-display)] text-[28px] font-bold leading-[1.15] tracking-tight text-[var(--color-ink)]">
-          Sign in
-        </h1>
-        <p className="mt-3 text-[13px] leading-[1.55] text-[var(--color-muted)]">
-          Continue with Google to enter your workspace.
-        </p>
+    <div className="flex h-screen w-screen bg-[var(--color-paper)]">
+      <aside className="relative hidden flex-col overflow-hidden bg-[var(--color-rail)] px-14 py-14 md:flex md:w-[44%] lg:w-[39%]">
+        <header className="flex items-center gap-3">
+          <span
+            aria-hidden="true"
+            className="inline-flex h-7 w-7 items-center justify-center rounded-sm bg-[var(--color-moss)] text-[var(--color-paper)]"
+          >
+            <Radio className="h-4 w-4" />
+          </span>
+          <span className="font-[var(--font-mono)] text-[14px] font-semibold uppercase tracking-[0.28em] text-[var(--color-paper)]">
+            Relay
+          </span>
+          <span
+            aria-hidden="true"
+            className="ml-2 h-px flex-1 bg-[var(--color-rail-2)]"
+          />
+          <span className="font-[var(--font-mono)] text-[10.5px] uppercase tracking-[0.24em] text-[var(--color-muted-2)]">
+            v1.0
+          </span>
+        </header>
 
-        {oauthDown ? (
-          <div className="mt-5">
+        <div className="mt-16">
+          <p className="font-[var(--font-display)] text-[40px] font-bold leading-[1.1] tracking-tight text-[var(--color-paper)]">
+            The operator console for{" "}
+            <span className="inline-block bg-[var(--color-moss)] px-2 py-[2px] text-[var(--color-paper)]">
+              multi-agent
+            </span>{" "}
+            sessions.
+          </p>
+          <p className="mt-5 max-w-[420px] text-[13px] leading-[1.6] text-[var(--color-muted-2)]">
+            Spawn, supervise, and audit every agent in one place.
+          </p>
+        </div>
+
+        <div className="mt-auto pt-10">
+          <img
+            src={signinArtwork}
+            alt=""
+            aria-hidden="true"
+            className="w-full select-none rounded-sm opacity-95"
+            draggable={false}
+          />
+        </div>
+      </aside>
+
+      <main className="grain-paper relative flex flex-1 items-center justify-center px-6 py-10">
+        <div className="w-full max-w-[420px]">
+          <h1 className="font-[var(--font-display)] text-[36px] font-bold leading-[1.1] tracking-tight text-[var(--color-ink)]">
+            Sign in to{" "}
+            <span className="inline-block rounded-md bg-[var(--color-moss-tint)] px-2.5 py-[2px] text-[var(--color-moss-deep)]">
+              Relay
+            </span>
+          </h1>
+          <p className="mt-3 text-[13px] leading-[1.55] text-[var(--color-muted)]">
+            Continue with your Google account.
+          </p>
+
+          {oauthDown ? (
             <Banner
               variant="amber"
               icon={<AlertTriangle className="h-3.5 w-3.5" />}
+              className="mt-5"
             >
               Google is unreachable, try again.
             </Banner>
-          </div>
-        ) : null}
+          ) : null}
 
-        <div className="mt-7">
           <Button
             variant="primary"
             size="md"
             onClick={onSignIn}
-            className="w-full"
+            className="mt-6 w-full gap-2"
           >
-            Sign in with Google
+            <GoogleG />
+            Continue with Google
           </Button>
+
+          <p className="mt-8 text-[11px] leading-[1.6] text-[var(--color-muted-2)]">
+            By continuing, you agree to the Terms of Service and the Privacy
+            Policy. Sessions are bound to your tenant and audited.
+          </p>
         </div>
-      </div>
+      </main>
     </div>
   );
 }
