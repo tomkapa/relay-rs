@@ -111,7 +111,10 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         &self,
         payload: NewScheduledTask,
     ) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
-        run_privileged(&self.pool, async |tx| create_in_tx(self, tx, payload).await).await
+        run_privileged(&self.pool, async |tx| {
+            create_in_tx(self, tx.tx_mut(), payload).await
+        })
+        .await
     }
 
     async fn create_for_user(
@@ -126,7 +129,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         // resulting `NewPromptRequest`'s tenancy).
         payload.created_by_user_id = acting_user_id;
         run_as_user(&self.pool, acting_user_id, async |tx| {
-            create_in_tx(self, tx, payload).await
+            create_in_tx(self, tx.tx_mut(), payload).await
         })
         .await
     }
@@ -138,7 +141,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         owner: AgentId,
     ) -> Result<(), ScheduledTaskError> {
         run_as_user(&self.pool, acting_user_id, async |tx| {
-            cancel_in_tx(self, tx, task, owner).await
+            cancel_in_tx(self, tx.tx_mut(), task, owner).await
         })
         .await
     }
@@ -183,7 +186,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         owner: AgentId,
     ) -> Result<(), ScheduledTaskError> {
         run_privileged(&self.pool, async |tx| {
-            cancel_in_tx(self, tx, task, owner).await
+            cancel_in_tx(self, tx.tx_mut(), task, owner).await
         })
         .await
     }
@@ -273,7 +276,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
 /// call.
 async fn create_in_tx(
     store: &PgScheduledTaskStore,
-    conn: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     payload: NewScheduledTask,
 ) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
     let id = ScheduledTaskId::new();
@@ -288,7 +291,7 @@ async fn create_in_tx(
     // does not prevent the TOCTOU).
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
         .bind(&cap_label)
-        .execute(&mut *conn)
+        .execute(&mut **tx)
         .await?;
 
     let (count,): (i64,) = sqlx::query_as(
@@ -297,7 +300,7 @@ async fn create_in_tx(
     )
     .bind(owner)
     .bind(ScheduledTaskState::Active)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut **tx)
     .await?;
     let count_usize = usize::try_from(count).map_err(|_| {
         ScheduledTaskError::Db(sqlx::Error::Decode(
@@ -327,7 +330,7 @@ async fn create_in_tx(
     .bind(payload.next_run_at)
     .bind(ScheduledTaskState::Active)
     .bind(now)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut **tx)
     .await?;
 
     row_to_record(row)
@@ -336,7 +339,7 @@ async fn create_in_tx(
 /// Body of `cancel` / `cancel_for_user`.
 async fn cancel_in_tx(
     store: &PgScheduledTaskStore,
-    conn: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     task: ScheduledTaskId,
     owner: AgentId,
 ) -> Result<(), ScheduledTaskError> {
@@ -348,7 +351,7 @@ async fn cancel_in_tx(
     )
     .bind(task)
     .bind(owner)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(&mut **tx)
     .await?;
 
     let Some((state,)) = existing else {
@@ -366,7 +369,7 @@ async fn cancel_in_tx(
     .bind(ScheduledTaskState::Cancelled)
     .bind(now)
     .bind(task)
-    .execute(&mut *conn)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())

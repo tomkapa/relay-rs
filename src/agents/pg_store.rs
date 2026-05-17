@@ -160,7 +160,7 @@ impl AgentStore for PgAgentStore {
     async fn create(&self, payload: NewAgent) -> Result<AgentRecord, AgentStoreError> {
         let embedding = self.embed(payload.description.as_str()).await?;
         run_privileged(&self.pool, async |tx| {
-            create_in_tx(self, tx, &embedding, payload).await
+            create_in_tx(self, tx.tx_mut(), &embedding, payload).await
         })
         .await
     }
@@ -172,7 +172,7 @@ impl AgentStore for PgAgentStore {
     ) -> Result<AgentRecord, AgentStoreError> {
         let embedding = self.embed(payload.description.as_str()).await?;
         run_as_user(&self.pool, acting_user_id, async |tx| {
-            create_in_tx(self, tx, &embedding, payload).await
+            create_in_tx(self, tx.tx_mut(), &embedding, payload).await
         })
         .await
     }
@@ -436,7 +436,7 @@ impl AgentStore for PgAgentStore {
 /// RLS-checked).
 async fn create_in_tx(
     store: &PgAgentStore,
-    conn: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     embedding: &[f32],
     payload: NewAgent,
 ) -> Result<AgentRecord, AgentStoreError> {
@@ -454,7 +454,7 @@ async fn create_in_tx(
         )
         .bind(now)
         .bind(payload.org_id)
-        .execute(&mut *conn)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -474,7 +474,7 @@ async fn create_in_tx(
     .bind(payload.is_default)
     .bind(payload.allowed_mcp_servers.as_slice())
     .bind(now)
-    .execute(&mut *conn)
+    .execute(&mut **tx)
     .await;
     match insert {
         Ok(_) => {}

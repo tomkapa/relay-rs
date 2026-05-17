@@ -97,7 +97,7 @@ impl SessionStore for PgSessionStore {
         run_privileged(&self.pool, async |tx| {
             resolve_or_create_for_pair_inner(
                 self,
-                tx,
+                tx.tx_mut(),
                 root_request_id,
                 a,
                 b,
@@ -110,6 +110,18 @@ impl SessionStore for PgSessionStore {
         .await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.resolve_or_create_for_user",
+        fields(
+            relay.dag.root = %root_request_id,
+            relay.parent.session.id = parent_session_id.map(tracing::field::display),
+            relay.org.id = %caller.org_id,
+            relay.user.id = %caller.user_id,
+            relay.session.id = tracing::field::Empty,
+            relay.session.created = tracing::field::Empty,
+        ),
+    )]
     async fn resolve_or_create_for_pair_for_user(
         &self,
         caller: &Caller,
@@ -129,7 +141,7 @@ impl SessionStore for PgSessionStore {
         run_as_user(&self.pool, caller.user_id, async |tx| {
             resolve_or_create_for_pair_inner(
                 self,
-                tx,
+                tx.tx_mut(),
                 root_request_id,
                 a,
                 b,
@@ -160,11 +172,21 @@ impl SessionStore for PgSessionStore {
         request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
         run_privileged(&self.pool, async |tx| {
-            append_row(self, tx, id, sender, receiver, message, request_id).await
+            append_row(self, tx.tx_mut(), id, sender, receiver, message, request_id).await
         })
         .await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.append_for_user",
+        fields(
+            relay.session.id = %id,
+            relay.user.id = %acting_user_id,
+            relay.message.kind = chat_message_kind(&message),
+            relay.message.blocks = chat_message_block_count(&message),
+        ),
+    )]
     async fn append_for_user(
         &self,
         acting_user_id: UserId,
@@ -175,7 +197,7 @@ impl SessionStore for PgSessionStore {
         request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
         run_as_user(&self.pool, acting_user_id, async |tx| {
-            append_row(self, tx, id, sender, receiver, message, request_id).await
+            append_row(self, tx.tx_mut(), id, sender, receiver, message, request_id).await
         })
         .await
     }
@@ -203,7 +225,7 @@ impl SessionStore for PgSessionStore {
         run_privileged(&self.pool, async |tx| {
             append_row(
                 self,
-                tx,
+                tx.tx_mut(),
                 id,
                 MessageSender::System,
                 receiver,
@@ -215,6 +237,15 @@ impl SessionStore for PgSessionStore {
         .await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.append_system_nudge_for_user",
+        fields(
+            relay.session.id = %id,
+            relay.user.id = %acting_user_id,
+            relay.bytes = note.len(),
+        ),
+    )]
     async fn append_system_nudge_for_user(
         &self,
         acting_user_id: UserId,
@@ -227,7 +258,7 @@ impl SessionStore for PgSessionStore {
         run_as_user(&self.pool, acting_user_id, async |tx| {
             append_row(
                 self,
-                tx,
+                tx.tx_mut(),
                 id,
                 MessageSender::System,
                 receiver,
@@ -383,6 +414,11 @@ impl SessionStore for PgSessionStore {
         Ok(out)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.participants",
+        fields(relay.session.id = %id),
+    )]
     async fn participants(
         &self,
         id: SessionId,
@@ -412,6 +448,11 @@ impl SessionStore for PgSessionStore {
         Ok((a, b))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.parent",
+        fields(relay.session.id = %id),
+    )]
     async fn parent(&self, id: SessionId) -> Result<Option<SessionId>, SessionError> {
         let row =
             run_privileged::<Option<(Option<SessionId>,)>, SessionError>(&self.pool, async |tx| {
@@ -495,6 +536,11 @@ impl SessionStore for PgSessionStore {
         Ok(out)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.root_request_id",
+        fields(relay.session.id = %id),
+    )]
     async fn root_request_id(&self, id: SessionId) -> Result<PromptRequestId, SessionError> {
         let row =
             run_privileged::<Option<(PromptRequestId,)>, SessionError>(&self.pool, async |tx| {
@@ -510,6 +556,11 @@ impl SessionStore for PgSessionStore {
         Ok(root)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.tenancy",
+        fields(relay.session.id = %id),
+    )]
     async fn tenancy(&self, id: SessionId) -> Result<SessionTenancy, SessionError> {
         let row = run_privileged::<Option<(OrgId, UserId)>, SessionError>(&self.pool, async |tx| {
             Ok(
@@ -527,6 +578,11 @@ impl SessionStore for PgSessionStore {
         })
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.delete",
+        fields(relay.session.id = %id),
+    )]
     async fn delete(&self, id: SessionId) -> Result<(), SessionError> {
         let rows_affected = run_privileged::<u64, SessionError>(&self.pool, async |tx| {
             let res = sqlx::query("DELETE FROM sessions WHERE id = $1")
@@ -551,7 +607,7 @@ impl SessionStore for PgSessionStore {
 #[allow(clippy::too_many_arguments)]
 async fn resolve_or_create_for_pair_inner(
     store: &PgSessionStore,
-    conn: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     root_request_id: PromptRequestId,
     a: Participant,
     b: Participant,
@@ -593,7 +649,7 @@ async fn resolve_or_create_for_pair_inner(
     .bind(a.agent_id())
     .bind(b.kind())
     .bind(b.agent_id())
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut **tx)
     .await
     .map_err(map_agent_fk)?;
 
@@ -617,7 +673,7 @@ async fn resolve_or_create_for_pair_inner(
 #[allow(clippy::too_many_arguments)]
 async fn append_row(
     store: &PgSessionStore,
-    conn: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: SessionId,
     sender: MessageSender,
     receiver: Participant,
@@ -674,7 +730,7 @@ async fn append_row(
     .bind(body)
     .bind(now)
     .bind(request_id)
-    .fetch_optional(&mut *conn)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(map_agent_fk)?;
 

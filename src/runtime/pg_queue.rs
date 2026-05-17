@@ -170,7 +170,10 @@ impl fmt::Debug for PgPromptQueue {
 #[async_trait]
 impl PromptQueue for PgPromptQueue {
     async fn enqueue(&self, req: NewPromptRequest) -> Result<EnqueueOutcome, PromptError> {
-        run_privileged(&self.pool, async |tx| enqueue_in_tx(self, tx, req).await).await
+        run_privileged(&self.pool, async |tx| {
+            enqueue_in_tx(self, tx.tx_mut(), req).await
+        })
+        .await
     }
 
     async fn enqueue_for_user(
@@ -188,7 +191,7 @@ impl PromptQueue for PgPromptQueue {
         // the storage layer.
         req.created_by_user_id = acting_user_id;
         run_as_user(&self.pool, acting_user_id, async |tx| {
-            enqueue_in_tx(self, tx, req).await
+            enqueue_in_tx(self, tx.tx_mut(), req).await
         })
         .await
     }
@@ -441,7 +444,7 @@ impl LeaseManager for PgPromptQueue {
 /// so it can open a `begin_as_user` turn-tx. The queue itself runs
 /// privileged because the scan is cross-tenant by construction.
 async fn next_candidate(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     now: DateTime<Utc>,
 ) -> Result<Option<(SessionId, OrgId, UserId)>, PromptError> {
     let row = sqlx::query_as(
@@ -473,7 +476,7 @@ async fn next_candidate(
     .bind(now)
     .bind(RequestKind::Normal)
     .bind(RequestStatus::Processing)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     Ok(row)
 }
@@ -482,7 +485,7 @@ async fn next_candidate(
 /// `INSERT ... ON CONFLICT` to stay race-free. `org_id` denormalisation
 /// is enforced by the shared parity trigger (migration 16).
 async fn bump_turn_seq(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session: SessionId,
     org_id: OrgId,
 ) -> Result<TurnSeq, PromptError> {
@@ -495,7 +498,7 @@ async fn bump_turn_seq(
     )
     .bind(session)
     .bind(org_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     Ok(next_seq)
 }
@@ -505,7 +508,7 @@ async fn bump_turn_seq(
 /// the statement returns 0 rows — that's the race-loss path; returns
 /// `false`.
 async fn try_take_lease(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session: SessionId,
     org_id: OrgId,
     worker: WorkerId,
@@ -529,7 +532,7 @@ async fn try_take_lease(
     .bind(next_seq)
     .bind(deadline)
     .bind(now)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     Ok(lease.is_some())
 }
@@ -549,7 +552,7 @@ type DrainedPrompt = (
 /// Agent from the registry, attach its `handle_claim` span to the
 /// producer's trace, and dispatch on job kind.
 async fn drain_pending(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session: SessionId,
     next_seq: TurnSeq,
     now: DateTime<Utc>,
@@ -568,7 +571,7 @@ async fn drain_pending(
     .bind(now)
     .bind(session)
     .bind(RequestStatus::Pending)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     Ok(drained)
 }
@@ -636,7 +639,7 @@ fn build_claimed_session(
 /// paths so the implicit-session-create + INSERT are RLS-checked).
 async fn enqueue_in_tx(
     queue: &PgPromptQueue,
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     req: NewPromptRequest,
 ) -> Result<EnqueueOutcome, PromptError> {
     let now = queue.now();
@@ -681,7 +684,7 @@ async fn enqueue_in_tx(
 /// Resolve the idempotency key for `(org_id, key)`. Returns the
 /// existing `EnqueueOutcome::Existing` so callers can short-circuit.
 async fn read_idempotent(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: OrgId,
     idempotency_key: &str,
 ) -> Result<Option<EnqueueOutcome>, PromptError> {
@@ -692,7 +695,7 @@ async fn read_idempotent(
     )
     .bind(org_id)
     .bind(idempotency_key)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     Ok(
         row.map(|(request_id, session, status)| EnqueueOutcome::Existing {
@@ -705,7 +708,7 @@ async fn read_idempotent(
 
 /// Reject the enqueue if the session has hit its pending-row cap.
 async fn enforce_pending_cap(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session: SessionId,
     pending_cap: u32,
 ) -> Result<(), PromptError> {
@@ -716,7 +719,7 @@ async fn enforce_pending_cap(
     )
     .bind(session)
     .bind(RequestStatus::Pending)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if pending_count >= pending_cap_i64 {
         return Err(PromptError::PendingCapExceeded {
@@ -729,7 +732,7 @@ async fn enforce_pending_cap(
 
 /// Seed the DAG turn-budget row for a freshly-created root session.
 async fn seed_dag_row(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     root_request_id: PromptRequestId,
     org_id: OrgId,
     now: DateTime<Utc>,
@@ -744,7 +747,7 @@ async fn seed_dag_row(
     .bind(org_id)
     .bind(cap)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -755,7 +758,7 @@ async fn seed_dag_row(
 /// `current_traceparent` (exporter off, no active span) leaves the column
 /// NULL and the worker starts a fresh root.
 async fn insert_prompt_request(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     req: &NewPromptRequest,
     request_id: PromptRequestId,
     session: SessionId,
@@ -798,7 +801,7 @@ async fn insert_prompt_request(
     .bind(kind)
     .bind(payload_json)
     .bind(now)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -815,7 +818,7 @@ struct SessionResolution {
 /// Resolve the session for an `enqueue`: either look up the existing one's
 /// DAG root or mint a brand-new session row anchored at `request_id`.
 async fn resolve_session(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     req: &NewPromptRequest,
     receiver: Participant,
     request_id: PromptRequestId,
@@ -825,7 +828,7 @@ async fn resolve_session(
         let row: Option<(PromptRequestId,)> =
             sqlx::query_as("SELECT root_request_id FROM sessions WHERE id = $1")
                 .bind(existing_session)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?;
         let (root,) = row.ok_or(PromptError::SessionNotFound(existing_session))?;
         return Ok(SessionResolution {
@@ -863,7 +866,7 @@ async fn resolve_session(
 /// session-before-request order is legal.
 #[allow(clippy::too_many_arguments)]
 async fn create_session_row(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     root_request_id: PromptRequestId,
     sender: Participant,
     receiver: Participant,
@@ -892,7 +895,7 @@ async fn create_session_row(
     .bind(a.agent_id())
     .bind(b.kind())
     .bind(b.agent_id())
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await;
     match res {
         Ok(_) => Ok(session_id),

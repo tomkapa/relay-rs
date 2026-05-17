@@ -56,6 +56,14 @@ impl<'a> TenantTx<'a> {
         self.user
     }
 
+    /// Hand the inner `Transaction` to a private `_in_tx` helper. The
+    /// returned `&mut Transaction` proof keeps "you are inside a tx"
+    /// a compile-time invariant at every helper-call boundary —
+    /// `&mut PgConnection` from the pool can't masquerade as one.
+    pub(crate) fn tx_mut(&mut self) -> &mut Transaction<'a, Postgres> {
+        &mut self.inner
+    }
+
     async fn commit(self) -> Result<(), sqlx::Error> {
         self.inner.commit().await
     }
@@ -96,6 +104,12 @@ pub struct PrivilegedTx<'a> {
 impl<'a> PrivilegedTx<'a> {
     fn new(inner: Transaction<'a, Postgres>) -> Self {
         Self { inner }
+    }
+
+    /// Hand the inner `Transaction` to a private `_in_tx` helper. See
+    /// [`TenantTx::tx_mut`] for the rationale.
+    pub(crate) fn tx_mut(&mut self) -> &mut Transaction<'a, Postgres> {
+        &mut self.inner
     }
 
     async fn commit(self) -> Result<(), sqlx::Error> {

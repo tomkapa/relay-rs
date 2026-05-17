@@ -204,7 +204,7 @@ impl ResponseSink for PgResponseHub {
         chunk: ResponseChunk,
     ) -> Result<ChunkSeq, ResponseError> {
         let persisted = run_privileged(&self.pool, async |tx| {
-            publish_in_tx(self, tx, request_id, chunk).await
+            publish_in_tx(self, tx.tx_mut(), request_id, chunk).await
         })
         .await?;
         self.fanout_after_commit(request_id, persisted)
@@ -217,14 +217,17 @@ impl ResponseSink for PgResponseHub {
         chunk: ResponseChunk,
     ) -> Result<ChunkSeq, ResponseError> {
         let persisted = run_as_user(&self.pool, acting_user_id, async |tx| {
-            publish_in_tx(self, tx, request_id, chunk).await
+            publish_in_tx(self, tx.tx_mut(), request_id, chunk).await
         })
         .await?;
         self.fanout_after_commit(request_id, persisted)
     }
 
     async fn close(&self, request_id: PromptRequestId) -> Result<(), ResponseError> {
-        run_privileged(&self.pool, async |tx| close_in_tx(tx, request_id).await).await?;
+        run_privileged(&self.pool, async |tx| {
+            close_in_tx(tx.tx_mut(), request_id).await
+        })
+        .await?;
         self.mark_closed(request_id);
         Ok(())
     }
@@ -235,7 +238,7 @@ impl ResponseSink for PgResponseHub {
         request_id: PromptRequestId,
     ) -> Result<(), ResponseError> {
         run_as_user(&self.pool, acting_user_id, async |tx| {
-            close_in_tx(tx, request_id).await
+            close_in_tx(tx.tx_mut(), request_id).await
         })
         .await?;
         self.mark_closed(request_id);
@@ -302,7 +305,7 @@ const PUBLISH_CTE_SQL: &str = "WITH req AS (
 
 async fn publish_in_tx(
     hub: &PgResponseHub,
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: PromptRequestId,
     chunk: ResponseChunk,
 ) -> Result<PersistedChunk, ResponseError> {
@@ -322,7 +325,7 @@ async fn publish_in_tx(
         .bind(bytes)
         .bind(now)
         .bind(THREAD_NOTIFY_CHANNEL)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
     let (next_seq,) = row.ok_or_else(|| {
         ResponseError::Backend(format!(
@@ -348,7 +351,7 @@ async fn publish_in_tx(
 /// the prior explicit None branch. The hub-side `mark_closed` runs
 /// after the runner commits.
 async fn close_in_tx(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     request_id: PromptRequestId,
 ) -> Result<(), ResponseError> {
     sqlx::query(
@@ -358,7 +361,7 @@ async fn close_in_tx(
          ON CONFLICT (request_id) DO UPDATE SET closed = TRUE",
     )
     .bind(request_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
