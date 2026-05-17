@@ -45,11 +45,17 @@ pub(super) async fn require_principal(
         warn!(error = %e, "auth.jwt.verify_failed");
         AuthError::Unauthenticated
     })?;
-    let role = state
-        .users
-        .membership(claims.sub, claims.org)
-        .await?
-        .ok_or(AuthError::NotMember(claims.org))?;
+    let role = if let Some(cached) = state.memberships.lookup(claims.sub, claims.org) {
+        cached
+    } else {
+        let fresh = state
+            .users
+            .membership(claims.sub, claims.org)
+            .await?
+            .ok_or(AuthError::NotMember(claims.org))?;
+        state.memberships.insert(claims.sub, claims.org, fresh);
+        fresh
+    };
     let principal = Principal {
         user_id: claims.sub,
         active_org_id: claims.org,

@@ -213,18 +213,16 @@ async fn update_agent(
         .map(AllowedMcpServers::try_from)
         .transpose()
         .map_err(HttpError::Parse)?;
-    // Tenant gate: ensure the row belongs to the caller's org before
-    // dispatching the privileged update. Inside `begin_as` the RLS
-    // policy rejects rows the caller can't see, so the read here returns
-    // None for cross-org ids and we 404 cleanly.
-    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
-    let visible: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM agents WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(AuthError::from)?;
-    tx.commit().await.map_err(AuthError::from)?;
-    if visible.is_none() {
+    // Tenant gate: 404 cross-org / unknown ids without leaking existence
+    // before dispatching the privileged update.
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::Agents,
+        id.as_uuid(),
+    )
+    .await?
+    {
         return Err(HttpError::NotFound);
     }
     let row = state
@@ -249,14 +247,14 @@ async fn delete_agent(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, HttpError> {
     let id = AgentId::from(id);
-    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
-    let visible: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM agents WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(AuthError::from)?;
-    tx.commit().await.map_err(AuthError::from)?;
-    if visible.is_none() {
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::Agents,
+        id.as_uuid(),
+    )
+    .await?
+    {
         return Err(HttpError::NotFound);
     }
     state.agents.delete(id).await?;

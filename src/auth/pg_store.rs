@@ -1,7 +1,7 @@
 //! Postgres-backed [`UserStore`]. Identity tables are not RLS-protected
 //! in this PR (every authenticated request can see at least their own
-//! user/org rows via the `/me` route). Mutations still run with
-//! `SET LOCAL row_security = off` so we can extend RLS to these tables
+//! user/org rows via the `/me` route). Mutations still go through
+//! [`super::begin_privileged`] so we can extend RLS to these tables
 //! later without rewriting this module.
 
 use std::fmt;
@@ -14,7 +14,10 @@ use sqlx::Row;
 use super::error::AuthError;
 use super::limits::MAX_SLUG_RETRIES;
 use super::store::{ConsumedOAuthState, NewOrg, OAuthStateRow, UpsertedUser, UserStore};
-use super::types::{Email, GoogleProfile, OrgId, OrgMembership, OrgSlug, Role, User, UserId};
+use super::types::{
+    Email, GoogleProfile, OAuthState, OrgId, OrgMembership, OrgSlug, PkceVerifier, Role, User,
+    UserId,
+};
 
 pub struct PgUserStore {
     pool: PgPool,
@@ -40,10 +43,7 @@ impl UserStore for PgUserStore {
         profile: &GoogleProfile,
         now: DateTime<Utc>,
     ) -> Result<UpsertedUser, AuthError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL row_security = off")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = super::begin_privileged(&self.pool).await?;
 
         // Idempotent under concurrent first-logins. Two callbacks for
         // the same brand-new Google account otherwise race on the
@@ -78,7 +78,7 @@ impl UserStore for PgUserStore {
              ON CONFLICT (provider, subject) DO NOTHING",
         )
         .bind(user_id)
-        .bind(&profile.subject)
+        .bind(profile.subject.as_str())
         .bind(profile.email.as_str())
         .bind(now)
         .execute(&mut *tx)
@@ -145,10 +145,7 @@ impl UserStore for PgUserStore {
     }
 
     async fn list_user_orgs(&self, user_id: UserId) -> Result<Vec<OrgMembership>, AuthError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL row_security = off")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = super::begin_privileged(&self.pool).await?;
         let rows = sqlx::query(
             "SELECT o.id, o.name, o.slug::text AS slug, m.role
              FROM org_members m
@@ -174,10 +171,7 @@ impl UserStore for PgUserStore {
     }
 
     async fn membership(&self, user_id: UserId, org_id: OrgId) -> Result<Option<Role>, AuthError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL row_security = off")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = super::begin_privileged(&self.pool).await?;
         let row: Option<String> =
             sqlx::query_scalar("SELECT role FROM org_members WHERE user_id = $1 AND org_id = $2")
                 .bind(user_id)
@@ -189,10 +183,7 @@ impl UserStore for PgUserStore {
     }
 
     async fn read_user(&self, user_id: UserId) -> Result<Option<User>, AuthError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL row_security = off")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = super::begin_privileged(&self.pool).await?;
         let row =
             sqlx::query("SELECT id, email, display_name, avatar_url FROM users WHERE id = $1")
                 .bind(user_id)
@@ -209,16 +200,13 @@ impl UserStore for PgUserStore {
     }
 
     async fn insert_oauth_state(&self, row: &OAuthStateRow) -> Result<(), AuthError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL row_security = off")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = super::begin_privileged(&self.pool).await?;
         sqlx::query(
             "INSERT INTO oauth_login_states (state, pkce_verifier, redirect_to, created_at, expires_at)
              VALUES ($1, $2, $3, $4, $5)",
         )
-        .bind(&row.state)
-        .bind(&row.pkce_verifier)
+        .bind(row.state.as_str())
+        .bind(row.pkce_verifier.as_str())
         .bind(row.redirect_to.as_deref())
         .bind(row.created_at)
         .bind(row.expires_at)
@@ -230,19 +218,16 @@ impl UserStore for PgUserStore {
 
     async fn consume_oauth_state(
         &self,
-        state: &str,
+        state: &OAuthState,
         now: DateTime<Utc>,
     ) -> Result<ConsumedOAuthState, AuthError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL row_security = off")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = super::begin_privileged(&self.pool).await?;
         let row = sqlx::query(
             "DELETE FROM oauth_login_states
              WHERE state = $1 AND expires_at > $2
              RETURNING pkce_verifier, redirect_to",
         )
-        .bind(state)
+        .bind(state.as_str())
         .bind(now)
         .fetch_optional(&mut *tx)
         .await?;
@@ -255,7 +240,7 @@ impl UserStore for PgUserStore {
         tx.commit().await?;
         let row = row.ok_or(AuthError::OAuthStateInvalid)?;
         Ok(ConsumedOAuthState {
-            pkce_verifier: row.get("pkce_verifier"),
+            pkce_verifier: PkceVerifier::try_from(row.get::<String, _>("pkce_verifier"))?,
             redirect_to: row.get("redirect_to"),
         })
     }
@@ -269,10 +254,7 @@ impl PgUserStore {
         display_name: &str,
         now: DateTime<Utc>,
     ) -> Result<NewOrg, AuthError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SET LOCAL row_security = off")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = super::begin_privileged(&self.pool).await?;
         let id = OrgId::new();
         sqlx::query(
             "INSERT INTO organizations (id, name, slug, created_at, updated_at)

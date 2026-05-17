@@ -53,7 +53,7 @@ async fn login(
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
 ) -> Result<Redirect, HttpError> {
-    let start = state.oauth.start();
+    let start = state.oauth.start()?;
     let now = now_utc(&state);
     let expires = now
         + chrono::Duration::from_std(crate::auth::limits::OAUTH_STATE_TTL)
@@ -81,7 +81,9 @@ async fn callback(
         return Err(HttpError::BadRequest(format!("oauth: {err}")));
     }
     let now = now_utc(&state);
-    let consumed = state.users.consume_oauth_state(&query.state, now).await?;
+    let state_token =
+        crate::auth::OAuthState::try_from(query.state.as_str()).map_err(HttpError::Parse)?;
+    let consumed = state.users.consume_oauth_state(&state_token, now).await?;
 
     let profile = state
         .oauth
@@ -109,7 +111,7 @@ async fn callback(
             .as_str()
             .split('@')
             .next()
-            .unwrap_or("workspace");
+            .expect("invariant: str::split always yields at least one element");
         let new_org = state
             .users
             .create_personal_org(upserted.user.id, slug_seed, &display, now)
@@ -140,7 +142,7 @@ async fn callback(
         relay.user.new = upserted.is_new_user,
     );
 
-    let cookie = build_session_cookie(token, state.cookie_secure());
+    let cookie = build_session_cookie(token, state.cookie_secure(), state.jwt.ttl_secs());
     let jar = jar.add(cookie);
     let dest = consumed.redirect_to.unwrap_or_else(|| "/".to_owned());
     // axum-extra: tupling a CookieJar with a Redirect produces a
@@ -148,20 +150,18 @@ async fn callback(
     Ok((jar, Redirect::to(&dest)).into_response())
 }
 
-fn build_session_cookie(token: String, secure: bool) -> Cookie<'static> {
+pub(super) fn build_session_cookie(token: String, secure: bool, ttl_secs: i64) -> Cookie<'static> {
     let mut cookie = Cookie::new(COOKIE_NAME, token);
     cookie.set_http_only(true);
     cookie.set_path("/");
     cookie.set_same_site(SameSite::Lax);
     cookie.set_secure(secure);
-    cookie.set_max_age(CookieDuration::seconds(
-        i64::try_from(crate::auth::limits::JWT_TTL.as_secs()).unwrap_or(i64::MAX),
-    ));
+    cookie.set_max_age(CookieDuration::seconds(ttl_secs));
     cookie
 }
 
 fn now_utc(state: &AppState) -> DateTime<Utc> {
-    DateTime::<Utc>::from(state.clock.now_wall())
+    state.clock.now_utc()
 }
 
 /// Only allow relative-path return URLs (no scheme, no host) so the

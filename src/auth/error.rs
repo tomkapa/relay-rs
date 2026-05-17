@@ -54,4 +54,11 @@ pub enum AuthError {
     /// that should have validated at startup, etc.). Triggers 500.
     #[error("internal: {0}")]
     Internal(&'static str),
+
+    /// Same intent as [`AuthError::Internal`] but carrying a dynamic
+    /// message — e.g. a failed URL parse during OAuth client
+    /// construction where the underlying error string only exists at
+    /// runtime. Triggers 500.
+    #[error("misconfigured: {0}")]
+    Misconfigured(String),
 }

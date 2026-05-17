@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::auth::{OrgId, UserId};
+use crate::auth::{OrgId, TxScope, UserId};
 use crate::clock::SharedClock;
 use crate::mcp::McpServerId;
 use crate::pg_vector;
@@ -69,7 +69,7 @@ impl PgAgentStore {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 
     /// Embed `description` synchronously. Errors propagate so the
@@ -159,7 +159,7 @@ impl AgentStore for PgAgentStore {
     }
 
     async fn create(&self, payload: NewAgent) -> Result<AgentRecord, AgentStoreError> {
-        create_impl(self, AgentTxScope::Privileged, payload).await
+        create_impl(self, TxScope::Privileged, payload).await
     }
 
     async fn create_for_user(
@@ -167,7 +167,7 @@ impl AgentStore for PgAgentStore {
         acting_user_id: UserId,
         payload: NewAgent,
     ) -> Result<AgentRecord, AgentStoreError> {
-        create_impl(self, AgentTxScope::AsUser(acting_user_id), payload).await
+        create_impl(self, TxScope::AsUser(acting_user_id), payload).await
     }
 
     async fn list(&self) -> Result<Vec<AgentRecord>, AgentStoreError> {
@@ -410,38 +410,13 @@ impl AgentStore for PgAgentStore {
     }
 }
 
-/// Transaction scope for [`create_impl`]. Privileged for HTTP routes /
-/// seeder; `AsUser` for the `create_agent` tool so the INSERT runs
-/// RLS-checked.
-#[derive(Debug, Clone, Copy)]
-enum AgentTxScope {
-    Privileged,
-    AsUser(UserId),
-}
-
-impl AgentTxScope {
-    async fn begin(
-        self,
-        pool: &sqlx::PgPool,
-    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, AgentStoreError> {
-        match self {
-            Self::Privileged => crate::auth::begin_privileged(pool)
-                .await
-                .map_err(AgentStoreError::from),
-            Self::AsUser(user_id) => crate::auth::begin_as_user(pool, user_id)
-                .await
-                .map_err(|e| AgentStoreError::Backend(format!("begin_as_user: {e}"))),
-        }
-    }
-}
-
 /// Body of `create` / `create_for_user`. Embed runs ahead of the tx
 /// so the embedding call doesn't hold row locks; the INSERT runs
 /// either privileged (HTTP route) or under `begin_as_user`
 /// (`create_agent` tool) for RLS enforcement.
 async fn create_impl(
     store: &PgAgentStore,
-    scope: AgentTxScope,
+    scope: TxScope,
     payload: NewAgent,
 ) -> Result<AgentRecord, AgentStoreError> {
     let embedding = store.embed(payload.description.as_str()).await?;

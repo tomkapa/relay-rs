@@ -358,16 +358,15 @@ impl SendMessageTool {
         // session(human, caller_agent) or, for descendant agents that have
         // not yet messaged the human, a freshly-minted (Human, Agent(X))
         // session in the same DAG.
+        let caller = crate::auth::Caller::new(ctx.acting_user_id, tenancy.org_id);
         let receiver_session = self
             .sessions
             .resolve_or_create_for_pair_for_user(
-                ctx.acting_user_id,
+                &caller,
                 ctx.root_request_id,
                 ctx.viewer,
                 receiver,
                 Some(ctx.session_id),
-                tenancy.org_id,
-                tenancy.created_by_user_id,
             )
             .await
             .map_err(|e| {

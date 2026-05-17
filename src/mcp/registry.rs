@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use chrono::Utc;
 use serde_json::Value;
 use tracing::{instrument, warn};
 
@@ -322,7 +321,7 @@ impl McpRegistryInner {
             }
         };
 
-        let now = chrono::DateTime::<Utc>::from(self.clock.now_wall());
+        let now = self.clock.now_utc();
         let discovered = ingest_tools(id, &alias, &client, remote_tools, builder);
 
         let _ = self

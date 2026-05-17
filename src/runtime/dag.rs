@@ -119,9 +119,7 @@ impl DagBudget for PgDagBudget {
         acting_user_id: UserId,
         root: PromptRequestId,
     ) -> Result<BudgetBumped, PromptError> {
-        let tx = crate::auth::begin_as_user(&self.pool, acting_user_id)
-            .await
-            .map_err(|e| PromptError::Backend(format!("begin_as_user: {e}")))?;
+        let tx = crate::auth::begin_as_user(&self.pool, acting_user_id).await?;
         bump_or_fail_in_tx(tx, root).await
     }
 

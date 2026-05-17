@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use sqlx::PgPool;
 
 use crate::agents::SharedAgentStore;
 use crate::auth::{GoogleOAuth, JwtSigner, SharedUserStore};
 use crate::clock::SharedClock;
+use crate::http::MembershipCache;
 use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore};
 use crate::memory::SharedMemoryStore;
 use crate::runtime::{
@@ -59,6 +62,9 @@ pub struct AppState {
     /// local-dev (plain http://localhost), on in any prod-shaped
     /// deployment. Sourced from [`crate::config::AuthSettings`].
     pub cookie_secure: bool,
+    /// `(user_id, org_id) → role` lookup cache. Cuts the per-request
+    /// membership round-trip down to a Mutex lookup for repeat callers.
+    pub memberships: Arc<MembershipCache>,
 }
 
 impl AppState {

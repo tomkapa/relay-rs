@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::auth::{OrgId, UserId};
+use crate::auth::{Caller, OrgId, UserId};
 use crate::provider::ChatMessage;
 use crate::runtime::PromptRequestId;
 use crate::types::{MessageSender, Participant};
@@ -65,23 +65,24 @@ pub trait SessionStore: fmt::Debug + Send + Sync {
 
     /// Tenant-scoped variant of [`Self::resolve_or_create_for_pair`].
     ///
-    /// Opens a `begin_as_user(acting_user_id)` transaction so the row's
+    /// Opens a `begin_as_user(caller.user_id)` transaction so the row's
     /// RLS predicate is evaluated against the acting principal —
     /// cross-tenant forks fail at the WITH CHECK boundary. Used from
     /// worker / tool paths where the acting user is read off the
     /// claim's `created_by_user_id`; HTTP route paths keep the
     /// existing privileged entry point because they have already
     /// gated through `begin_as` upstream.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The new session inherits `(org_id, created_by_user_id)` from
+    /// `caller` — both `caller.org_id` and `caller.user_id` land on the
+    /// row. They cannot diverge by construction (see [`Caller`]).
     async fn resolve_or_create_for_pair_for_user(
         &self,
-        acting_user_id: UserId,
+        caller: &Caller,
         root_request_id: PromptRequestId,
         a: Participant,
         b: Participant,
         parent_session_id: Option<SessionId>,
-        org_id: OrgId,
-        created_by_user_id: UserId,
     ) -> Result<SessionId, SessionError>;
 
     /// Append one chat message authored by `sender` and addressed to `receiver`.

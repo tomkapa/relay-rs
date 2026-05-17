@@ -25,7 +25,7 @@ use crate::types::SecretString;
 
 use super::error::AuthError;
 use super::limits::{MAX_USERINFO_BYTES, OAUTH_HTTP_TIMEOUT};
-use super::types::{Email, GoogleProfile};
+use super::types::{Email, GoogleProfile, GoogleSubject, OAuthState, PkceVerifier};
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -55,11 +55,11 @@ impl GoogleOAuth {
         redirect_url: &str,
     ) -> Result<Self, AuthError> {
         let auth = AuthUrl::new(GOOGLE_AUTH_URL.to_owned())
-            .map_err(|e| AuthError::Internal_owned_string(format!("auth url: {e}")))?;
+            .map_err(|e| AuthError::Misconfigured(format!("auth url: {e}")))?;
         let token = TokenUrl::new(GOOGLE_TOKEN_URL.to_owned())
-            .map_err(|e| AuthError::Internal_owned_string(format!("token url: {e}")))?;
+            .map_err(|e| AuthError::Misconfigured(format!("token url: {e}")))?;
         let redirect = RedirectUrl::new(redirect_url.to_owned())
-            .map_err(|e| AuthError::Internal_owned_string(format!("redirect url: {e}")))?;
+            .map_err(|e| AuthError::Misconfigured(format!("redirect url: {e}")))?;
         let client = BasicClient::new(ClientId::new(client_id.expose().to_owned()))
             .set_client_secret(ClientSecret::new(client_secret.expose().to_owned()))
             .set_auth_uri(auth)
@@ -80,7 +80,7 @@ impl GoogleOAuth {
             .build()
             .map_err(|e| AuthError::OAuthProvider(format!("http client: {e}")))?;
         let userinfo_url = Url::parse(GOOGLE_USERINFO_URL)
-            .map_err(|e| AuthError::Internal_owned_string(format!("userinfo url: {e}")))?;
+            .map_err(|e| AuthError::Misconfigured(format!("userinfo url: {e}")))?;
         Ok(Self {
             client,
             http,
@@ -89,9 +89,10 @@ impl GoogleOAuth {
     }
 
     /// Build a redirect URL for the browser plus the (state, verifier)
-    /// pair the caller must store for the upcoming callback.
-    #[must_use]
-    pub fn start(&self) -> AuthStart {
+    /// pair the caller must store for the upcoming callback. Both
+    /// secrets pass through their newtype smart constructors so a
+    /// future provider that emits malformed values fails fast here.
+    pub fn start(&self) -> Result<AuthStart, AuthError> {
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
         let (url, csrf) = self
             .client
@@ -101,22 +102,26 @@ impl GoogleOAuth {
             .add_scope(Scope::new("profile".to_owned()))
             .set_pkce_challenge(challenge)
             .url();
-        AuthStart {
+        Ok(AuthStart {
             authorize_url: url,
-            state: csrf.secret().to_owned(),
-            pkce_verifier: verifier.secret().to_owned(),
-        }
+            state: OAuthState::try_from(csrf.secret().as_str())?,
+            pkce_verifier: PkceVerifier::try_from(verifier.secret().as_str())?,
+        })
     }
 
     /// Exchange the `code` from the callback for a userinfo profile. The
     /// HTTP client and timeouts wrap every external await per
     /// CLAUDE.md §5.
-    pub async fn exchange(&self, code: &str, verifier: &str) -> Result<GoogleProfile, AuthError> {
+    pub async fn exchange(
+        &self,
+        code: &str,
+        verifier: &PkceVerifier,
+    ) -> Result<GoogleProfile, AuthError> {
         let http = self.http.clone();
         let token = self
             .client
             .exchange_code(AuthorizationCode::new(code.to_owned()))
-            .set_pkce_verifier(PkceCodeVerifier::new(verifier.to_owned()))
+            .set_pkce_verifier(PkceCodeVerifier::new(verifier.as_str().to_owned()))
             .request_async(&http)
             .await
             .map_err(|e| AuthError::OAuthProvider(format!("token exchange: {e}")))?;
@@ -159,8 +164,9 @@ impl GoogleOAuth {
             .email
             .ok_or_else(|| AuthError::OAuthProvider("userinfo missing email".into()))?;
         let email = Email::try_from(email_raw.as_str())?;
+        let subject = GoogleSubject::try_from(raw.sub.as_str())?;
         Ok(GoogleProfile {
-            subject: raw.sub,
+            subject,
             email,
             email_verified: true,
             display_name: raw.name,
@@ -173,19 +179,27 @@ impl GoogleOAuth {
 #[derive(Debug, Clone)]
 pub struct AuthStart {
     pub authorize_url: Url,
-    pub state: String,
-    pub pkce_verifier: String,
+    pub state: OAuthState,
+    pub pkce_verifier: PkceVerifier,
 }
 
 /// Trait seam for tests. Production code uses [`GoogleOAuth`] directly.
 #[async_trait]
 pub trait TokenExchanger: Send + Sync + 'static {
-    async fn exchange(&self, code: &str, verifier: &str) -> Result<GoogleProfile, AuthError>;
+    async fn exchange(
+        &self,
+        code: &str,
+        verifier: &PkceVerifier,
+    ) -> Result<GoogleProfile, AuthError>;
 }
 
 #[async_trait]
 impl TokenExchanger for GoogleOAuth {
-    async fn exchange(&self, code: &str, verifier: &str) -> Result<GoogleProfile, AuthError> {
+    async fn exchange(
+        &self,
+        code: &str,
+        verifier: &PkceVerifier,
+    ) -> Result<GoogleProfile, AuthError> {
         Self::exchange(self, code, verifier).await
     }
 }
@@ -197,18 +211,4 @@ struct GoogleUserinfo {
     email_verified: Option<bool>,
     name: Option<String>,
     picture: Option<String>,
-}
-
-// Helper to keep AuthError::Internal taking &'static str ergonomic when
-// the message is dynamic — we box-leak via Box::leak would create a
-// memory leak; instead we extend the AuthError surface here.
-impl AuthError {
-    #[allow(non_snake_case)]
-    fn Internal_owned_string(msg: String) -> Self {
-        // Lean on OAuthProvider for dynamic strings during startup
-        // parsing — these would otherwise need a boxed String variant.
-        // OAuthProvider semantically also covers misconfigured endpoint
-        // URLs (which are part of provider integration).
-        Self::OAuthProvider(msg)
-    }
 }

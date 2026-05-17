@@ -9,6 +9,13 @@ use std::time::{Duration, Instant, SystemTime};
 pub trait Clock: fmt::Debug + Send + Sync + 'static {
     fn now(&self) -> Instant;
     fn now_wall(&self) -> SystemTime;
+
+    /// Convenience: the same instant as [`Clock::now_wall`] in UTC. Default impl
+    /// is correct for every clock; subsystems use this instead of carrying their
+    /// own `DateTime::<Utc>::from(clock.now_wall())` helper.
+    fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::from(self.now_wall())
+    }
 }
 
 /// Reference-counted clock handle. Subsystems hold one without taking a generic

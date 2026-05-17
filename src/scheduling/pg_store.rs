@@ -36,7 +36,7 @@ impl PgScheduledTaskStore {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 }
 
@@ -126,9 +126,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         // principal (the scheduler reads this column to mint the
         // resulting `NewPromptRequest`'s tenancy).
         payload.created_by_user_id = acting_user_id;
-        let tx = begin_as_user(&self.pool, acting_user_id)
-            .await
-            .map_err(|e| ScheduledTaskError::Backend(format!("begin_as_user: {e}")))?;
+        let tx = begin_as_user(&self.pool, acting_user_id).await?;
         create_in_tx(self, tx, payload).await
     }
 
@@ -138,9 +136,7 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
         task: ScheduledTaskId,
         owner: AgentId,
     ) -> Result<(), ScheduledTaskError> {
-        let tx = begin_as_user(&self.pool, acting_user_id)
-            .await
-            .map_err(|e| ScheduledTaskError::Backend(format!("begin_as_user: {e}")))?;
+        let tx = begin_as_user(&self.pool, acting_user_id).await?;
         cancel_in_tx(self, tx, task, owner).await
     }
 

@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::agents::AgentId;
-use crate::auth::{OrgId, UserId};
+use crate::auth::{Caller, OrgId, TxScope, UserId};
 use crate::clock::SharedClock;
 use crate::provider::{AssistantContent, ChatMessage, UserContent};
 use crate::runtime::PromptRequestId;
@@ -54,7 +54,7 @@ impl PgSessionStore {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 }
 
@@ -114,28 +114,21 @@ impl SessionStore for PgSessionStore {
 
     async fn resolve_or_create_for_pair_for_user(
         &self,
-        acting_user_id: UserId,
+        caller: &Caller,
         root_request_id: PromptRequestId,
         a: Participant,
         b: Participant,
         parent_session_id: Option<SessionId>,
-        org_id: OrgId,
-        _created_by_user_id: UserId,
     ) -> Result<SessionId, SessionError> {
         // Tenant-scoped tx — the RLS WITH CHECK on `sessions.org_id`
         // rejects a row whose `org_id` is not in the acting user's
-        // memberships. Worker / tool callers source `acting_user_id`
-        // from the claimed session's `created_by_user_id`.
+        // memberships. Worker / tool callers source `caller` from the
+        // claimed session's `(created_by_user_id, org_id)`.
         //
         // Identity invariant: the inserted session's `created_by_user_id`
-        // is the authenticated actor, *not* whatever the caller named in
-        // the argument. This closes a forgery window: a same-org caller
-        // could otherwise create a session attributed to another member
-        // and every subsequent worker `_for_user` write claimed off that
-        // session would run under the spoofed identity.
-        let mut tx = crate::auth::begin_as_user(&self.pool, acting_user_id)
-            .await
-            .map_err(|e| SessionError::Backend(format!("begin_as_user: {e}")))?;
+        // is the authenticated actor, never a free-form caller-supplied
+        // value. `Caller` makes this impossible to express incorrectly.
+        let mut tx = crate::auth::begin_as_user(&self.pool, caller.user_id).await?;
         let id = resolve_or_create_for_pair_inner(
             self,
             &mut tx,
@@ -143,8 +136,8 @@ impl SessionStore for PgSessionStore {
             a,
             b,
             parent_session_id,
-            org_id,
-            acting_user_id,
+            caller.org_id,
+            caller.user_id,
         )
         .await?;
         tx.commit().await.map_err(SessionError::Db)?;
@@ -170,7 +163,7 @@ impl SessionStore for PgSessionStore {
     ) -> Result<(), SessionError> {
         append_row(
             self,
-            AppendTxScope::Privileged,
+            TxScope::Privileged,
             id,
             sender,
             receiver,
@@ -191,7 +184,7 @@ impl SessionStore for PgSessionStore {
     ) -> Result<(), SessionError> {
         append_row(
             self,
-            AppendTxScope::AsUser(acting_user_id),
+            TxScope::AsUser(acting_user_id),
             id,
             sender,
             receiver,
@@ -223,7 +216,7 @@ impl SessionStore for PgSessionStore {
         let body = ChatMessage::User(vec![UserContent::Text(note)]);
         append_row(
             self,
-            AppendTxScope::Privileged,
+            TxScope::Privileged,
             id,
             MessageSender::System,
             receiver,
@@ -244,7 +237,7 @@ impl SessionStore for PgSessionStore {
         let body = ChatMessage::User(vec![UserContent::Text(note)]);
         append_row(
             self,
-            AppendTxScope::AsUser(acting_user_id),
+            TxScope::AsUser(acting_user_id),
             id,
             MessageSender::System,
             receiver,
@@ -610,16 +603,6 @@ async fn resolve_or_create_for_pair_inner(
     Ok(id)
 }
 
-/// Transaction scope for [`append_row`]: privileged for HTTP routes /
-/// schedulers that have already gated through `begin_as`, or
-/// tenant-scoped for worker / tool paths so the `session_messages`
-/// INSERT is RLS-checked against the acting principal.
-#[derive(Debug, Clone, Copy)]
-enum AppendTxScope {
-    Privileged,
-    AsUser(UserId),
-}
-
 /// Single-row insert path shared by `append` and `append_system_nudge`
 /// in both their privileged and tenant-scoped flavours.
 ///
@@ -634,7 +617,7 @@ enum AppendTxScope {
 #[allow(clippy::too_many_arguments)]
 async fn append_row(
     store: &PgSessionStore,
-    scope: AppendTxScope,
+    scope: TxScope,
     id: SessionId,
     sender: MessageSender,
     receiver: Participant,
@@ -656,14 +639,7 @@ async fn append_row(
     // visibility upstream. The trigger on `session_messages` raises
     // if our bound `org_id` ever drifts from the parent session's;
     // RLS adds the cross-tenant defence on top.
-    let mut tx = match scope {
-        AppendTxScope::Privileged => crate::auth::begin_privileged(&store.pool)
-            .await
-            .map_err(SessionError::Db)?,
-        AppendTxScope::AsUser(user_id) => crate::auth::begin_as_user(&store.pool, user_id)
-            .await
-            .map_err(|e| SessionError::Backend(format!("begin_as_user: {e}")))?,
-    };
+    let mut tx = scope.begin(&store.pool).await?;
     let row: Option<(bool, i64)> = sqlx::query_as(
         "WITH locked AS (
              SELECT id, org_id FROM sessions WHERE id = $1 FOR UPDATE

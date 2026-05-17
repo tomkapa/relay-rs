@@ -169,11 +169,178 @@ impl TryFrom<String> for OrgSlug {
     }
 }
 
+/// Google's `sub` claim — stable per-user identifier scoped to our
+/// OAuth client. Persisted in `user_identities.subject` and used as
+/// the primary key for "is this the same Google account."
+///
+/// Google publishes `sub` as a numeric string up to 255 chars; we
+/// enforce non-empty + the 255-byte cap at the boundary.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct GoogleSubject(Arc<str>);
+
+impl GoogleSubject {
+    pub const MAX_BYTES: usize = 255;
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for GoogleSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // PII — debug-tier per CLAUDE.md §2; redact in any printed form.
+        f.write_str("GoogleSubject(***)")
+    }
+}
+
+impl TryFrom<&str> for GoogleSubject {
+    type Error = ParseError;
+    fn try_from(raw: &str) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(ParseError::Empty {
+                field: "google_subject",
+            });
+        }
+        if raw.len() > Self::MAX_BYTES {
+            return Err(ParseError::TooLong {
+                field: "google_subject",
+                max: Self::MAX_BYTES,
+                got: raw.len(),
+            });
+        }
+        Ok(Self(Arc::from(raw)))
+    }
+}
+
+impl TryFrom<String> for GoogleSubject {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_from(raw.as_str())
+    }
+}
+
+/// RFC 7636 PKCE `code_verifier` — 43–128 chars from `[A-Za-z0-9\-._~]`.
+/// Treated as secret material: redacted Debug, never logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PkceVerifier(Arc<str>);
+
+impl PkceVerifier {
+    pub const MIN_BYTES: usize = 43;
+    pub const MAX_BYTES: usize = 128;
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PkceVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PkceVerifier(***)")
+    }
+}
+
+impl TryFrom<&str> for PkceVerifier {
+    type Error = ParseError;
+    fn try_from(raw: &str) -> Result<Self, Self::Error> {
+        if raw.len() < Self::MIN_BYTES {
+            return Err(ParseError::Malformed {
+                field: "pkce_verifier",
+                detail: "shorter than RFC 7636 minimum (43)",
+            });
+        }
+        if raw.len() > Self::MAX_BYTES {
+            return Err(ParseError::TooLong {
+                field: "pkce_verifier",
+                max: Self::MAX_BYTES,
+                got: raw.len(),
+            });
+        }
+        if !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+        {
+            return Err(ParseError::Malformed {
+                field: "pkce_verifier",
+                detail: "non-unreserved character",
+            });
+        }
+        Ok(Self(Arc::from(raw)))
+    }
+}
+
+impl TryFrom<String> for PkceVerifier {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_from(raw.as_str())
+    }
+}
+
+/// One-time CSRF nonce for the OAuth round-trip. Stored in
+/// `oauth_login_states.state`. URL-safe; bounded so a hostile
+/// callback cannot tip the row over a column-size cap.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OAuthState(Arc<str>);
+
+impl OAuthState {
+    pub const MIN_BYTES: usize = 16;
+    pub const MAX_BYTES: usize = 256;
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OAuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Effectively a single-use secret; treat as redacted.
+        f.write_str("OAuthState(***)")
+    }
+}
+
+impl TryFrom<&str> for OAuthState {
+    type Error = ParseError;
+    fn try_from(raw: &str) -> Result<Self, Self::Error> {
+        if raw.len() < Self::MIN_BYTES {
+            return Err(ParseError::Malformed {
+                field: "oauth_state",
+                detail: "too short",
+            });
+        }
+        if raw.len() > Self::MAX_BYTES {
+            return Err(ParseError::TooLong {
+                field: "oauth_state",
+                max: Self::MAX_BYTES,
+                got: raw.len(),
+            });
+        }
+        if !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+        {
+            return Err(ParseError::Malformed {
+                field: "oauth_state",
+                detail: "non-URL-safe character",
+            });
+        }
+        Ok(Self(Arc::from(raw)))
+    }
+}
+
+impl TryFrom<String> for OAuthState {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_from(raw.as_str())
+    }
+}
+
 /// Profile claims pulled from Google's `userinfo` endpoint. Built by
 /// [`crate::auth::oauth_google`] and consumed by [`UserStore::upsert_from_google`].
 #[derive(Debug, Clone)]
 pub struct GoogleProfile {
-    pub subject: String,
+    pub subject: GoogleSubject,
     pub email: Email,
     pub email_verified: bool,
     pub display_name: Option<String>,

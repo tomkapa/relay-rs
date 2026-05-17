@@ -102,8 +102,9 @@ impl AuthAgentsHarness {
             jwt,
             oauth,
             users,
-            clock,
+            clock: clock.clone(),
             cookie_secure: false,
+            memberships: std::sync::Arc::new(relay_rs::http::MembershipCache::new(clock.clone())),
         };
 
         Self {

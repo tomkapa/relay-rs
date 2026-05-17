@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use crate::agents::AgentId;
-use crate::auth::UserId;
+use crate::auth::{TxScope, UserId};
 use crate::clock::SharedClock;
 use crate::pg_vector;
 use crate::provider::SharedEmbeddingProvider;
@@ -60,7 +60,7 @@ impl PgMemoryStore {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 
     /// Embed `content` synchronously. Errors propagate so the mutation
@@ -78,41 +78,11 @@ impl fmt::Debug for PgMemoryStore {
     }
 }
 
-/// Transaction scope for the memory store's tenant-aware paths.
-/// Privileged is reserved for librarian / reflection-scheduler /
-/// HTTP-route paths that have already gated through `begin_as` (or
-/// run cross-tenant by design); `AsUser` is the worker / tool path
-/// that needs the RLS WITH CHECK on `agent_memories` and
-/// `memory_events` to fire.
-#[derive(Debug, Clone, Copy)]
-enum MemoryTxScope {
-    Privileged,
-    AsUser(UserId),
-}
-
-impl MemoryTxScope {
-    async fn begin(
-        self,
-        pool: &sqlx::PgPool,
-    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, MemoryStoreError> {
-        match self {
-            Self::Privileged => crate::auth::begin_privileged(pool)
-                .await
-                .map_err(MemoryStoreError::Db),
-            Self::AsUser(user_id) => crate::auth::begin_as_user(pool, user_id)
-                .await
-                .map_err(|e| {
-                    MemoryStoreError::Db(sqlx::Error::Protocol(format!("begin_as_user: {e}")))
-                }),
-        }
-    }
-}
-
 #[async_trait]
 #[allow(clippy::too_many_lines)] // exhaustive dispatch on a 3-arm enum
 impl MemoryStore for PgMemoryStore {
     async fn apply(&self, mutation: MemoryMutation) -> Result<MutationOutcome, MemoryStoreError> {
-        apply_impl(self, MemoryTxScope::Privileged, mutation).await
+        apply_impl(self, TxScope::Privileged, mutation).await
     }
 
     async fn apply_for_user(
@@ -120,7 +90,7 @@ impl MemoryStore for PgMemoryStore {
         acting_user_id: UserId,
         mutation: MemoryMutation,
     ) -> Result<MutationOutcome, MemoryStoreError> {
-        apply_impl(self, MemoryTxScope::AsUser(acting_user_id), mutation).await
+        apply_impl(self, TxScope::AsUser(acting_user_id), mutation).await
     }
 
     async fn record_validation_for_user(
@@ -133,7 +103,7 @@ impl MemoryStore for PgMemoryStore {
     ) -> Result<MemoryRow, MemoryStoreError> {
         record_validation_impl(
             self,
-            MemoryTxScope::AsUser(acting_user_id),
+            TxScope::AsUser(acting_user_id),
             agent,
             memory,
             origin,
@@ -148,7 +118,7 @@ impl MemoryStore for PgMemoryStore {
         id: ContradictionEventId,
         outcome: ResolutionOutcome,
     ) -> Result<(), MemoryStoreError> {
-        resolve_contradiction_impl(self, MemoryTxScope::AsUser(acting_user_id), id, outcome).await
+        resolve_contradiction_impl(self, TxScope::AsUser(acting_user_id), id, outcome).await
     }
 
     async fn record_access_for_user(
@@ -156,7 +126,7 @@ impl MemoryStore for PgMemoryStore {
         acting_user_id: UserId,
         ids: &[MemoryId],
     ) -> Result<(), MemoryStoreError> {
-        record_access_impl(self, MemoryTxScope::AsUser(acting_user_id), ids).await
+        record_access_impl(self, TxScope::AsUser(acting_user_id), ids).await
     }
 
     async fn list(&self, agent: AgentId) -> Result<Vec<MemoryRow>, MemoryStoreError> {
@@ -488,15 +458,7 @@ impl MemoryStore for PgMemoryStore {
         origin: ValidationOrigin,
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError> {
-        record_validation_impl(
-            self,
-            MemoryTxScope::Privileged,
-            agent,
-            memory,
-            origin,
-            detail,
-        )
-        .await
+        record_validation_impl(self, TxScope::Privileged, agent, memory, origin, detail).await
     }
 
     async fn record_contradiction(
@@ -607,7 +569,7 @@ impl MemoryStore for PgMemoryStore {
         id: ContradictionEventId,
         outcome: ResolutionOutcome,
     ) -> Result<(), MemoryStoreError> {
-        resolve_contradiction_impl(self, MemoryTxScope::Privileged, id, outcome).await
+        resolve_contradiction_impl(self, TxScope::Privileged, id, outcome).await
     }
 
     async fn evict_overflow(
@@ -687,19 +649,7 @@ impl MemoryStore for PgMemoryStore {
         let now = self.now();
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
-        let sql = format!(
-            "SELECT {MEMORY_EVENT_COLUMNS} FROM memory_events WHERE id = $1 AND agent_id = $2",
-        );
-        let row = sqlx::query(&sql)
-            .bind(event)
-            .bind(agent)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let evt = match row {
-            Some(r) => decode_memory_event(&r)?,
-            None => return Err(MemoryStoreError::EventNotFound { id: event }),
-        };
-
+        let evt = load_event(&mut tx, agent, event).await?;
         let target = evt.target_memory_id;
         // Inverse mapping (payload variants carry everything replay needs —
         // no defensive defaults, no extra journal scans):
@@ -709,24 +659,7 @@ impl MemoryStore for PgMemoryStore {
         let inverse_event = MemoryEventId::new();
         match evt.payload {
             MemoryEventPayload::Write { .. } => {
-                let prior = lock_existing(&mut tx, agent, target, MutationSource::Operator).await?;
-                let payload = MemoryEventPayload::Forget {
-                    before: prior.content.clone(),
-                };
-                insert_event(
-                    &mut tx,
-                    inverse_event,
-                    agent,
-                    target,
-                    MutationSource::Operator,
-                    now,
-                    &payload,
-                )
-                .await?;
-                sqlx::query("DELETE FROM agent_memories WHERE id = $1")
-                    .bind(target)
-                    .execute(&mut *tx)
-                    .await?;
+                revert_write(&mut tx, agent, target, inverse_event, now).await?;
             }
             MemoryEventPayload::Update {
                 before,
@@ -735,77 +668,21 @@ impl MemoryStore for PgMemoryStore {
                 pinned,
                 ..
             } => {
-                let prior = lock_existing(&mut tx, agent, target, MutationSource::Operator).await?;
-                let payload = MemoryEventPayload::Update {
-                    before: prior.content.clone(),
-                    after: before.clone(),
+                revert_update(
+                    &mut tx,
+                    agent,
+                    target,
+                    inverse_event,
+                    now,
+                    before,
                     kind,
                     state,
                     pinned,
-                };
-                insert_event(
-                    &mut tx,
-                    inverse_event,
-                    agent,
-                    target,
-                    MutationSource::Operator,
-                    now,
-                    &payload,
                 )
-                .await?;
-                sqlx::query(
-                    "UPDATE agent_memories SET content = $1, state = $2, pinned = $3 WHERE id = $4",
-                )
-                .bind(before.as_str())
-                .bind(state)
-                .bind(pinned)
-                .bind(target)
-                .execute(&mut *tx)
                 .await?;
             }
             MemoryEventPayload::Forget { before } => {
-                // Walk back to the most recent write/update event for this
-                // memory to recover the lifecycle attrs (the forget event
-                // itself does not carry them). Missing means journal
-                // corruption — surface, don't default.
-                let attrs = restore_attrs_for(&mut tx, agent, target).await?;
-                let payload = MemoryEventPayload::Write {
-                    content: before.clone(),
-                    kind: attrs.kind,
-                    state: attrs.state,
-                    pinned: attrs.pinned,
-                };
-                insert_event(
-                    &mut tx,
-                    inverse_event,
-                    agent,
-                    target,
-                    MutationSource::Operator,
-                    now,
-                    &payload,
-                )
-                .await?;
-                // `org_id` derived from the parent agent via subquery —
-                // see `apply_write` for the rationale. The
-                // `agent_memories_enforce_org` trigger parity-checks it.
-                sqlx::query(
-                    "INSERT INTO agent_memories
-                         (id, agent_id, org_id, kind, content, state, pinned,
-                          source_turn_id,
-                          created_at, last_validated_at, last_accessed_at, access_count)
-                     VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
-                             $3, $4, $5, $6, NULL, $7, $7, $7, 0)
-                     ON CONFLICT (id) DO NOTHING",
-                )
-                .bind(target)
-                .bind(agent)
-                .bind(attrs.kind)
-                .bind(before.as_str())
-                .bind(attrs.state)
-                .bind(attrs.pinned)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+                revert_forget(&mut tx, agent, target, inverse_event, now, before).await?;
             }
         }
 
@@ -858,8 +735,157 @@ impl MemoryStore for PgMemoryStore {
     }
 
     async fn record_access(&self, ids: &[MemoryId]) -> Result<(), MemoryStoreError> {
-        record_access_impl(self, MemoryTxScope::Privileged, ids).await
+        record_access_impl(self, TxScope::Privileged, ids).await
     }
+}
+
+/// Load the `memory_events` row to be reverted, gated by `(id, agent_id)`.
+async fn load_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    event: MemoryEventId,
+) -> Result<MemoryEvent, MemoryStoreError> {
+    let sql = format!(
+        "SELECT {MEMORY_EVENT_COLUMNS} FROM memory_events WHERE id = $1 AND agent_id = $2",
+    );
+    let row = sqlx::query(&sql)
+        .bind(event)
+        .bind(agent)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map_or_else(
+        || Err(MemoryStoreError::EventNotFound { id: event }),
+        |r| decode_memory_event(&r),
+    )
+}
+
+/// Inverse of a `Write` event: forget the materialised row and journal
+/// the deletion (with the now-current content captured as `before`).
+async fn revert_write(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    target: MemoryId,
+    inverse_event: MemoryEventId,
+    now: DateTime<Utc>,
+) -> Result<(), MemoryStoreError> {
+    let prior = lock_existing(tx, agent, target, MutationSource::Operator).await?;
+    let payload = MemoryEventPayload::Forget {
+        before: prior.content.clone(),
+    };
+    insert_event(
+        tx,
+        inverse_event,
+        agent,
+        target,
+        MutationSource::Operator,
+        now,
+        &payload,
+    )
+    .await?;
+    sqlx::query("DELETE FROM agent_memories WHERE id = $1")
+        .bind(target)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Inverse of an `Update` event: write the prior `before` back into the
+/// row and journal a fresh `Update` whose `before` is the now-current
+/// content.
+#[allow(clippy::too_many_arguments)]
+async fn revert_update(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    target: MemoryId,
+    inverse_event: MemoryEventId,
+    now: DateTime<Utc>,
+    before: MemoryContent,
+    kind: MemoryKind,
+    state: MemoryState,
+    pinned: bool,
+) -> Result<(), MemoryStoreError> {
+    let prior = lock_existing(tx, agent, target, MutationSource::Operator).await?;
+    let payload = MemoryEventPayload::Update {
+        before: prior.content.clone(),
+        after: before.clone(),
+        kind,
+        state,
+        pinned,
+    };
+    insert_event(
+        tx,
+        inverse_event,
+        agent,
+        target,
+        MutationSource::Operator,
+        now,
+        &payload,
+    )
+    .await?;
+    sqlx::query("UPDATE agent_memories SET content = $1, state = $2, pinned = $3 WHERE id = $4")
+        .bind(before.as_str())
+        .bind(state)
+        .bind(pinned)
+        .bind(target)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Inverse of a `Forget` event: walk the journal for the most-recent
+/// lifecycle attrs, write a fresh `agent_memories` row with the prior
+/// `before` content, and journal a `Write` event marking the restore.
+async fn revert_forget(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    target: MemoryId,
+    inverse_event: MemoryEventId,
+    now: DateTime<Utc>,
+    before: MemoryContent,
+) -> Result<(), MemoryStoreError> {
+    // Walk back to the most recent write/update event for this memory
+    // to recover the lifecycle attrs (the forget event itself does not
+    // carry them). Missing means journal corruption — surface, don't
+    // default.
+    let attrs = restore_attrs_for(tx, agent, target).await?;
+    let payload = MemoryEventPayload::Write {
+        content: before.clone(),
+        kind: attrs.kind,
+        state: attrs.state,
+        pinned: attrs.pinned,
+    };
+    insert_event(
+        tx,
+        inverse_event,
+        agent,
+        target,
+        MutationSource::Operator,
+        now,
+        &payload,
+    )
+    .await?;
+    // `org_id` derived from the parent agent via subquery — see
+    // `apply_write` for the rationale. The
+    // `agent_memories_enforce_org` trigger parity-checks it.
+    sqlx::query(
+        "INSERT INTO agent_memories
+             (id, agent_id, org_id, kind, content, state, pinned,
+              source_turn_id,
+              created_at, last_validated_at, last_accessed_at, access_count)
+         VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
+                 $3, $4, $5, $6, NULL, $7, $7, $7, 0)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(target)
+    .bind(agent)
+    .bind(attrs.kind)
+    .bind(before.as_str())
+    .bind(attrs.state)
+    .bind(attrs.pinned)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Body of `apply` / `apply_for_user`. Opens the tx via `scope` so the
@@ -867,7 +893,7 @@ impl MemoryStore for PgMemoryStore {
 /// RLS-checked (worker / tool mutations).
 async fn apply_impl(
     store: &PgMemoryStore,
-    scope: MemoryTxScope,
+    scope: TxScope,
     mutation: MemoryMutation,
 ) -> Result<MutationOutcome, MemoryStoreError> {
     // Embed BEFORE opening the transaction — embedding can be slow,
@@ -925,7 +951,7 @@ async fn apply_impl(
 /// Body of `record_validation` / `record_validation_for_user`.
 async fn record_validation_impl(
     store: &PgMemoryStore,
-    scope: MemoryTxScope,
+    scope: TxScope,
     agent: AgentId,
     memory: MemoryId,
     origin: ValidationOrigin,
@@ -996,7 +1022,7 @@ async fn record_validation_impl(
 /// Body of `resolve_contradiction` / `resolve_contradiction_for_user`.
 async fn resolve_contradiction_impl(
     store: &PgMemoryStore,
-    scope: MemoryTxScope,
+    scope: TxScope,
     id: ContradictionEventId,
     outcome: ResolutionOutcome,
 ) -> Result<(), MemoryStoreError> {
@@ -1042,7 +1068,7 @@ async fn resolve_contradiction_impl(
 /// Body of `record_access` / `record_access_for_user`.
 async fn record_access_impl(
     store: &PgMemoryStore,
-    scope: MemoryTxScope,
+    scope: TxScope,
     ids: &[MemoryId],
 ) -> Result<(), MemoryStoreError> {
     if ids.is_empty() {

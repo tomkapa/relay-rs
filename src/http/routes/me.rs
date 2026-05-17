@@ -14,6 +14,7 @@ use crate::auth::{AuthError, OrgId, OrgMembership, Principal, Role, User, limits
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
+use super::auth::build_session_cookie;
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -110,14 +111,7 @@ async fn switch_org(
         .await?
         .ok_or(AuthError::NotMember(req.org_id))?;
     let token = state.jwt.mint(principal.user_id, req.org_id)?;
-    let mut cookie = Cookie::new(COOKIE_NAME, token);
-    cookie.set_http_only(true);
-    cookie.set_path("/");
-    cookie.set_same_site(SameSite::Lax);
-    cookie.set_secure(state.cookie_secure());
-    cookie.set_max_age(CookieDuration::seconds(
-        i64::try_from(crate::auth::limits::JWT_TTL.as_secs()).unwrap_or(i64::MAX),
-    ));
+    let cookie = build_session_cookie(token, state.cookie_secure(), state.jwt.ttl_secs());
     let jar = jar.add(cookie);
     Ok((
         jar,

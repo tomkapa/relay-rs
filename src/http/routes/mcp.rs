@@ -208,18 +208,16 @@ async fn update_mcp_server(
         .map(|inner| inner.map(McpDescription::try_from).transpose())
         .transpose()
         .map_err(HttpError::Parse)?;
-    // Tenant gate: ensure the row belongs to the caller's org before
-    // dispatching the privileged update. Inside `begin_as` the RLS
-    // policy rejects rows the caller can't see, so the `read` here
-    // returns rows-affected = 0 for cross-org ids and we 404 cleanly.
-    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
-    let visible: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM mcp_servers WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(AuthError::from)?;
-    tx.commit().await.map_err(AuthError::from)?;
-    if visible.is_none() {
+    // Tenant gate: 404 cross-org / unknown ids without leaking existence
+    // before dispatching the privileged update.
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::McpServers,
+        id.as_uuid(),
+    )
+    .await?
+    {
         return Err(HttpError::NotFound);
     }
     let row = state
@@ -245,14 +243,14 @@ async fn delete_mcp_server(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, HttpError> {
     let id = McpServerId::from(id);
-    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
-    let visible: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM mcp_servers WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(AuthError::from)?;
-    tx.commit().await.map_err(AuthError::from)?;
-    if visible.is_none() {
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::McpServers,
+        id.as_uuid(),
+    )
+    .await?
+    {
         return Err(HttpError::NotFound);
     }
     state.mcp_store.delete(id, principal.active_org_id).await?;

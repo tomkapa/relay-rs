@@ -719,6 +719,7 @@ pub async fn build_server(
     .map_err(AppError::Auth)?;
     let users: SharedUserStore = Arc::new(PgUserStore::new(pieces.pool.clone()));
 
+    let memberships = Arc::new(crate::http::MembershipCache::new(pieces.clock.clone()));
     let state = AppState {
         queue: pieces.queue,
         leases: pieces.leases,
@@ -736,6 +737,7 @@ pub async fn build_server(
         users,
         clock: pieces.clock.clone(),
         cookie_secure: settings.auth.cookie_secure,
+        memberships,
     };
 
     Ok(Server {

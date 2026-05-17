@@ -3,8 +3,11 @@
 
 mod auth_layer;
 mod error;
+mod membership_cache;
 mod routes;
 mod state;
+
+pub use membership_cache::MembershipCache;
 
 pub use error::HttpError;
 pub use routes::router;

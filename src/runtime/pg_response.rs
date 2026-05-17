@@ -26,6 +26,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::warn;
 
+use crate::auth::TxScope;
 use crate::clock::SharedClock;
 
 use super::error::ResponseError;
@@ -99,7 +100,7 @@ impl PgResponseHub {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 
     fn table(&self) -> std::sync::MutexGuard<'_, SlotTable> {
@@ -202,7 +203,7 @@ impl ResponseSink for PgResponseHub {
         request_id: PromptRequestId,
         chunk: ResponseChunk,
     ) -> Result<ChunkSeq, ResponseError> {
-        publish_impl(self, PublishTxScope::Privileged, request_id, chunk).await
+        publish_impl(self, TxScope::Privileged, request_id, chunk).await
     }
 
     async fn publish_for_user(
@@ -211,17 +212,11 @@ impl ResponseSink for PgResponseHub {
         request_id: PromptRequestId,
         chunk: ResponseChunk,
     ) -> Result<ChunkSeq, ResponseError> {
-        publish_impl(
-            self,
-            PublishTxScope::AsUser(acting_user_id),
-            request_id,
-            chunk,
-        )
-        .await
+        publish_impl(self, TxScope::AsUser(acting_user_id), request_id, chunk).await
     }
 
     async fn close(&self, request_id: PromptRequestId) -> Result<(), ResponseError> {
-        close_impl(self, PublishTxScope::Privileged, request_id).await
+        close_impl(self, TxScope::Privileged, request_id).await
     }
 
     async fn close_for_user(
@@ -229,39 +224,47 @@ impl ResponseSink for PgResponseHub {
         acting_user_id: crate::auth::UserId,
         request_id: PromptRequestId,
     ) -> Result<(), ResponseError> {
-        close_impl(self, PublishTxScope::AsUser(acting_user_id), request_id).await
+        close_impl(self, TxScope::AsUser(acting_user_id), request_id).await
     }
 }
 
-/// Transaction scope for the publish / close paths. Mirrors the
-/// session store's split: workers and tools running mid-turn open
-/// `begin_as_user` so the chunk + stream INSERTs are RLS-checked,
-/// HTTP routes / schedulers reuse the privileged entry point.
-#[derive(Debug, Clone, Copy)]
-enum PublishTxScope {
-    Privileged,
-    AsUser(crate::auth::UserId),
-}
-
-impl PublishTxScope {
-    async fn begin(
-        self,
-        pool: &sqlx::PgPool,
-    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, ResponseError> {
-        match self {
-            Self::Privileged => crate::auth::begin_privileged(pool)
-                .await
-                .map_err(ResponseError::from),
-            Self::AsUser(user_id) => crate::auth::begin_as_user(pool, user_id)
-                .await
-                .map_err(|e| ResponseError::Backend(format!("begin_as_user: {e}"))),
-        }
-    }
-}
+/// One round-trip: read parent's `(org_id, root_request_id)`, bump the
+/// per-request seq counter (the streams upsert also pins the `closed`
+/// flag), insert the chunk row denormalised on the same `org_id`, and
+/// `pg_notify` the DAG thread stream — all as one CTE chain. The first
+/// publish lands at seq 0 (post-bump `next_seq` is 1, so `next_seq - 1`
+/// matches `ChunkSeq::ZERO` and the SSE `Last-Event-ID` contract). If
+/// `req` resolves to zero rows (synthetic test id), the chain yields
+/// zero rows and the caller surfaces the original error.
+const PUBLISH_CTE_SQL: &str = "WITH req AS (
+     SELECT id AS request_id, org_id, root_request_id
+     FROM prompt_requests WHERE id = $1
+ ), bumped AS (
+     INSERT INTO prompt_response_streams (request_id, org_id, next_seq, closed)
+     SELECT req.request_id, req.org_id, 1, $2 FROM req
+     ON CONFLICT (request_id) DO UPDATE
+         SET next_seq = prompt_response_streams.next_seq + 1,
+             closed   = prompt_response_streams.closed OR EXCLUDED.closed
+     RETURNING next_seq
+ ), chunk_ins AS (
+     INSERT INTO prompt_response_chunks
+         (request_id, org_id, seq, payload, bytes, is_terminal, created_at)
+     SELECT req.request_id, req.org_id, bumped.next_seq - 1, $3, $4, $2, $5
+     FROM req, bumped
+     RETURNING seq
+ ), notify AS (
+     SELECT pg_notify($6, json_build_object(
+         'request_id', req.request_id,
+         'root_request_id', req.root_request_id,
+         'chunk_seq', chunk_ins.seq
+     )::text) AS _n
+     FROM req, chunk_ins
+ )
+ SELECT bumped.next_seq FROM bumped, notify";
 
 async fn publish_impl(
     hub: &PgResponseHub,
-    scope: PublishTxScope,
+    scope: TxScope,
     request_id: PromptRequestId,
     chunk: ResponseChunk,
 ) -> Result<ChunkSeq, ResponseError> {
@@ -275,88 +278,34 @@ async fn publish_impl(
     let bytes = i32::try_from(weight_capped).expect("invariant: weight clamped to i32 range");
 
     let mut tx = scope.begin(&hub.pool).await?;
-
-    // Resolve the request's `org_id` once per publish — the
-    // streams / chunks rows are denormalised on it (NOT NULL,
-    // parity-trigger-pinned). One extra round-trip per chunk is
-    // cheap relative to the chunk's payload work and keeps the
-    // tenancy column self-contained without threading org context
-    // through the publish trait.
-    let org_id: crate::auth::OrgId =
-        sqlx::query_scalar("SELECT org_id FROM prompt_requests WHERE id = $1")
-            .bind(request_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| {
-                ResponseError::Backend(format!(
-                    "publish: request {request_id} has no prompt_requests row"
-                ))
-            })?;
-
-    // Bump the per-request seq counter atomically; the row is a tiny upsert that
-    // also carries the closed flag. RETURNING gives us the post-bump counter; the
-    // seq we hand to this chunk is the value that was *current* before the bump,
-    // so the first publish lands at seq 0 (matches ChunkSeq::ZERO and the SSE
-    // handler's Last-Event-ID contract).
-    let (next_seq,): (ChunkSeq,) = sqlx::query_as(
-        "INSERT INTO prompt_response_streams (request_id, org_id, next_seq, closed)
-             VALUES ($1, $2, 1, $3)
-             ON CONFLICT (request_id) DO UPDATE
-                 SET next_seq = prompt_response_streams.next_seq + 1,
-                     closed   = prompt_response_streams.closed OR EXCLUDED.closed
-             RETURNING next_seq",
-    )
-    .bind(request_id)
-    .bind(org_id)
-    .bind(terminal)
-    .fetch_one(&mut *tx)
-    .await?;
-
+    let row: Option<(ChunkSeq,)> = sqlx::query_as(PUBLISH_CTE_SQL)
+        .bind(request_id)
+        .bind(terminal)
+        .bind(&payload)
+        .bind(bytes)
+        .bind(now)
+        .bind(THREAD_NOTIFY_CHANNEL)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let (next_seq,) = row.ok_or_else(|| {
+        ResponseError::Backend(format!(
+            "publish: request {request_id} has no prompt_requests row"
+        ))
+    })?;
     let assigned = next_seq
         .get()
         .checked_sub(1)
         .map(ChunkSeq::from)
         .expect("invariant: post-bump next_seq is at least 1");
-
-    // Fan-in NOTIFY for the DAG thread stream is folded into the chunk
-    // INSERT so each publish is one round-trip.
-    sqlx::query(
-        "WITH ins AS (
-                INSERT INTO prompt_response_chunks
-                    (request_id, org_id, seq, payload, bytes, is_terminal, created_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                RETURNING request_id, seq
-             )
-             SELECT pg_notify($8,
-                json_build_object(
-                    'request_id', pr.id,
-                    'root_request_id', pr.root_request_id,
-                    'chunk_seq', ins.seq
-                )::text)
-             FROM ins
-             JOIN prompt_requests pr ON pr.id = ins.request_id",
-    )
-    .bind(request_id)
-    .bind(org_id)
-    .bind(assigned)
-    .bind(&payload)
-    .bind(bytes)
-    .bind(terminal)
-    .bind(now)
-    .bind(THREAD_NOTIFY_CHANNEL)
-    .execute(&mut *tx)
-    .await?;
-
     tx.commit().await?;
-
-    let envelope = ResponseChunkEnvelope {
-        seq: assigned,
-        chunk: chunk.clone(),
-    };
 
     // After DB commit, broadcast to live subscribers. Send returns Err only when
     // there are no receivers — fine, late subscribers replay from the chunks
     // table.
+    let envelope = ResponseChunkEnvelope {
+        seq: assigned,
+        chunk,
+    };
     let sender = hub.publish_sender(request_id, terminal)?;
     let _ = sender.send(envelope);
 
@@ -365,28 +314,23 @@ async fn publish_impl(
 
 async fn close_impl(
     hub: &PgResponseHub,
-    scope: PublishTxScope,
+    scope: TxScope,
     request_id: PromptRequestId,
 ) -> Result<(), ResponseError> {
     let mut tx = scope.begin(&hub.pool).await?;
-    let org_id: Option<crate::auth::OrgId> =
-        sqlx::query_scalar("SELECT org_id FROM prompt_requests WHERE id = $1")
-            .bind(request_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    // No row → benign (e.g. tests close a synthetic id); just
-    // mark the in-memory slot and return.
-    if let Some(org_id) = org_id {
-        sqlx::query(
-            "INSERT INTO prompt_response_streams (request_id, org_id, next_seq, closed)
-                 VALUES ($1, $2, 0, TRUE)
-                 ON CONFLICT (request_id) DO UPDATE SET closed = TRUE",
-        )
-        .bind(request_id)
-        .bind(org_id)
-        .execute(&mut *tx)
-        .await?;
-    }
+    // One round-trip: read `org_id` from the parent request and upsert
+    // the closed flag in a single CTE. If `req` resolves to zero rows
+    // (synthetic test id) the INSERT does nothing — benign, matches
+    // the prior explicit None branch.
+    sqlx::query(
+        "WITH req AS (SELECT id, org_id FROM prompt_requests WHERE id = $1)
+         INSERT INTO prompt_response_streams (request_id, org_id, next_seq, closed)
+         SELECT req.id, req.org_id, 0, TRUE FROM req
+         ON CONFLICT (request_id) DO UPDATE SET closed = TRUE",
+    )
+    .bind(request_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     hub.mark_closed(request_id);
     Ok(())
@@ -404,76 +348,89 @@ impl ResponseSource for PgResponseHub {
         // DB read; the seq-filter on the live stream then dedupes the overlap.
         let (live_rx, _was_closed) = self.subscribe_live(request_id);
 
-        // Two SQL paths because the `since = None` (full replay) case has no lower
-        // bound — there's no sentinel `ChunkSeq` value below `ChunkSeq::ZERO`.
-        //
-        // Privileged: backlog replay can be triggered by either an
-        // HTTP request (already gated by the caller's `begin_as`
-        // tenant-visibility check before resolving the subscribe), or
-        // by worker-side reconciliation. The chunks table is RLS-
-        // forced; without `begin_privileged` the worker's anonymous
-        // role would filter to no rows.
-        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
-        let backlog: Vec<(ChunkSeq, sqlx::types::JsonValue)> = match since {
-            Some(s) => {
-                sqlx::query_as(
-                    "SELECT seq, payload FROM prompt_response_chunks
-                     WHERE request_id = $1 AND seq > $2
-                     ORDER BY seq ASC",
-                )
-                .bind(request_id)
-                .bind(s)
-                .fetch_all(&mut *tx)
-                .await?
-            }
-            None => {
-                sqlx::query_as(
-                    "SELECT seq, payload FROM prompt_response_chunks
-                     WHERE request_id = $1
-                     ORDER BY seq ASC",
-                )
-                .bind(request_id)
-                .fetch_all(&mut *tx)
-                .await?
-            }
-        };
-        tx.commit().await?;
-
-        let mut backlog_envelopes = Vec::with_capacity(backlog.len());
-        let mut backlog_max: Option<ChunkSeq> = since;
-        for (seq, payload) in backlog {
-            let chunk: ResponseChunk = serde_json::from_value(payload)
-                .map_err(|e| ResponseError::Backend(format!("deserialize chunk: {e}")))?;
-            backlog_envelopes.push(Ok::<StreamEvent, ResponseError>(StreamEvent::Chunk(
-                ResponseChunkEnvelope { seq, chunk },
-            )));
-            backlog_max = Some(backlog_max.map_or(seq, |m| m.max(seq)));
-        }
-
+        let (backlog_envelopes, backlog_max) = read_backlog(&self.pool, request_id, since).await?;
         let backlog_stream = futures::stream::iter(backlog_envelopes);
-        let dedupe_threshold = backlog_max;
-
-        let live_mapped = BroadcastStream::new(live_rx).map(
-            move |item| -> Result<Option<StreamEvent>, ResponseError> {
-                match item {
-                    Ok(env) => {
-                        if dedupe_threshold.is_some_and(|threshold| env.seq <= threshold) {
-                            // Already delivered via the backlog replay; drop.
-                            Ok(None)
-                        } else {
-                            Ok(Some(StreamEvent::Chunk(env)))
-                        }
-                    }
-                    Err(BroadcastStreamRecvError::Lagged(_)) => Ok(Some(StreamEvent::Stalled)),
-                }
-            },
-        );
-
-        // Filter out the dedupe-`None`s. `Result<Option<T>, E>::transpose` →
-        // `Option<Result<T, E>>` does this in one call: `Ok(None)` becomes the
-        // filter-out None, and the other two arms keep their shape.
-        let live_filtered = live_mapped.filter_map(|r| async move { r.transpose() });
-
+        let live_filtered = filter_live_stream(live_rx, backlog_max);
         Ok(Box::pin(backlog_stream.chain(live_filtered)))
     }
+}
+
+/// Replay every chunk persisted for `request_id` strictly after `since`
+/// (or every chunk if `since` is `None`). Returns the envelopes already
+/// wrapped as stream events plus the maximum seq seen (used downstream
+/// to dedupe against the live broadcast).
+///
+/// Privileged: backlog replay is triggered either by an HTTP request
+/// (already gated by the caller's `begin_as` tenant-visibility check)
+/// or by worker-side reconciliation. The chunks table is RLS-forced;
+/// without `begin_privileged` the worker's anonymous role would filter
+/// to no rows.
+async fn read_backlog(
+    pool: &PgPool,
+    request_id: PromptRequestId,
+    since: Option<ChunkSeq>,
+) -> Result<(Vec<Result<StreamEvent, ResponseError>>, Option<ChunkSeq>), ResponseError> {
+    let mut tx = crate::auth::begin_privileged(pool).await?;
+    // Two SQL paths because the `since = None` (full replay) case has no
+    // lower bound — there is no sentinel `ChunkSeq` below `ChunkSeq::ZERO`.
+    let backlog: Vec<(ChunkSeq, sqlx::types::JsonValue)> = match since {
+        Some(s) => {
+            sqlx::query_as(
+                "SELECT seq, payload FROM prompt_response_chunks
+                 WHERE request_id = $1 AND seq > $2
+                 ORDER BY seq ASC",
+            )
+            .bind(request_id)
+            .bind(s)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT seq, payload FROM prompt_response_chunks
+                 WHERE request_id = $1
+                 ORDER BY seq ASC",
+            )
+            .bind(request_id)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+    };
+    tx.commit().await?;
+
+    let mut envelopes = Vec::with_capacity(backlog.len());
+    let mut max_seq: Option<ChunkSeq> = since;
+    for (seq, payload) in backlog {
+        let chunk: ResponseChunk = serde_json::from_value(payload)
+            .map_err(|e| ResponseError::Backend(format!("deserialize chunk: {e}")))?;
+        envelopes.push(Ok(StreamEvent::Chunk(ResponseChunkEnvelope { seq, chunk })));
+        max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
+    }
+    Ok((envelopes, max_seq))
+}
+
+/// Adapt the live broadcast into a stream of `StreamEvent`s, dropping
+/// any envelope whose seq was already delivered via the backlog
+/// replay (overlap dedupe). `BroadcastStreamRecvError::Lagged` is
+/// surfaced as a [`StreamEvent::Stalled`] sentinel so callers can
+/// react instead of silently losing chunks.
+fn filter_live_stream(
+    live_rx: broadcast::Receiver<ResponseChunkEnvelope>,
+    dedupe_threshold: Option<ChunkSeq>,
+) -> impl futures::Stream<Item = Result<StreamEvent, ResponseError>> + Send {
+    let live_mapped = BroadcastStream::new(live_rx).map(
+        move |item| -> Result<Option<StreamEvent>, ResponseError> {
+            match item {
+                Ok(env) => {
+                    if dedupe_threshold.is_some_and(|threshold| env.seq <= threshold) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(StreamEvent::Chunk(env)))
+                    }
+                }
+                Err(BroadcastStreamRecvError::Lagged(_)) => Ok(Some(StreamEvent::Stalled)),
+            }
+        },
+    );
+    live_mapped.filter_map(|r| async move { r.transpose() })
 }

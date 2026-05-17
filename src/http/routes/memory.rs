@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::agents::AgentId;
-use crate::auth::{AuthError, Principal};
+use crate::auth::Principal;
 use crate::memory::{
     MemoryContent, MemoryEventId, MemoryEventPayload, MemoryId, MemoryKind, MemoryMutation,
     MemoryRow, MemoryState, MutationKind, MutationSource, MutationSourceKind, ValidationOrigin,
@@ -38,14 +38,14 @@ use super::super::state::AppState;
 /// the visibility check on its own. Gating here keeps the route a
 /// thin shell over the store without duplicating the membership rule.
 async fn gate_agent(pool: &PgPool, principal: &Principal, agent: AgentId) -> Result<(), HttpError> {
-    let mut tx = crate::auth::begin_as(pool, principal).await?;
-    let visible: Option<(AgentId,)> = sqlx::query_as("SELECT id FROM agents WHERE id = $1")
-        .bind(agent)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(AuthError::from)?;
-    tx.commit().await.map_err(AuthError::from)?;
-    if visible.is_none() {
+    if !crate::auth::visible_to(
+        pool,
+        principal,
+        crate::auth::VisibilityTable::Agents,
+        agent.as_uuid(),
+    )
+    .await?
+    {
         return Err(HttpError::NotFound);
     }
     Ok(())

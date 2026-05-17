@@ -8,15 +8,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::error::AuthError;
-use super::types::{GoogleProfile, OrgId, OrgMembership, Role, User, UserId};
+use super::types::{
+    GoogleProfile, OAuthState, OrgId, OrgMembership, PkceVerifier, Role, User, UserId,
+};
 
 pub type SharedUserStore = Arc<dyn UserStore>;
 
 /// New row to be inserted into `oauth_login_states`.
 #[derive(Debug, Clone)]
 pub struct OAuthStateRow {
-    pub state: String,
-    pub pkce_verifier: String,
+    pub state: OAuthState,
+    pub pkce_verifier: PkceVerifier,
     pub redirect_to: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -25,7 +27,7 @@ pub struct OAuthStateRow {
 /// Row returned when consuming a `oauth_login_states` row.
 #[derive(Debug, Clone)]
 pub struct ConsumedOAuthState {
-    pub pkce_verifier: String,
+    pub pkce_verifier: PkceVerifier,
     pub redirect_to: Option<String>,
 }
 
@@ -85,7 +87,7 @@ pub trait UserStore: std::fmt::Debug + Send + Sync + 'static {
     /// expired.
     async fn consume_oauth_state(
         &self,
-        state: &str,
+        state: &OAuthState,
         now: DateTime<Utc>,
     ) -> Result<ConsumedOAuthState, AuthError>;
 }

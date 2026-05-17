@@ -141,21 +141,16 @@ async fn cancel_request(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, HttpError> {
     let request_id = PromptRequestId::from(id);
-    // Tenant gate: confirm the principal can see the request before
-    // dispatching the privileged cancellation write. Inside
-    // `begin_as`, RLS on `prompt_requests` filters cross-org rows so
-    // the lookup returns `None` for ids the caller can't see — we
-    // 404 cleanly without leaking existence. Mirrors the agents /
-    // mcp_servers route pattern.
-    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
-    let visible: Option<bool> =
-        sqlx::query_scalar("SELECT TRUE FROM prompt_requests WHERE id = $1")
-            .bind(request_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(crate::auth::AuthError::from)?;
-    tx.commit().await.map_err(crate::auth::AuthError::from)?;
-    if visible.is_none() {
+    // Tenant gate: 404 cross-org / unknown ids without leaking existence
+    // before dispatching the privileged cancellation write.
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::PromptRequests,
+        request_id.as_uuid(),
+    )
+    .await?
+    {
         return Err(HttpError::NotFound);
     }
     state.queue.request_cancellation(request_id).await?;

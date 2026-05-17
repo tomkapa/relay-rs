@@ -18,7 +18,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use sqlx::PgPool;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -481,16 +480,14 @@ impl Worker {
         reflection_session: SessionId,
         acting_user_id: crate::auth::UserId,
     ) -> Result<(), sqlx::Error> {
-        let now = chrono::DateTime::<Utc>::from(self.clock.now_wall());
+        let now = self.clock.now_utc();
         // Tenant-scoped tx: `reflection_checkpoints` is RLS-forced
         // post-migration-17. `org_id` is derived from the parent agent
         // and parity-checked by `reflection_checkpoints_enforce_org`;
         // the `begin_as_user` here pins `app.user_id` to the same
         // principal the reflection claim was minted under so the
         // WITH CHECK fires against the right org.
-        let mut tx = crate::auth::begin_as_user(&self.pool, acting_user_id)
-            .await
-            .map_err(|e| sqlx::Error::Protocol(format!("begin_as_user: {e}")))?;
+        let mut tx = crate::auth::begin_as_user(&self.pool, acting_user_id).await?;
         sqlx::query(
             "INSERT INTO reflection_checkpoints
                  (agent_id, org_id, session_id, last_turn_id, reflection_event_id,
