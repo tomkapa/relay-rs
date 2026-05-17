@@ -27,9 +27,6 @@ pub enum SettingsError {
     #[error("default timezone {raw:?} is not a valid IANA name")]
     InvalidDefaultTimezone { raw: String },
 
-    #[error("auth configuration missing: {field}")]
-    AuthMissing { field: &'static str },
-
     #[error("auth: jwt secret too short — need at least 32 bytes")]
     AuthSecretTooShort,
 }
@@ -152,17 +149,15 @@ struct RawSettings {
     #[serde(default = "default_timezone_raw")]
     default_timezone: String,
 
-    // Auth — required at startup.
+    // Auth — required at startup. Missing values surface as the
+    // `config` crate's own "missing field" error via `SettingsError::Source`,
+    // same as `database_url` / `brave_search_api_key` above.
+    relay_jwt_secret: SecretString,
+    google_client_id: SecretString,
+    google_client_secret: SecretString,
+    google_redirect_url: String,
     #[serde(default)]
-    relay_jwt_secret: Option<SecretString>,
-    #[serde(default)]
-    google_client_id: Option<SecretString>,
-    #[serde(default)]
-    google_client_secret: Option<SecretString>,
-    #[serde(default)]
-    google_redirect_url: Option<String>,
-    #[serde(default)]
-    relay_cookie_secure: Option<bool>,
+    relay_cookie_secure: bool,
 }
 
 fn default_timezone_raw() -> String {
@@ -216,24 +211,15 @@ impl TryFrom<RawSettings> for Settings {
                 raw: raw.default_timezone.clone(),
             }
         })?;
-        let jwt_secret = raw.relay_jwt_secret.ok_or(SettingsError::AuthMissing {
-            field: "RELAY_JWT_SECRET",
-        })?;
-        if jwt_secret.expose().len() < 32 {
+        if raw.relay_jwt_secret.expose().len() < 32 {
             return Err(SettingsError::AuthSecretTooShort);
         }
         let auth = AuthSettings {
-            jwt_secret,
-            google_client_id: raw.google_client_id.ok_or(SettingsError::AuthMissing {
-                field: "GOOGLE_CLIENT_ID",
-            })?,
-            google_client_secret: raw.google_client_secret.ok_or(SettingsError::AuthMissing {
-                field: "GOOGLE_CLIENT_SECRET",
-            })?,
-            google_redirect_url: raw.google_redirect_url.ok_or(SettingsError::AuthMissing {
-                field: "GOOGLE_REDIRECT_URL",
-            })?,
-            cookie_secure: raw.relay_cookie_secure.unwrap_or(false),
+            jwt_secret: raw.relay_jwt_secret,
+            google_client_id: raw.google_client_id,
+            google_client_secret: raw.google_client_secret,
+            google_redirect_url: raw.google_redirect_url,
+            cookie_secure: raw.relay_cookie_secure,
         };
         Ok(Self {
             provider,
@@ -292,11 +278,11 @@ mod tests {
             embedding_model: Some("text-embedding-3-small".to_string()),
             embedding_dimensions: None,
             default_timezone: default_timezone_raw(),
-            relay_jwt_secret: Some(secret(&"a".repeat(64))),
-            google_client_id: Some(secret("test-client-id")),
-            google_client_secret: Some(secret("test-client-secret")),
-            google_redirect_url: Some("http://localhost:8080/auth/google/callback".to_string()),
-            relay_cookie_secure: Some(false),
+            relay_jwt_secret: secret(&"a".repeat(64)),
+            google_client_id: secret("test-client-id"),
+            google_client_secret: secret("test-client-secret"),
+            google_redirect_url: "http://localhost:8080/auth/google/callback".to_string(),
+            relay_cookie_secure: false,
         }
     }
 

@@ -118,13 +118,17 @@ impl Tool for CancelScheduledTaskTool {
                 warn!(error = %e, "cancel_scheduled_task.begin_as_user_failed");
                 ToolError::Backend(format!("cancel_scheduled_task: tx: {e}"))
             })?;
-        let visible: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT id FROM scheduled_tasks \
-             WHERE id = $1 AND owner_agent_id = $2",
+        // Existence-only probe under RLS; `EXISTS` returns bool, keeping
+        // raw `uuid::Uuid` out of app code (CLAUDE.md §1).
+        let visible: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+                SELECT 1 FROM scheduled_tasks \
+                WHERE id = $1 AND owner_agent_id = $2\
+             )",
         )
         .bind(parsed.task_id)
         .bind(owner)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             warn!(error = %e, relay.scheduled_task.id = %parsed.task_id,
@@ -132,7 +136,7 @@ impl Tool for CancelScheduledTaskTool {
             ToolError::Backend(format!("cancel_scheduled_task: visibility: {e}"))
         })?;
         drop(tx);
-        if visible.is_none() {
+        if !visible {
             return Err(ToolError::InvalidInput(format!(
                 "cancel_scheduled_task: task {} not found",
                 parsed.task_id

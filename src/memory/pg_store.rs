@@ -521,7 +521,10 @@ impl MemoryStore for PgMemoryStore {
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         // Idempotency: if an unresolved row already exists for this pair,
         // return its id.
-        let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
+        // Typed lookup — `ContradictionEventId` round-trips via the
+        // `uuid_newtype!` sqlx impls; never traffic in raw `uuid::Uuid`
+        // at the app boundary (CLAUDE.md §1).
+        let existing: Option<ContradictionEventId> = sqlx::query_scalar(
             "SELECT id FROM contradiction_events
              WHERE agent_id = $1 AND memory_a = $2 AND memory_b = $3 AND resolved_at IS NULL
              ORDER BY created_at DESC LIMIT 1",
@@ -531,9 +534,9 @@ impl MemoryStore for PgMemoryStore {
         .bind(hi)
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((id,)) = existing {
+        if let Some(id) = existing {
             tx.commit().await?;
-            return Ok(ContradictionEventId::from(id));
+            return Ok(id);
         }
 
         let id = ContradictionEventId::new();

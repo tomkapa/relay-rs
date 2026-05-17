@@ -226,6 +226,7 @@ async fn update_mcp_server(
         .mcp_store
         .update(
             id,
+            principal.active_org_id,
             McpServerUpdate {
                 alias,
                 config: payload.config,
@@ -254,7 +255,7 @@ async fn delete_mcp_server(
     if visible.is_none() {
         return Err(HttpError::NotFound);
     }
-    state.mcp_store.delete(id).await?;
+    state.mcp_store.delete(id, principal.active_org_id).await?;
     state.mcp_refresh.request();
     Ok(StatusCode::NO_CONTENT)
 }

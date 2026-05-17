@@ -157,14 +157,23 @@ impl McpServerStore for PgMcpServerStore {
         rows.into_iter().map(McpServerRow::into_record).collect()
     }
 
-    async fn read(&self, id: McpServerId) -> Result<McpServerRecord, McpError> {
+    async fn read(
+        &self,
+        id: McpServerId,
+        org_id: crate::auth::OrgId,
+    ) -> Result<McpServerRecord, McpError> {
+        // Privileged tx (RLS is bypassed) but the `WHERE … AND org_id = $2`
+        // makes the cross-tenant fence explicit at the query layer — even
+        // a future HTTP handler that forgets the `begin_as` pre-gate
+        // cannot fetch another org's row by id.
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row = sqlx::query_as::<_, McpServerRow>(
             "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
                     discovered_tools, created_at, updated_at \
-             FROM mcp_servers WHERE id = $1",
+             FROM mcp_servers WHERE id = $1 AND org_id = $2",
         )
         .bind(id)
+        .bind(org_id)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -174,6 +183,7 @@ impl McpServerStore for PgMcpServerStore {
     async fn update(
         &self,
         id: McpServerId,
+        org_id: crate::auth::OrgId,
         payload: McpServerUpdate,
     ) -> Result<McpServerRecord, McpError> {
         let now = self.now();
@@ -182,9 +192,10 @@ impl McpServerStore for PgMcpServerStore {
         let existing: Option<McpServerRow> = sqlx::query_as::<_, McpServerRow>(
             "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
                     discovered_tools, created_at, updated_at \
-             FROM mcp_servers WHERE id = $1 FOR UPDATE",
+             FROM mcp_servers WHERE id = $1 AND org_id = $2 FOR UPDATE",
         )
         .bind(id)
+        .bind(org_id)
         .fetch_optional(&mut *tx)
         .await?;
         let existing = existing.ok_or(McpError::NotFound(id))?;
@@ -208,11 +219,12 @@ impl McpServerStore for PgMcpServerStore {
             .map_err(|e| McpError::Backend(format!("serialize transport: {e}")))?;
 
         let result = sqlx::query(
-            "UPDATE mcp_servers SET alias = $2, enabled = $3, config = $4, description = $5, \
-                                    updated_at = $6 \
-             WHERE id = $1",
+            "UPDATE mcp_servers SET alias = $3, enabled = $4, config = $5, description = $6, \
+                                    updated_at = $7 \
+             WHERE id = $1 AND org_id = $2",
         )
         .bind(id)
+        .bind(org_id)
         .bind(current.alias.as_str())
         .bind(current.enabled)
         .bind(&config_json)
@@ -227,10 +239,11 @@ impl McpServerStore for PgMcpServerStore {
         Ok(current)
     }
 
-    async fn delete(&self, id: McpServerId) -> Result<(), McpError> {
+    async fn delete(&self, id: McpServerId, org_id: crate::auth::OrgId) -> Result<(), McpError> {
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
-        let res = sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
+        let res = sqlx::query("DELETE FROM mcp_servers WHERE id = $1 AND org_id = $2")
             .bind(id)
+            .bind(org_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -243,6 +256,7 @@ impl McpServerStore for PgMcpServerStore {
     async fn update_health(
         &self,
         id: McpServerId,
+        org_id: crate::auth::OrgId,
         health: McpHealthUpdate,
     ) -> Result<(), McpError> {
         let discovered_json = health
@@ -254,12 +268,13 @@ impl McpServerStore for PgMcpServerStore {
         let now = self.now();
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let res = sqlx::query(
-            "UPDATE mcp_servers SET last_seen_at = $2, last_error = $3, \
-                                    discovered_tools = COALESCE($4, discovered_tools), \
-                                    updated_at = $5 \
-             WHERE id = $1",
+            "UPDATE mcp_servers SET last_seen_at = $3, last_error = $4, \
+                                    discovered_tools = COALESCE($5, discovered_tools), \
+                                    updated_at = $6 \
+             WHERE id = $1 AND org_id = $2",
         )
         .bind(id)
+        .bind(org_id)
         .bind(health.last_seen_at)
         .bind(health.last_error.as_deref())
         .bind(discovered_json)

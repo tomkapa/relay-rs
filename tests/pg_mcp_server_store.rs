@@ -46,7 +46,7 @@ async fn create_read_roundtrip() {
         enabled: true,
     };
     let row = store.create(payload).await.expect("create");
-    let read = store.read(row.id).await.expect("read");
+    let read = store.read(row.id, db.default_org_id).await.expect("read");
     assert_eq!(read.id, row.id);
     assert_eq!(read.alias.as_str(), "every");
     assert!(read.enabled);
@@ -124,6 +124,7 @@ async fn update_changes_alias_and_config() {
     let updated = store
         .update(
             row.id,
+            db.default_org_id,
             McpServerUpdate {
                 alias: Some(alias("renamed")),
                 config: Some(http_transport("http://localhost:9100/")),
@@ -135,7 +136,7 @@ async fn update_changes_alias_and_config() {
         .expect("update");
     assert_eq!(updated.alias.as_str(), "renamed");
     assert!(!updated.enabled);
-    let read = store.read(row.id).await.expect("read");
+    let read = store.read(row.id, db.default_org_id).await.expect("read");
     let McpTransport::Http { url, .. } = &read.config;
     assert_eq!(url.as_str(), "http://localhost:9100/");
 }
@@ -154,10 +155,19 @@ async fn delete_returns_not_found_after() {
         })
         .await
         .expect("create");
-    store.delete(row.id).await.expect("delete");
-    let err = store.read(row.id).await.expect_err("read after delete");
+    store
+        .delete(row.id, db.default_org_id)
+        .await
+        .expect("delete");
+    let err = store
+        .read(row.id, db.default_org_id)
+        .await
+        .expect_err("read after delete");
     assert!(matches!(err, McpError::NotFound(_)));
-    let err = store.delete(row.id).await.expect_err("delete again");
+    let err = store
+        .delete(row.id, db.default_org_id)
+        .await
+        .expect_err("delete again");
     assert!(matches!(err, McpError::NotFound(_)));
 }
 
@@ -184,6 +194,7 @@ async fn update_health_persists_discovered_tools() {
     store
         .update_health(
             row.id,
+            db.default_org_id,
             McpHealthUpdate {
                 last_seen_at: Some(now),
                 last_error: None,
@@ -192,7 +203,7 @@ async fn update_health_persists_discovered_tools() {
         )
         .await
         .expect("update_health");
-    let read = store.read(row.id).await.expect("read");
+    let read = store.read(row.id, db.default_org_id).await.expect("read");
     assert!(read.last_seen_at.is_some());
     assert_eq!(read.last_error, None);
     let tools = read.discovered_tools.expect("tools");
@@ -207,18 +218,21 @@ async fn missing_id_returns_not_found_on_read_update_delete() {
     let store = store(&db);
     let id = McpServerId::new();
     assert!(matches!(
-        store.read(id).await.expect_err("read"),
+        store.read(id, db.default_org_id).await.expect_err("read"),
         McpError::NotFound(_)
     ));
     assert!(matches!(
         store
-            .update(id, McpServerUpdate::default())
+            .update(id, db.default_org_id, McpServerUpdate::default())
             .await
             .expect_err("update"),
         McpError::NotFound(_)
     ));
     assert!(matches!(
-        store.delete(id).await.expect_err("delete"),
+        store
+            .delete(id, db.default_org_id)
+            .await
+            .expect_err("delete"),
         McpError::NotFound(_)
     ));
 }

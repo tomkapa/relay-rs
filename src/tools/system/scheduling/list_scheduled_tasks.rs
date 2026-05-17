@@ -131,17 +131,20 @@ impl Tool for ListScheduledTasksTool {
                 warn!(error = %e, "list_scheduled_tasks.begin_as_user_failed");
                 ToolError::Backend(format!("list_scheduled_tasks: tx: {e}"))
             })?;
-        let visible: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM agents WHERE id = $1")
+        // Existence-only probe; `EXISTS` keeps the result as `bool` so the
+        // function doesn't traffic in raw `uuid::Uuid` (CLAUDE.md §1: IDs
+        // are newtypes — a bare `Uuid` in app code is a review-blocker).
+        let visible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)")
             .bind(owner)
-            .fetch_optional(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
                 warn!(error = %e, relay.agent.id = %owner,
-                        "list_scheduled_tasks.visibility_check_failed");
+                            "list_scheduled_tasks.visibility_check_failed");
                 ToolError::Backend(format!("list_scheduled_tasks: visibility: {e}"))
             })?;
         drop(tx);
-        if visible.is_none() {
+        if !visible {
             return Ok(serde_json::to_string(&Output { tasks: Vec::new() })?);
         }
 
