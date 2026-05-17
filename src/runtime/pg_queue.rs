@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::auth::{OrgId, TxScope, UserId};
+use crate::auth::{OrgId, UserId, run_as_user, run_privileged};
 use crate::clock::SharedClock;
 use crate::observability::propagation;
 use crate::session::SessionId;
@@ -170,7 +170,10 @@ impl fmt::Debug for PgPromptQueue {
 #[async_trait]
 impl PromptQueue for PgPromptQueue {
     async fn enqueue(&self, req: NewPromptRequest) -> Result<EnqueueOutcome, PromptError> {
-        enqueue_impl(self, TxScope::Privileged, req).await
+        run_privileged(&self.pool, async |tx| {
+            enqueue_in_tx(self, tx.tx_mut(), req).await
+        })
+        .await
     }
 
     async fn enqueue_for_user(
@@ -187,7 +190,10 @@ impl PromptQueue for PgPromptQueue {
         // column). Overwriting here makes the spoof unrepresentable at
         // the storage layer.
         req.created_by_user_id = acting_user_id;
-        enqueue_impl(self, TxScope::AsUser(acting_user_id), req).await
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            enqueue_in_tx(self, tx.tx_mut(), req).await
+        })
+        .await
     }
 
     async fn claim_next_session(
@@ -627,14 +633,13 @@ fn build_claimed_session(
     })
 }
 
-/// Body of `enqueue` / `enqueue_for_user`. Opens the right transaction
-/// scope (privileged for the librarian/reflection/scheduler paths,
-/// `begin_as_user` for HTTP / tool / worker paths so the
-/// implicit-session-create + INSERT are RLS-checked) and runs the
-/// shared idempotency / session / cap / dag-seed sequence.
-async fn enqueue_impl(
+/// Body of `enqueue` / `enqueue_for_user`. The runner owns
+/// commit/rollback; the caller picks the scope (privileged for the
+/// librarian/reflection/scheduler paths, tenant for HTTP / tool / worker
+/// paths so the implicit-session-create + INSERT are RLS-checked).
+async fn enqueue_in_tx(
     queue: &PgPromptQueue,
-    scope: TxScope,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     req: NewPromptRequest,
 ) -> Result<EnqueueOutcome, PromptError> {
     let now = queue.now();
@@ -652,12 +657,7 @@ async fn enqueue_impl(
         return Err(PromptError::SelfSession);
     }
 
-    let mut tx = scope.begin(&queue.pool).await?;
-
-    if let Some(existing) =
-        read_idempotent(&mut tx, req.org_id, req.idempotency_key.as_str()).await?
-    {
-        tx.commit().await?;
+    if let Some(existing) = read_idempotent(tx, req.org_id, req.idempotency_key.as_str()).await? {
         return Ok(existing);
     }
 
@@ -666,15 +666,13 @@ async fn enqueue_impl(
         session,
         root_request_id,
         is_new_session,
-    } = resolve_session(&mut tx, &req, receiver, request_id, now).await?;
+    } = resolve_session(tx, &req, receiver, request_id, now).await?;
 
-    enforce_pending_cap(&mut tx, session, queue.pending_cap).await?;
-    insert_prompt_request(&mut tx, &req, request_id, session, root_request_id, now).await?;
+    enforce_pending_cap(tx, session, queue.pending_cap).await?;
+    insert_prompt_request(tx, &req, request_id, session, root_request_id, now).await?;
     if is_new_session {
-        seed_dag_row(&mut tx, root_request_id, req.org_id, now).await?;
+        seed_dag_row(tx, root_request_id, req.org_id, now).await?;
     }
-
-    tx.commit().await?;
 
     Ok(EnqueueOutcome::Inserted {
         request_id,

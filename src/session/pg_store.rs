@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::agents::AgentId;
-use crate::auth::{Caller, OrgId, TxScope, UserId};
+use crate::auth::{Caller, OrgId, UserId, run_as_user, run_privileged};
 use crate::clock::SharedClock;
 use crate::provider::{AssistantContent, ChatMessage, UserContent};
 use crate::runtime::PromptRequestId;
@@ -94,24 +94,34 @@ impl SessionStore for PgSessionStore {
         // Tenant scoping is provided by the explicit `org_id` bound
         // on every statement and by the trigger that pins a child
         // session's org to its parent.
-        let mut tx = crate::auth::begin_privileged(&self.pool)
+        run_privileged(&self.pool, async |tx| {
+            resolve_or_create_for_pair_inner(
+                self,
+                tx.tx_mut(),
+                root_request_id,
+                a,
+                b,
+                parent_session_id,
+                org_id,
+                created_by_user_id,
+            )
             .await
-            .map_err(SessionError::Db)?;
-        let id = resolve_or_create_for_pair_inner(
-            self,
-            &mut tx,
-            root_request_id,
-            a,
-            b,
-            parent_session_id,
-            org_id,
-            created_by_user_id,
-        )
-        .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
-        Ok(id)
+        })
+        .await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.resolve_or_create_for_user",
+        fields(
+            relay.dag.root = %root_request_id,
+            relay.parent.session.id = parent_session_id.map(tracing::field::display),
+            relay.org.id = %caller.org_id,
+            relay.user.id = %caller.user_id,
+            relay.session.id = tracing::field::Empty,
+            relay.session.created = tracing::field::Empty,
+        ),
+    )]
     async fn resolve_or_create_for_pair_for_user(
         &self,
         caller: &Caller,
@@ -128,20 +138,20 @@ impl SessionStore for PgSessionStore {
         // Identity invariant: the inserted session's `created_by_user_id`
         // is the authenticated actor, never a free-form caller-supplied
         // value. `Caller` makes this impossible to express incorrectly.
-        let mut tx = crate::auth::begin_as_user(&self.pool, caller.user_id).await?;
-        let id = resolve_or_create_for_pair_inner(
-            self,
-            &mut tx,
-            root_request_id,
-            a,
-            b,
-            parent_session_id,
-            caller.org_id,
-            caller.user_id,
-        )
-        .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
-        Ok(id)
+        run_as_user(&self.pool, caller.user_id, async |tx| {
+            resolve_or_create_for_pair_inner(
+                self,
+                tx.tx_mut(),
+                root_request_id,
+                a,
+                b,
+                parent_session_id,
+                caller.org_id,
+                caller.user_id,
+            )
+            .await
+        })
+        .await
     }
 
     #[tracing::instrument(
@@ -161,18 +171,22 @@ impl SessionStore for PgSessionStore {
         message: ChatMessage,
         request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
-        append_row(
-            self,
-            TxScope::Privileged,
-            id,
-            sender,
-            receiver,
-            message,
-            request_id,
-        )
+        run_privileged(&self.pool, async |tx| {
+            append_row(self, tx.tx_mut(), id, sender, receiver, message, request_id).await
+        })
         .await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.append_for_user",
+        fields(
+            relay.session.id = %id,
+            relay.user.id = %acting_user_id,
+            relay.message.kind = chat_message_kind(&message),
+            relay.message.blocks = chat_message_block_count(&message),
+        ),
+    )]
     async fn append_for_user(
         &self,
         acting_user_id: UserId,
@@ -182,15 +196,9 @@ impl SessionStore for PgSessionStore {
         message: ChatMessage,
         request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
-        append_row(
-            self,
-            TxScope::AsUser(acting_user_id),
-            id,
-            sender,
-            receiver,
-            message,
-            request_id,
-        )
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            append_row(self, tx.tx_mut(), id, sender, receiver, message, request_id).await
+        })
         .await
     }
 
@@ -214,18 +222,30 @@ impl SessionStore for PgSessionStore {
         // prompt as user-side context — exactly how a system reminder
         // renders to the model.
         let body = ChatMessage::User(vec![UserContent::Text(note)]);
-        append_row(
-            self,
-            TxScope::Privileged,
-            id,
-            MessageSender::System,
-            receiver,
-            body,
-            request_id,
-        )
+        run_privileged(&self.pool, async |tx| {
+            append_row(
+                self,
+                tx.tx_mut(),
+                id,
+                MessageSender::System,
+                receiver,
+                body,
+                request_id,
+            )
+            .await
+        })
         .await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.append_system_nudge_for_user",
+        fields(
+            relay.session.id = %id,
+            relay.user.id = %acting_user_id,
+            relay.bytes = note.len(),
+        ),
+    )]
     async fn append_system_nudge_for_user(
         &self,
         acting_user_id: UserId,
@@ -235,15 +255,18 @@ impl SessionStore for PgSessionStore {
         request_id: PromptRequestId,
     ) -> Result<(), SessionError> {
         let body = ChatMessage::User(vec![UserContent::Text(note)]);
-        append_row(
-            self,
-            TxScope::AsUser(acting_user_id),
-            id,
-            MessageSender::System,
-            receiver,
-            body,
-            request_id,
-        )
+        run_as_user(&self.pool, acting_user_id, async |tx| {
+            append_row(
+                self,
+                tx.tx_mut(),
+                id,
+                MessageSender::System,
+                receiver,
+                body,
+                request_id,
+            )
+            .await
+        })
         .await
     }
 
@@ -264,35 +287,38 @@ impl SessionStore for PgSessionStore {
         id: SessionId,
         viewer: Participant,
     ) -> Result<Vec<ChatMessage>, SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let exists: Option<(SessionId,)> = sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if exists.is_none() {
-            return Err(SessionError::NotFound(id));
-        }
-
-        let rows: Vec<(
+        type Row = (
             MessageSenderKind,
             Option<AgentId>,
             ParticipantKind,
             Option<AgentId>,
             serde_json::Value,
-        )> = sqlx::query_as(
-            "SELECT sender_kind, sender_agent_id,
-                    receiver_kind, receiver_agent_id,
-                    body
-                 FROM session_messages
-                 WHERE session_id = $1
-                 ORDER BY seq ASC",
-        )
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
+        );
+        let rows: Vec<Row> =
+            run_privileged::<Option<Vec<Row>>, SessionError>(&self.pool, async |tx| {
+                let exists: Option<(SessionId,)> =
+                    sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&mut **tx)
+                        .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows: Vec<Row> = sqlx::query_as(
+                    "SELECT sender_kind, sender_agent_id,
+                            receiver_kind, receiver_agent_id,
+                            body
+                         FROM session_messages
+                         WHERE session_id = $1
+                         ORDER BY seq ASC",
+                )
+                .bind(id)
+                .fetch_all(&mut **tx)
+                .await?;
+                Ok(Some(rows))
+            })
+            .await?
+            .ok_or(SessionError::NotFound(id))?;
 
         tracing::Span::current().record("relay.history.count", rows.len());
         let mut out = Vec::with_capacity(rows.len());
@@ -327,44 +353,47 @@ impl SessionStore for PgSessionStore {
         limit: u32,
         before_seq: Option<i64>,
     ) -> Result<Vec<(i64, ChatMessage)>, SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let exists: Option<(SessionId,)> = sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if exists.is_none() {
-            return Err(SessionError::NotFound(id));
-        }
-
-        // Pull the newest `limit` rows below `before_seq` (or the
-        // newest overall when no cursor is set), then re-order to seq
-        // ASC for the caller. Postgres LIMIT requires a BIGINT.
-        let limit_i64 = i64::from(limit);
-        let cursor = before_seq.unwrap_or(i64::MAX);
-        let mut rows: Vec<(
+        type WindowRow = (
             i64,
             MessageSenderKind,
             Option<AgentId>,
             ParticipantKind,
             Option<AgentId>,
             serde_json::Value,
-        )> = sqlx::query_as(
-            "SELECT seq, sender_kind, sender_agent_id,
-                    receiver_kind, receiver_agent_id,
-                    body
-                 FROM session_messages
-                 WHERE session_id = $1 AND seq < $2
-                 ORDER BY seq DESC
-                 LIMIT $3",
-        )
-        .bind(id)
-        .bind(cursor)
-        .bind(limit_i64)
-        .fetch_all(&mut *tx)
-        .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
+        );
+        // Pull the newest `limit` rows below `before_seq` (or the
+        // newest overall when no cursor is set), then re-order to seq
+        // ASC for the caller. Postgres LIMIT requires a BIGINT.
+        let limit_i64 = i64::from(limit);
+        let cursor = before_seq.unwrap_or(i64::MAX);
+        let mut rows =
+            run_privileged::<Option<Vec<WindowRow>>, SessionError>(&self.pool, async |tx| {
+                let exists: Option<(SessionId,)> =
+                    sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&mut **tx)
+                        .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let rows: Vec<WindowRow> = sqlx::query_as(
+                    "SELECT seq, sender_kind, sender_agent_id,
+                            receiver_kind, receiver_agent_id,
+                            body
+                         FROM session_messages
+                         WHERE session_id = $1 AND seq < $2
+                         ORDER BY seq DESC
+                         LIMIT $3",
+                )
+                .bind(id)
+                .bind(cursor)
+                .bind(limit_i64)
+                .fetch_all(&mut **tx)
+                .await?;
+                Ok(Some(rows))
+            })
+            .await?
+            .ok_or(SessionError::NotFound(id))?;
         rows.reverse();
 
         tracing::Span::current().record("relay.history.count", rows.len());
@@ -385,28 +414,33 @@ impl SessionStore for PgSessionStore {
         Ok(out)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.participants",
+        fields(relay.session.id = %id),
+    )]
     async fn participants(
         &self,
         id: SessionId,
     ) -> Result<(Participant, Participant), SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let row: Option<(
+        type Row = (
             ParticipantKind,
             Option<AgentId>,
             ParticipantKind,
             Option<AgentId>,
-        )> = sqlx::query_as(
-            "SELECT participant_a_kind, participant_a_agent_id,
-                    participant_b_kind, participant_b_agent_id
-             FROM sessions
-             WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
+        );
+        let row = run_privileged::<Option<Row>, SessionError>(&self.pool, async |tx| {
+            Ok(sqlx::query_as(
+                "SELECT participant_a_kind, participant_a_agent_id,
+                        participant_b_kind, participant_b_agent_id
+                 FROM sessions
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?)
+        })
         .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
 
         let (ak, aid, bk, bid) = row.ok_or(SessionError::NotFound(id))?;
         let a = Participant::from_kind_id(ak, aid).map_err(invariant_to_backend)?;
@@ -414,16 +448,22 @@ impl SessionStore for PgSessionStore {
         Ok((a, b))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.parent",
+        fields(relay.session.id = %id),
+    )]
     async fn parent(&self, id: SessionId) -> Result<Option<SessionId>, SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let row: Option<(Option<SessionId>,)> =
-            sqlx::query_as("SELECT parent_session_id FROM sessions WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
+        let row =
+            run_privileged::<Option<(Option<SessionId>,)>, SessionError>(&self.pool, async |tx| {
+                Ok(
+                    sqlx::query_as("SELECT parent_session_id FROM sessions WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&mut **tx)
+                        .await?,
+                )
+            })
+            .await?;
         let (parent,) = row.ok_or(SessionError::NotFound(id))?;
         Ok(parent)
     }
@@ -447,39 +487,39 @@ impl SessionStore for PgSessionStore {
         id: SessionId,
         viewer: Participant,
     ) -> Result<Vec<ChatMessage>, SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let rows: Vec<(
+        type Row = (
             MessageSenderKind,
             Option<AgentId>,
             ParticipantKind,
             Option<AgentId>,
             serde_json::Value,
-        )> = sqlx::query_as(
-            "WITH parent_session AS (
-                 SELECT s.id AS parent_id
-                 FROM sessions cur
-                 JOIN sessions s ON s.id = cur.parent_session_id
-                 WHERE cur.id = $1
-                   AND (
-                       (s.participant_a_kind = $2 AND s.participant_a_agent_id IS NOT DISTINCT FROM $3)
-                    OR (s.participant_b_kind = $2 AND s.participant_b_agent_id IS NOT DISTINCT FROM $3)
-                   )
-             )
-             SELECT m.sender_kind, m.sender_agent_id,
-                    m.receiver_kind, m.receiver_agent_id,
-                    m.body
-             FROM session_messages m
-             JOIN parent_session ps ON m.session_id = ps.parent_id
-             ORDER BY m.seq ASC",
-        )
-        .bind(id)
-        .bind(viewer.kind())
-        .bind(viewer.agent_id())
-        .fetch_all(&mut *tx)
+        );
+        let rows = run_privileged::<Vec<Row>, SessionError>(&self.pool, async |tx| {
+            Ok(sqlx::query_as(
+                "WITH parent_session AS (
+                     SELECT s.id AS parent_id
+                     FROM sessions cur
+                     JOIN sessions s ON s.id = cur.parent_session_id
+                     WHERE cur.id = $1
+                       AND (
+                           (s.participant_a_kind = $2 AND s.participant_a_agent_id IS NOT DISTINCT FROM $3)
+                        OR (s.participant_b_kind = $2 AND s.participant_b_agent_id IS NOT DISTINCT FROM $3)
+                       )
+                 )
+                 SELECT m.sender_kind, m.sender_agent_id,
+                        m.receiver_kind, m.receiver_agent_id,
+                        m.body
+                 FROM session_messages m
+                 JOIN parent_session ps ON m.session_id = ps.parent_id
+                 ORDER BY m.seq ASC",
+            )
+            .bind(id)
+            .bind(viewer.kind())
+            .bind(viewer.agent_id())
+            .fetch_all(&mut **tx)
+            .await?)
+        })
         .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
 
         tracing::Span::current().record("relay.history.count", rows.len());
         let mut out = Vec::with_capacity(rows.len());
@@ -496,30 +536,41 @@ impl SessionStore for PgSessionStore {
         Ok(out)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.root_request_id",
+        fields(relay.session.id = %id),
+    )]
     async fn root_request_id(&self, id: SessionId) -> Result<PromptRequestId, SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let row: Option<(PromptRequestId,)> =
-            sqlx::query_as("SELECT root_request_id FROM sessions WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
+        let row =
+            run_privileged::<Option<(PromptRequestId,)>, SessionError>(&self.pool, async |tx| {
+                Ok(
+                    sqlx::query_as("SELECT root_request_id FROM sessions WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&mut **tx)
+                        .await?,
+                )
+            })
+            .await?;
         let (root,) = row.ok_or(SessionError::NotFound(id))?;
         Ok(root)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.tenancy",
+        fields(relay.session.id = %id),
+    )]
     async fn tenancy(&self, id: SessionId) -> Result<SessionTenancy, SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let row: Option<(OrgId, UserId)> =
-            sqlx::query_as("SELECT org_id, created_by_user_id FROM sessions WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
+        let row = run_privileged::<Option<(OrgId, UserId)>, SessionError>(&self.pool, async |tx| {
+            Ok(
+                sqlx::query_as("SELECT org_id, created_by_user_id FROM sessions WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut **tx)
+                    .await?,
+            )
+        })
+        .await?;
         let (org_id, created_by_user_id) = row.ok_or(SessionError::NotFound(id))?;
         Ok(SessionTenancy {
             org_id,
@@ -527,16 +578,21 @@ impl SessionStore for PgSessionStore {
         })
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "session.delete",
+        fields(relay.session.id = %id),
+    )]
     async fn delete(&self, id: SessionId) -> Result<(), SessionError> {
-        let mut tx = crate::auth::begin_privileged(&self.pool)
-            .await
-            .map_err(SessionError::Db)?;
-        let res = sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await.map_err(SessionError::Db)?;
-        if res.rows_affected() == 0 {
+        let rows_affected = run_privileged::<u64, SessionError>(&self.pool, async |tx| {
+            let res = sqlx::query("DELETE FROM sessions WHERE id = $1")
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+            Ok(res.rows_affected())
+        })
+        .await?;
+        if rows_affected == 0 {
             return Err(SessionError::NotFound(id));
         }
         Ok(())
@@ -617,7 +673,7 @@ async fn resolve_or_create_for_pair_inner(
 #[allow(clippy::too_many_arguments)]
 async fn append_row(
     store: &PgSessionStore,
-    scope: TxScope,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: SessionId,
     sender: MessageSender,
     receiver: Participant,
@@ -632,14 +688,9 @@ async fn append_row(
     let cap = store.message_cap;
     let cap_i64 = i64::from(cap);
 
-    // Tenant-scoped variants open `begin_as_user` so the
-    // `session_messages` INSERT's RLS WITH CHECK fires against the
-    // acting principal. Privileged variants are reserved for HTTP
-    // routes and schedulers that have already established
-    // visibility upstream. The trigger on `session_messages` raises
-    // if our bound `org_id` ever drifts from the parent session's;
-    // RLS adds the cross-tenant defence on top.
-    let mut tx = scope.begin(&store.pool).await?;
+    // The trigger on `session_messages` raises if our bound `org_id`
+    // ever drifts from the parent session's; RLS adds the cross-tenant
+    // defence on top.
     let row: Option<(bool, i64)> = sqlx::query_as(
         "WITH locked AS (
              SELECT id, org_id FROM sessions WHERE id = $1 FOR UPDATE
@@ -679,10 +730,9 @@ async fn append_row(
     .bind(body)
     .bind(now)
     .bind(request_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(map_agent_fk)?;
-    tx.commit().await.map_err(SessionError::Db)?;
 
     let Some((inserted, row_count)) = row else {
         // Outer SELECT had no rows ⇒ the `locked` CTE found no session row
