@@ -23,9 +23,15 @@ const MCP_CREATE_LOCK_KEY: i64 = 0x006D_6370_5F63_7265;
 
 /// Column list for the `McpServerRow` `FromRow` impl. Centralised so the
 /// list stays in lockstep with the struct shape across every query in
-/// this module.
-const MCP_ROW_COLS: &str = "id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
-     discovered_tools, created_at, updated_at";
+/// this module. Macro form (vs `const &str`) so call sites can splice the
+/// projection into a `concat!`-built compile-time literal and avoid
+/// `format!`-assembled SQL (CLAUDE.md §10).
+macro_rules! mcp_row_cols {
+    () => {
+        "id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
+         discovered_tools, created_at, updated_at"
+    };
+}
 
 pub struct PgMcpServerStore {
     pool: PgPool,
@@ -139,8 +145,10 @@ impl McpServerStore for PgMcpServerStore {
 
     async fn list(&self) -> Result<Vec<McpServerRecord>, McpError> {
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
-        let rows = sqlx::query_as::<_, McpServerRow>(&format!(
-            "SELECT {MCP_ROW_COLS} FROM mcp_servers ORDER BY alias ASC",
+        let rows = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers ORDER BY alias ASC",
         ))
         .fetch_all(&mut *tx)
         .await?;
@@ -150,8 +158,10 @@ impl McpServerStore for PgMcpServerStore {
 
     async fn list_enabled(&self) -> Result<Vec<McpServerRecord>, McpError> {
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
-        let rows = sqlx::query_as::<_, McpServerRow>(&format!(
-            "SELECT {MCP_ROW_COLS} FROM mcp_servers WHERE enabled = TRUE ORDER BY alias ASC",
+        let rows = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers WHERE enabled = TRUE ORDER BY alias ASC",
         ))
         .fetch_all(&mut *tx)
         .await?;
@@ -169,8 +179,10 @@ impl McpServerStore for PgMcpServerStore {
         // a future HTTP handler that forgets the `begin_as` pre-gate
         // cannot fetch another org's row by id.
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
-        let row = sqlx::query_as::<_, McpServerRow>(&format!(
-            "SELECT {MCP_ROW_COLS} FROM mcp_servers WHERE id = $1 AND org_id = $2",
+        let row = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers WHERE id = $1 AND org_id = $2",
         ))
         .bind(id)
         .bind(org_id)
@@ -189,8 +201,10 @@ impl McpServerStore for PgMcpServerStore {
         let now = self.now();
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
-        let existing: Option<McpServerRow> = sqlx::query_as::<_, McpServerRow>(&format!(
-            "SELECT {MCP_ROW_COLS} FROM mcp_servers WHERE id = $1 AND org_id = $2 FOR UPDATE",
+        let existing: Option<McpServerRow> = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers WHERE id = $1 AND org_id = $2 FOR UPDATE",
         ))
         .bind(id)
         .bind(org_id)

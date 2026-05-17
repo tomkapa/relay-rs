@@ -45,44 +45,71 @@ impl UserStore for PgUserStore {
     ) -> Result<UpsertedUser, AuthError> {
         let mut tx = super::begin_privileged(&self.pool).await?;
 
-        // Idempotent under concurrent first-logins. Two callbacks for
-        // the same brand-new Google account otherwise race on the
-        // read-then-insert sequence; one would 23505 on the unique
-        // constraint and the sign-in would 500 with stale state in the
-        // partial. The `ON CONFLICT … RETURNING id` pattern collapses
-        // the "insert or get existing" decision into one statement that
-        // either ways yields the canonical id.
-        let candidate_id = UserId::new();
-        let user_id: UserId = sqlx::query_scalar(
-            "INSERT INTO users (id, email, display_name, avatar_url, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $5)
-             ON CONFLICT (email) DO UPDATE
-                 SET display_name = EXCLUDED.display_name,
-                     avatar_url   = EXCLUDED.avatar_url,
-                     updated_at   = EXCLUDED.updated_at
-             RETURNING id",
-        )
-        .bind(candidate_id)
-        .bind(profile.email.as_str())
-        .bind(profile.display_name.as_deref())
-        .bind(profile.avatar_url.as_deref())
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await?;
-        // is_new = true iff the INSERT actually used our candidate id.
-        let is_new_user = user_id.as_uuid() == candidate_id.as_uuid();
+        // Serialize concurrent first-logins for the same (provider, subject)
+        // so the "look up identity, insert if missing" sequence below
+        // resolves to one users row. Transaction-scoped — released
+        // automatically on commit/rollback. `hashtextextended` is a
+        // built-in stable hash returning bigint, the shape
+        // `pg_advisory_xact_lock` wants.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("google:{}", profile.subject.as_str()))
+            .execute(&mut *tx)
+            .await?;
 
-        sqlx::query(
-            "INSERT INTO user_identities (user_id, provider, subject, email_at_link, created_at)
-             VALUES ($1, 'google', $2, $3, $4)
-             ON CONFLICT (provider, subject) DO NOTHING",
+        // Canonical identity is (provider, subject), not email. Email
+        // can change on the Google side and a stale email-keyed upsert
+        // would sign the callback into the wrong users row when the
+        // new email already belongs to a different account.
+        let existing: Option<UserId> = sqlx::query_scalar(
+            "SELECT user_id FROM user_identities
+             WHERE provider = 'google' AND subject = $1",
         )
-        .bind(user_id)
         .bind(profile.subject.as_str())
-        .bind(profile.email.as_str())
-        .bind(now)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        let (user_id, is_new_user) = if let Some(uid) = existing {
+            sqlx::query(
+                "UPDATE users
+                 SET email        = $2,
+                     display_name = $3,
+                     avatar_url   = $4,
+                     updated_at   = $5
+                 WHERE id = $1",
+            )
+            .bind(uid)
+            .bind(profile.email.as_str())
+            .bind(profile.display_name.as_deref())
+            .bind(profile.avatar_url.as_deref())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            (uid, false)
+        } else {
+            let candidate_id = UserId::new();
+            sqlx::query(
+                "INSERT INTO users (id, email, display_name, avatar_url, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $5)",
+            )
+            .bind(candidate_id)
+            .bind(profile.email.as_str())
+            .bind(profile.display_name.as_deref())
+            .bind(profile.avatar_url.as_deref())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO user_identities (user_id, provider, subject, email_at_link, created_at)
+                 VALUES ($1, 'google', $2, $3, $4)",
+            )
+            .bind(candidate_id)
+            .bind(profile.subject.as_str())
+            .bind(profile.email.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            (candidate_id, true)
+        };
 
         // Read back the canonical user row.
         let row =

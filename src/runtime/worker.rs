@@ -252,6 +252,11 @@ impl Worker {
             self.publish_failure(&receipt, &FailureReason::Cancelled)
                 .await;
             self.finalise(&receipt, FailureReason::Cancelled).await;
+            // Without an explicit release the claim stays leased until the
+            // TTL expires; under repeated cancels that stalls reclaim.
+            if let Err(e) = self.leases.release(receipt.lease()).await {
+                warn!(error = %e, "worker.lease.release.error");
+            }
             return;
         }
 

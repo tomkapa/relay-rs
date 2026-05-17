@@ -201,6 +201,22 @@ impl MemoryStore for PgMemoryStore {
     async fn rebuild_materialized(&self, agent: AgentId) -> Result<(), MemoryStoreError> {
         let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
+        // Snapshot embeddings before DELETE so we can re-attach them after
+        // replay. `memory_events` does not carry the embedding (it's
+        // derived from content and lives only in the materialized view),
+        // so a naive DELETE-then-replay would leave every row with
+        // `embedding IS NULL` and silently break `search_by_embedding`
+        // / `similar_pairs`. Snapshot is keyed by memory id; replay
+        // re-creates the same ids from `event.target_memory_id`, so the
+        // restore-by-id maps the right vector to the right row.
+        let embedding_snapshot: Vec<(MemoryId, String)> = sqlx::query_as(
+            "SELECT id, embedding::text FROM agent_memories
+             WHERE agent_id = $1 AND embedding IS NOT NULL",
+        )
+        .bind(agent)
+        .fetch_all(&mut *tx)
+        .await?;
+
         sqlx::query("DELETE FROM agent_memories WHERE agent_id = $1")
             .bind(agent)
             .execute(&mut *tx)
@@ -216,6 +232,16 @@ impl MemoryStore for PgMemoryStore {
         for row in event_rows {
             let event = decode_memory_event(&row)?;
             apply_replay(&mut tx, agent, &event).await?;
+        }
+
+        // Restore embeddings for rows that still exist (Forget events
+        // dropped some during replay; the UPDATE no-ops for those).
+        for (id, embedding) in embedding_snapshot {
+            sqlx::query("UPDATE agent_memories SET embedding = $1::vector WHERE id = $2")
+                .bind(embedding)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
 
         tx.commit().await?;
