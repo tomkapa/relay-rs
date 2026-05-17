@@ -148,7 +148,7 @@ pub async fn build_harness(provider: Arc<ScriptedProvider>) -> WorkerHarness {
         factory,
         AGENT_PROMPT_CACHE_CAP,
         AGENT_PROMPT_CACHE_TTL,
-        clock,
+        clock.clone(),
     ));
 
     let cfg = WorkerConfig {
@@ -168,6 +168,7 @@ pub async fn build_harness(provider: Arc<ScriptedProvider>) -> WorkerHarness {
         dag.clone(),
         db.pool.clone(),
         memory_store,
+        clock.clone(),
         cfg,
     )
     .spawn();

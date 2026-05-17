@@ -150,7 +150,7 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
     let memory_store_for_pool: relay_rs::memory::SharedMemoryStore =
         Arc::new(relay_rs::memory::PgMemoryStore::new(
             db.pool.clone(),
-            clock,
+            clock.clone(),
             common::embedding::FakeEmbeddingProvider::shared(),
         ));
 
@@ -171,6 +171,7 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
         dag,
         db.pool.clone(),
         memory_store_for_pool,
+        clock.clone(),
         cfg,
     )
     .spawn();

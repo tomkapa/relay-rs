@@ -148,10 +148,11 @@ impl GoogleOAuth {
         let raw: GoogleUserinfo = serde_json::from_slice(&bytes)
             .map_err(|e| AuthError::OAuthProvider(format!("userinfo parse: {e}")))?;
         if !raw.email_verified.unwrap_or(false) {
-            warn!(
-                email = raw.email.as_deref().unwrap_or("?"),
-                "oauth.email_unverified"
-            );
+            // PII (the email itself) is debug-tier and stripped by
+            // production exporters per CLAUDE.md §2. The WARN line only
+            // records the event so operators can monitor the rate of
+            // unverified attempts without leaking subjects.
+            warn!(event = "oauth.email_unverified");
             return Err(AuthError::EmailUnverified);
         }
         let email_raw = raw

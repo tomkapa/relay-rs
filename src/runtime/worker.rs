@@ -112,6 +112,10 @@ pub struct WorkerPool {
     /// no-action contradictions (the mutation path closes inline via the
     /// memory tools).
     memory_store: crate::memory::SharedMemoryStore,
+    /// Injected clock (CLAUDE.md §11). Used for any wall-clock reading
+    /// the worker does directly — e.g. stamping reflection checkpoints.
+    /// Production code never calls `chrono::Utc::now` directly.
+    clock: crate::clock::SharedClock,
     cfg: WorkerConfig,
 }
 
@@ -127,6 +131,7 @@ impl WorkerPool {
         dag: SharedDagBudget,
         pool: PgPool,
         memory_store: crate::memory::SharedMemoryStore,
+        clock: crate::clock::SharedClock,
         cfg: WorkerConfig,
     ) -> Self {
         Self {
@@ -138,6 +143,7 @@ impl WorkerPool {
             dag,
             pool,
             memory_store,
+            clock,
             cfg,
         }
     }
@@ -162,6 +168,7 @@ impl WorkerPool {
                 dag: self.dag.clone(),
                 pool: self.pool.clone(),
                 memory_store: self.memory_store.clone(),
+                clock: self.clock.clone(),
                 cfg: cfg.clone(),
                 shutdown: shutdown.clone(),
             };
@@ -186,6 +193,7 @@ struct Worker {
     dag: SharedDagBudget,
     pool: PgPool,
     memory_store: crate::memory::SharedMemoryStore,
+    clock: crate::clock::SharedClock,
     cfg: WorkerConfig,
     shutdown: CancellationToken,
 }
@@ -473,7 +481,7 @@ impl Worker {
         reflection_session: SessionId,
         acting_user_id: crate::auth::UserId,
     ) -> Result<(), sqlx::Error> {
-        let now = Utc::now();
+        let now = chrono::DateTime::<Utc>::from(self.clock.now_wall());
         // Tenant-scoped tx: `reflection_checkpoints` is RLS-forced
         // post-migration-17. `org_id` is derived from the parent agent
         // and parity-checked by `reflection_checkpoints_enforce_org`;

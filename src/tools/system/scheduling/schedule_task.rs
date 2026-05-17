@@ -224,9 +224,16 @@ impl ScheduleTaskTool {
             schedule,
             next_run_at: Some(next_run_at),
         };
+        // Authorise + persist as the session-derived principal (the
+        // human at the DAG root). `ctx.acting_user_id` and
+        // `session_tenancy.created_by_user_id` agree under normal
+        // worker dispatch, but if the call ever arrives via a path
+        // where they diverge the row must commit under the same
+        // principal that the fire-tx will later assume — otherwise the
+        // task auths under one user and executes under another.
         let row = match self
             .store
-            .create_for_user(ctx.acting_user_id, payload)
+            .create_for_user(session_tenancy.created_by_user_id, payload)
             .await
         {
             Ok(row) => row,

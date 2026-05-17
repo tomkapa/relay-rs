@@ -122,7 +122,10 @@ async fn callback(
         // a newtype invariant — surface as an internal error rather than
         // a user-facing 4xx (it's a server-side bug, not a bad request).
         let seed = crate::app::default_agent_seed().map_err(|e| {
-            tracing::error!(error = %e, "auth.callback.default_agent_seed_build_failed");
+            tracing::error!(
+                event = "auth.callback.default_agent_seed_build_failed",
+                error = ?e,
+            );
             HttpError::Internal
         })?;
         crate::app::seed_default_agent_for_org(&state.agents, new_org.id, seed).await?;
@@ -131,10 +134,10 @@ async fn callback(
 
     let token = state.jwt.mint(upserted.user.id, active_org)?;
     info!(
-        user.id = %upserted.user.id,
-        org.id = %active_org,
-        new_user = upserted.is_new_user,
-        "auth.login.success"
+        event = "auth.login.success",
+        relay.user.id = %upserted.user.id,
+        relay.org.id = %active_org,
+        relay.user.new = upserted.is_new_user,
     );
 
     let cookie = build_session_cookie(token, state.cookie_secure());

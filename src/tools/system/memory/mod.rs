@@ -159,6 +159,7 @@ pub(super) fn store_to_tool_err(e: MemoryStoreError) -> ToolError {
     match e {
         MemoryStoreError::NotFound { .. }
         | MemoryStoreError::EventNotFound { .. }
+        | MemoryStoreError::ContradictionNotFound(_)
         | MemoryStoreError::WrongAgent { .. }
         | MemoryStoreError::PinnedImmutable { .. }
         | MemoryStoreError::Parse(_) => ToolError::InvalidInput(e.to_string()),

@@ -45,65 +45,44 @@ impl UserStore for PgUserStore {
             .execute(&mut *tx)
             .await?;
 
-        // 1) Lookup existing identity.
-        let existing: Option<UserId> = sqlx::query_scalar(
-            "SELECT user_id FROM user_identities WHERE provider = 'google' AND subject = $1",
+        // Idempotent under concurrent first-logins. Two callbacks for
+        // the same brand-new Google account otherwise race on the
+        // read-then-insert sequence; one would 23505 on the unique
+        // constraint and the sign-in would 500 with stale state in the
+        // partial. The `ON CONFLICT … RETURNING id` pattern collapses
+        // the "insert or get existing" decision into one statement that
+        // either ways yields the canonical id.
+        let candidate_id = UserId::new();
+        let user_id: UserId = sqlx::query_scalar(
+            "INSERT INTO users (id, email, display_name, avatar_url, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $5)
+             ON CONFLICT (email) DO UPDATE
+                 SET display_name = EXCLUDED.display_name,
+                     avatar_url   = EXCLUDED.avatar_url,
+                     updated_at   = EXCLUDED.updated_at
+             RETURNING id",
         )
-        .bind(&profile.subject)
-        .fetch_optional(&mut *tx)
+        .bind(candidate_id)
+        .bind(profile.email.as_str())
+        .bind(profile.display_name.as_deref())
+        .bind(profile.avatar_url.as_deref())
+        .bind(now)
+        .fetch_one(&mut *tx)
         .await?;
+        // is_new = true iff the INSERT actually used our candidate id.
+        let is_new_user = user_id.as_uuid() == candidate_id.as_uuid();
 
-        let (user_id, is_new_user) = if let Some(id) = existing {
-            // Refresh display name / avatar if the provider updated them.
-            sqlx::query(
-                "UPDATE users SET display_name = $2, avatar_url = $3, updated_at = $4
-                 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(profile.display_name.as_deref())
-            .bind(profile.avatar_url.as_deref())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            (id, false)
-        } else {
-            // Either this email is brand new, or the user previously
-            // logged in via a different provider (none in v1, but the
-            // schema allows it). Resolve via `users.email`.
-            let by_email: Option<UserId> =
-                sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
-                    .bind(profile.email.as_str())
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            let (id, is_new) = if let Some(id) = by_email {
-                (id, false)
-            } else {
-                let id = UserId::new();
-                sqlx::query(
-                    "INSERT INTO users (id, email, display_name, avatar_url, created_at, updated_at)
-                     VALUES ($1, $2, $3, $4, $5, $5)",
-                )
-                .bind(id)
-                .bind(profile.email.as_str())
-                .bind(profile.display_name.as_deref())
-                .bind(profile.avatar_url.as_deref())
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-                (id, true)
-            };
-            sqlx::query(
-                "INSERT INTO user_identities (user_id, provider, subject, email_at_link, created_at)
-                 VALUES ($1, 'google', $2, $3, $4)",
-            )
-            .bind(id)
-            .bind(&profile.subject)
-            .bind(profile.email.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-            (id, is_new)
-        };
+        sqlx::query(
+            "INSERT INTO user_identities (user_id, provider, subject, email_at_link, created_at)
+             VALUES ($1, 'google', $2, $3, $4)
+             ON CONFLICT (provider, subject) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(&profile.subject)
+        .bind(profile.email.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
 
         // Read back the canonical user row.
         let row =

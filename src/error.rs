@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use thiserror::Error;
 
 use crate::agents::AgentStoreError;
+use crate::auth::AuthError;
 use crate::config::SettingsError;
 use crate::provider::ProviderError;
 use crate::types::ParseError;
@@ -48,5 +49,5 @@ pub enum AppError {
     AgentStore(#[from] AgentStoreError),
 
     #[error("auth: {0}")]
-    Auth(String),
+    Auth(#[from] AuthError),
 }

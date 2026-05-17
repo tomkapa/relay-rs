@@ -257,7 +257,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         factory,
         AGENT_PROMPT_CACHE_CAP,
         AGENT_PROMPT_CACHE_TTL,
-        clock,
+        clock.clone(),
     ));
     let memory_store_for_pool: relay_rs::memory::SharedMemoryStore =
         Arc::new(relay_rs::memory::PgMemoryStore::new(
@@ -289,6 +289,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         dag.clone(),
         db.pool.clone(),
         memory_store_for_pool,
+        clock.clone(),
         cfg,
     )
     .spawn();

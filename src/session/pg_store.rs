@@ -120,12 +120,19 @@ impl SessionStore for PgSessionStore {
         b: Participant,
         parent_session_id: Option<SessionId>,
         org_id: OrgId,
-        created_by_user_id: UserId,
+        _created_by_user_id: UserId,
     ) -> Result<SessionId, SessionError> {
         // Tenant-scoped tx — the RLS WITH CHECK on `sessions.org_id`
         // rejects a row whose `org_id` is not in the acting user's
         // memberships. Worker / tool callers source `acting_user_id`
         // from the claimed session's `created_by_user_id`.
+        //
+        // Identity invariant: the inserted session's `created_by_user_id`
+        // is the authenticated actor, *not* whatever the caller named in
+        // the argument. This closes a forgery window: a same-org caller
+        // could otherwise create a session attributed to another member
+        // and every subsequent worker `_for_user` write claimed off that
+        // session would run under the spoofed identity.
         let mut tx = crate::auth::begin_as_user(&self.pool, acting_user_id)
             .await
             .map_err(|e| SessionError::Backend(format!("begin_as_user: {e}")))?;
@@ -137,7 +144,7 @@ impl SessionStore for PgSessionStore {
             b,
             parent_session_id,
             org_id,
-            created_by_user_id,
+            acting_user_id,
         )
         .await?;
         tx.commit().await.map_err(SessionError::Db)?;

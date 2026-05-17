@@ -1006,7 +1006,7 @@ async fn resolve_contradiction_impl(
         ResolutionOutcome::NoAction { reason } => (None, Some(reason.into_inner())),
     };
     let mut tx = scope.begin(&store.pool).await?;
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE contradiction_events
          SET resolved_at = $1, resolution_event_id = $2, resolution_reason = $3
          WHERE id = $4 AND resolved_at IS NULL",
@@ -1017,6 +1017,24 @@ async fn resolve_contradiction_impl(
     .bind(id)
     .execute(&mut *tx)
     .await?;
+    // Zero rows affected has two distinct meanings that we must
+    // disambiguate: (1) the row is already resolved — idempotent
+    // success, preserving the original stamped time (a contract the
+    // librarian and `resolve_contradiction_is_idempotent` test both
+    // rely on); (2) the row doesn't exist, or is filtered out by RLS
+    // in `AsUser` scope — real error, must surface so retry-loops
+    // don't mistake silent skips for resolution.
+    if result.rows_affected() == 0 {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contradiction_events WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(MemoryStoreError::ContradictionNotFound(id));
+        }
+        // Row exists and was already resolved → idempotent no-op.
+    }
     tx.commit().await?;
     Ok(())
 }

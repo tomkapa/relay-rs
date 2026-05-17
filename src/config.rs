@@ -156,8 +156,16 @@ struct RawSettings {
     google_client_id: SecretString,
     google_client_secret: SecretString,
     google_redirect_url: String,
-    #[serde(default)]
+    // Secure by default — forgetting to set this in any https-fronted
+    // deploy must not silently drop the `Secure` cookie flag. Local-dev
+    // (http://localhost) overrides via `RELAY_COOKIE_SECURE=false` in
+    // `.env`.
+    #[serde(default = "default_cookie_secure")]
     relay_cookie_secure: bool,
+}
+
+const fn default_cookie_secure() -> bool {
+    true
 }
 
 fn default_timezone_raw() -> String {

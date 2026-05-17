@@ -25,8 +25,8 @@ use crate::types::ParseError;
 
 use super::limits::{CONTRADICTION_REASON_MAX_BYTES, VALIDATION_EVIDENCE_MAX_BYTES};
 use super::types::{
-    MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState, MutationKind,
-    MutationSourceKind,
+    ContradictionEventId, MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState,
+    MutationKind, MutationSourceKind,
 };
 
 /// All failure modes the memory store can surface. CLAUDE.md §12 — one error
@@ -42,6 +42,13 @@ pub enum MemoryStoreError {
     /// by the revert path against a stale id.
     #[error("memory event {id:?} not found")]
     EventNotFound { id: MemoryEventId },
+
+    /// Resolve-contradiction touched zero rows. Either the row was
+    /// already resolved, the id is unknown, or RLS filtered it out as
+    /// belonging to another tenant. Treating zero-affected as success
+    /// would silently lie to the librarian / resolution turn.
+    #[error("contradiction {0:?} not found or already resolved")]
+    ContradictionNotFound(ContradictionEventId),
 
     /// Target row exists but belongs to a different agent. Memory is
     /// per-agent and private (doc/memory.md §1.11) — a cross-agent edit is

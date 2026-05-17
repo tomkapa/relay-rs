@@ -118,8 +118,14 @@ impl ScheduledTaskStore for PgScheduledTaskStore {
     async fn create_for_user(
         &self,
         acting_user_id: UserId,
-        payload: NewScheduledTask,
+        mut payload: NewScheduledTask,
     ) -> Result<ScheduledTaskRecord, ScheduledTaskError> {
+        // Identity invariant: persist the authenticated actor regardless
+        // of the payload's `created_by_user_id`. Otherwise a caller
+        // could schedule a task that fires under another member's
+        // principal (the scheduler reads this column to mint the
+        // resulting `NewPromptRequest`'s tenancy).
+        payload.created_by_user_id = acting_user_id;
         let tx = begin_as_user(&self.pool, acting_user_id)
             .await
             .map_err(|e| ScheduledTaskError::Backend(format!("begin_as_user: {e}")))?;

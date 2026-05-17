@@ -665,6 +665,7 @@ pub async fn build_server(
         pieces.dag.clone(),
         pieces.pool.clone(),
         pieces.memory_store.clone(),
+        pieces.clock.clone(),
         WorkerConfig::default(),
     );
     let workers = pool.spawn();
@@ -708,14 +709,14 @@ pub async fn build_server(
             .await
             .map_err(|source| AppError::DbConnect { source })?;
 
-    let jwt = JwtSigner::new(&settings.auth.jwt_secret, pieces.clock.clone())
-        .map_err(|e| AppError::Auth(format!("jwt signer: {e}")))?;
+    let jwt =
+        JwtSigner::new(&settings.auth.jwt_secret, pieces.clock.clone()).map_err(AppError::Auth)?;
     let oauth = GoogleOAuth::new(
         &settings.auth.google_client_id,
         &settings.auth.google_client_secret,
         &settings.auth.google_redirect_url,
     )
-    .map_err(|e| AppError::Auth(format!("google oauth: {e}")))?;
+    .map_err(AppError::Auth)?;
     let users: SharedUserStore = Arc::new(PgUserStore::new(pieces.pool.clone()));
 
     let state = AppState {

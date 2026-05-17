@@ -104,6 +104,16 @@ impl DagBudget for PgDagBudget {
         bump_or_fail_in_tx(tx, root).await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        name = "dag.bump",
+        fields(
+            relay.dag.root = %root,
+            relay.dag.bump.outcome = tracing::field::Empty,
+            relay.dag.turns_used = tracing::field::Empty,
+            relay.dag.turns_cap = tracing::field::Empty,
+        ),
+    )]
     async fn bump_or_fail_for_user(
         &self,
         acting_user_id: UserId,

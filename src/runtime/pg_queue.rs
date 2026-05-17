@@ -187,8 +187,17 @@ impl PromptQueue for PgPromptQueue {
     async fn enqueue_for_user(
         &self,
         acting_user_id: UserId,
-        req: NewPromptRequest,
+        mut req: NewPromptRequest,
     ) -> Result<EnqueueOutcome, PromptError> {
+        // Identity invariant: the persisted `created_by_user_id` is the
+        // authenticated actor, not whatever the caller put in the
+        // payload. Otherwise a same-org caller could enqueue a request
+        // that stamps another member's id; every subsequent worker
+        // `_for_user` write would then run under that other principal
+        // (the `ClaimReceipt::acting_user_id` is derived from this
+        // column). Overwriting here makes the spoof unrepresentable at
+        // the storage layer.
+        req.created_by_user_id = acting_user_id;
         enqueue_impl(self, EnqueueTxScope::AsUser(acting_user_id), req).await
     }
 

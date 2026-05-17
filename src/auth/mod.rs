@@ -76,6 +76,15 @@ pub async fn begin_as_user<'a>(
 /// Works because the app role is the table owner in dev and tests;
 /// production deployments that split roles should swap this for a
 /// dedicated `BYPASSRLS` role.
+///
+/// Returns `sqlx::Error` (not `AuthError`) so callers in any subsystem
+/// can use `?` with their existing `Db(#[from] sqlx::Error)` variant.
+/// Routing every caller's error type through `AuthError` would require
+/// `From<AuthError>` on `SessionError`, `MemoryStoreError`,
+/// `ScheduledTaskError`, `PromptError`, `McpError`, `ResponseError`,
+/// and `AgentStoreError` — a cross-module change disproportionate to
+/// the benefit. This helper is infrastructure-level; the inner failure
+/// is always a Postgres error.
 pub async fn begin_privileged(pool: &PgPool) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL row_security = off")

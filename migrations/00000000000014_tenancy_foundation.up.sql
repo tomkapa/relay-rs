@@ -79,13 +79,29 @@ CREATE OR REPLACE FUNCTION app_current_user_id() RETURNS UUID
     SELECT NULLIF(current_setting('app.user_id', true), '')::UUID
 $$;
 
+-- SECURITY DEFINER so the membership read runs with the function
+-- owner's privileges (the table owner) regardless of the calling role.
+-- This is what lets us REVOKE access to `org_members` from `relay_app`
+-- below — the RLS policy still evaluates correctly because the helper
+-- isn't subject to the caller's grants. STABLE keeps the planner able
+-- to fold repeated calls within a query.
 CREATE OR REPLACE FUNCTION app_user_is_member(target_org UUID) RETURNS BOOLEAN
-    LANGUAGE sql STABLE AS $$
+    LANGUAGE sql STABLE SECURITY DEFINER AS $$
     SELECT EXISTS (
         SELECT 1 FROM org_members m
          WHERE m.user_id = app_current_user_id()
            AND m.org_id  = target_org
     )
+$$;
+-- Lock the function's search_path to the schema it was created in so
+-- a search-path attack can't redirect `org_members` to a different
+-- table. Dynamic SQL because per-test schema-pinned setups create
+-- the function in a `relay_test_*` schema, not `public`.
+DO $$
+DECLARE s text := current_schema();
+BEGIN
+    EXECUTE format('ALTER FUNCTION app_user_is_member(UUID) SET search_path = %I, pg_catalog', s);
+END
 $$;
 
 -- ───────────────────────────────────────────────────────────────────────────
@@ -112,6 +128,14 @@ $$;
 -- (the migration runs once per schema-isolated test DB, so dynamic SQL
 -- with `current_schema()` keeps the grants schema-correct without us
 -- hard-coding `public`).
+--
+-- The identity tables (`users`, `user_identities`, `org_members`,
+-- `oauth_login_states`) are then explicitly REVOKEd from `relay_app`
+-- so a tenant-scoped tx (which always runs as `relay_app`) cannot
+-- read or write the auth surface — including PKCE verifier rows. The
+-- `auth::PgUserStore` reaches these tables through `begin_privileged`
+-- (table owner, RLS off) instead. Future identity tables get the
+-- same treatment as they're added.
 DO $$
 DECLARE s text := current_schema();
 BEGIN
@@ -120,6 +144,10 @@ BEGIN
     EXECUTE format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO relay_app', s);
     EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO relay_app', s);
     EXECUTE format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT EXECUTE ON FUNCTIONS TO relay_app', s);
+    EXECUTE format('REVOKE ALL ON TABLE %I.users FROM relay_app', s);
+    EXECUTE format('REVOKE ALL ON TABLE %I.user_identities FROM relay_app', s);
+    EXECUTE format('REVOKE ALL ON TABLE %I.org_members FROM relay_app', s);
+    EXECUTE format('REVOKE ALL ON TABLE %I.oauth_login_states FROM relay_app', s);
 END
 $$;
 

@@ -286,7 +286,7 @@ impl McpServerRowForList {
         // or via a tenant-scoped raw query here.
         let alias = McpServerAlias::try_from(self.alias).map_err(HttpError::Parse)?;
         let config: McpTransport = serde_json::from_value(self.config).map_err(|e| {
-            tracing::error!(error = %e, "mcp.row.deserialize_transport");
+            tracing::error!(error = ?e, "mcp.row.deserialize_transport");
             HttpError::Internal
         })?;
         let description = self
@@ -299,7 +299,7 @@ impl McpServerRowForList {
             .map(serde_json::from_value::<Vec<DiscoveredTool>>)
             .transpose()
             .map_err(|e| {
-                tracing::error!(error = %e, "mcp.row.deserialize_discovered");
+                tracing::error!(error = ?e, "mcp.row.deserialize_discovered");
                 HttpError::Internal
             })?;
         let _ = self.org_id; // not on the wire shape — RLS already filtered.

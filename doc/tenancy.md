@@ -35,7 +35,7 @@ Migrations 14–19 build the surface in one trunk. Each migration ships
 together with paired up/down SQL and the Rust-side code that reads it
 (per CLAUDE.md §14).
 
-```
+```text
 migrations/
   00000000000014_tenancy_foundation.up.sql
     └─ users, user_identities, organizations, org_members,
@@ -64,7 +64,7 @@ migrations/
 
 ### Identity tables
 
-```
+```text
 users               (id, email CITEXT UNIQUE, display_name, avatar_url, ts)
 user_identities     (provider, subject) PK; FK → users.id; provider IN
                     ('google') today, widens to other OAuth providers
@@ -84,7 +84,7 @@ and their memberships; identity is single-tenant per row already
 
 Every retrofit follows the same shape:
 
-```
+```sql
 ALTER TABLE <tbl> ADD COLUMN org_id UUID NOT NULL
     REFERENCES organizations(id) ON DELETE CASCADE;
 
@@ -125,7 +125,7 @@ parent relationships are slightly different.
 
 ## 3. Auth subsystem (`src/auth/`)
 
-```
+```text
 src/auth/
   mod.rs           re-exports + begin_as / begin_as_user / begin_privileged
   types.rs         UserId, OrgId (uuid_newtype!); Email, OrgSlug;
@@ -168,7 +168,7 @@ task1.md:80 calls out).
 
 ## 4. Sign-in flow (Google OAuth Authorization Code + PKCE)
 
-```
+```text
        Browser                    relay-rs                     Google
           │                          │                            │
           │ GET /auth/google/login   │                            │
@@ -224,7 +224,7 @@ and time-limited (10 min) — replays and stale callbacks both raise
 
 ## 5. HTTP surface
 
-```
+```text
 src/http/routes/
   auth.rs          GET /auth/google/login, GET /auth/google/callback
                    (public — outside the principal layer)
@@ -361,7 +361,7 @@ of truth.
 
 ## 8. Test scaffolding
 
-```
+```text
 tests/common/
   pg.rs            TestDb::fresh seeds default_user_id, default_org_id,
                    default_agent_id (the agent is seeded into
