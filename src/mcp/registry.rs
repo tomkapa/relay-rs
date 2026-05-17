@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use chrono::Utc;
 use serde_json::Value;
 use tracing::{instrument, warn};
 
@@ -282,10 +281,17 @@ impl McpRegistryInner {
         builder: &mut McpStateBuilder,
     ) {
         let McpServerRecord {
-            id, alias, config, ..
+            id,
+            org_id,
+            alias,
+            config,
+            ..
         } = row;
 
-        let client = match self.connect_or_reuse(id, &alias, &config, prior).await {
+        let client = match self
+            .connect_or_reuse(id, org_id, &alias, &config, prior)
+            .await
+        {
             Some(c) => c,
             None => return,
         };
@@ -303,6 +309,7 @@ impl McpRegistryInner {
                     .store
                     .update_health(
                         id,
+                        org_id,
                         McpHealthUpdate {
                             last_seen_at: None,
                             last_error: Some(format!("list_tools: {e}")),
@@ -314,13 +321,14 @@ impl McpRegistryInner {
             }
         };
 
-        let now = chrono::DateTime::<Utc>::from(self.clock.now_wall());
+        let now = self.clock.now_utc();
         let discovered = ingest_tools(id, &alias, &client, remote_tools, builder);
 
         let _ = self
             .store
             .update_health(
                 id,
+                org_id,
                 McpHealthUpdate {
                     last_seen_at: Some(now),
                     last_error: None,
@@ -339,6 +347,7 @@ impl McpRegistryInner {
     async fn connect_or_reuse(
         &self,
         id: McpServerId,
+        org_id: crate::auth::OrgId,
         alias: &McpServerAlias,
         config: &McpTransport,
         prior: &mut HashMap<McpServerId, ConnectedServer>,
@@ -361,6 +370,7 @@ impl McpRegistryInner {
                     .store
                     .update_health(
                         id,
+                        org_id,
                         McpHealthUpdate {
                             last_seen_at: None,
                             last_error: Some(format!("connect: {e}")),

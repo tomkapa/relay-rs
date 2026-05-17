@@ -18,9 +18,10 @@ use tracing::{info, warn};
 use crate::agent_core::{Agent, AgentBuilder};
 use crate::agents::{
     AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL, AgentDescription, AgentFactory, AgentName,
-    AgentNamesCache, AgentPromptCache, AgentSystemPrompt, CachedAgents, DefaultAgentSeed,
-    PgAgentStore, SharedAgentStore, SharedAgents,
+    AgentNamesCache, AgentPromptCache, AgentStoreError, AgentSystemPrompt, CachedAgents,
+    DefaultAgentSeed, PgAgentStore, SharedAgentStore, SharedAgents,
 };
+use crate::auth::{GoogleOAuth, JwtSigner, OrgId, PgUserStore, SharedUserStore};
 use crate::clock::{SharedClock, SystemClock};
 use crate::config::{EmbeddingSettings, ProviderSettings, Settings};
 use crate::error::AppError;
@@ -318,14 +319,15 @@ impl Collaborators {
         let embedding_provider: SharedEmbeddingProvider =
             build_embedding_provider(&settings.embedding);
 
-        // Downstream (HTTP, worker, memory) assumes `agents.default_id()` resolves.
+        // Per-org default-agent seeding happens lazily on first sign-up
+        // (see `seed_default_agent_for_org` and `auth::callback`); the
+        // composition root no longer mints a global default because there
+        // is no global org to own it.
         let agents_impl = Arc::new(PgAgentStore::new(
             pool.clone(),
             clock.clone(),
             embedding_provider.clone(),
         ));
-        let seed = default_agent_seed()?;
-        agents_impl.seed_default(seed).await?;
         let agents: SharedAgentStore = agents_impl;
 
         let sessions: SharedSessionStore =
@@ -336,7 +338,11 @@ impl Collaborators {
             AGENT_PROMPT_CACHE_TTL,
             clock.clone(),
         );
-        let names_cache = AgentNamesCache::new(AGENT_PROMPT_CACHE_TTL, clock.clone());
+        let names_cache = AgentNamesCache::new(
+            AGENT_PROMPT_CACHE_CAP,
+            AGENT_PROMPT_CACHE_TTL,
+            clock.clone(),
+        );
         let memory_store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
             pool.clone(),
             clock.clone(),
@@ -421,6 +427,7 @@ impl Collaborators {
             scheduled_tasks: scheduled_tasks.clone(),
             default_tz,
             clock: clock.clone(),
+            pool: pool.clone(),
         })?;
 
         // `memory_store` and `session_memory_cache` are not held on
@@ -500,6 +507,9 @@ struct BuiltinToolDeps<'a> {
     scheduled_tasks: SharedScheduledTaskStore,
     default_tz: DefaultTimezone,
     clock: SharedClock,
+    /// Pool handle threaded through to the scheduling tools so they can
+    /// open `begin_as_user` tx for tenant-side visibility gating.
+    pool: PgPool,
 }
 
 /// Register every system tool into a [`ToolRegistry`]. Lives at the
@@ -535,22 +545,50 @@ fn build_builtin_tools(deps: BuiltinToolDeps<'_>) -> Result<ToolRegistry, AppErr
         .with(Arc::new(CreateAgentTool::new(deps.agents.clone())))
         .with(Arc::new(ScheduleTaskTool::new(
             deps.scheduled_tasks.clone(),
+            deps.agents.clone(),
+            deps.sessions.clone(),
             deps.default_tz,
             deps.clock,
         )))
         .with(Arc::new(ListScheduledTasksTool::new(
             deps.scheduled_tasks.clone(),
+            deps.sessions.clone(),
+            deps.pool.clone(),
         )))
-        .with(Arc::new(CancelScheduledTaskTool::new(deps.scheduled_tasks)))
+        .with(Arc::new(CancelScheduledTaskTool::new(
+            deps.scheduled_tasks,
+            deps.sessions.clone(),
+            deps.pool.clone(),
+        )))
         .build())
 }
 
-fn default_agent_seed() -> Result<DefaultAgentSeed, AppError> {
+/// Seed material for the per-org default agent.
+///
+/// Exposed so the OAuth callback (`auth::callback`) can mint the default
+/// agent inside the just-created personal org without re-importing the
+/// recruiter prompt constants. Fails only if one of the seed constants
+/// suddenly violates a newtype invariant — a compile-time-ish guarantee
+/// in practice.
+pub fn default_agent_seed() -> Result<DefaultAgentSeed, AppError> {
     Ok(DefaultAgentSeed {
         name: AgentName::try_from(DEFAULT_AGENT_NAME)?,
         system_prompt: AgentSystemPrompt::try_from(DEFAULT_AGENT_ROLE_PROMPT)?,
         description: AgentDescription::try_from(DEFAULT_AGENT_DESCRIPTION)?,
     })
+}
+
+/// Seed the default agent for `org_id`.
+///
+/// Idempotent — a second call for the same org returns the existing
+/// default's id. Called from the OAuth callback on first sign-up so the
+/// cookie minted immediately resolves to a usable workspace.
+pub async fn seed_default_agent_for_org(
+    agents: &SharedAgentStore,
+    org_id: OrgId,
+    seed: DefaultAgentSeed,
+) -> Result<crate::agents::AgentId, AgentStoreError> {
+    agents.seed_default(org_id, seed).await
 }
 
 /// Build a fully-wired [`Agent`] without the HTTP/worker stack.
@@ -627,6 +665,7 @@ pub async fn build_server(
         pieces.dag.clone(),
         pieces.pool.clone(),
         pieces.memory_store.clone(),
+        pieces.clock.clone(),
         WorkerConfig::default(),
     );
     let workers = pool.spawn();
@@ -670,6 +709,17 @@ pub async fn build_server(
             .await
             .map_err(|source| AppError::DbConnect { source })?;
 
+    let jwt =
+        JwtSigner::new(&settings.auth.jwt_secret, pieces.clock.clone()).map_err(AppError::Auth)?;
+    let oauth = GoogleOAuth::new(
+        &settings.auth.google_client_id,
+        &settings.auth.google_client_secret,
+        &settings.auth.google_redirect_url,
+    )
+    .map_err(AppError::Auth)?;
+    let users: SharedUserStore = Arc::new(PgUserStore::new(pieces.pool.clone()));
+
+    let memberships = Arc::new(crate::http::MembershipCache::new(pieces.clock.clone()));
     let state = AppState {
         queue: pieces.queue,
         leases: pieces.leases,
@@ -682,6 +732,12 @@ pub async fn build_server(
         mcp_refresh,
         thread_stream,
         pool: pieces.pool.clone(),
+        jwt,
+        oauth,
+        users,
+        clock: pieces.clock.clone(),
+        cookie_secure: settings.auth.cookie_secure,
+        memberships,
     };
 
     Ok(Server {

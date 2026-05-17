@@ -25,6 +25,7 @@ use crate::agents::{
     AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt, AgentUpdate,
     AllowedMcpServers, NewAgent,
 };
+use crate::auth::{AuthError, Principal};
 use crate::mcp::McpServerId;
 
 use super::super::error::HttpError;
@@ -116,6 +117,7 @@ struct UpdateAgentRequest {
 
 async fn create_agent(
     State(state): State<AppState>,
+    principal: Principal,
     Json(payload): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentResponse>), HttpError> {
     let name = AgentName::try_from(payload.name).map_err(HttpError::Parse)?;
@@ -127,6 +129,7 @@ async fn create_agent(
     let record = state
         .agents
         .create(NewAgent {
+            org_id: principal.active_org_id,
             name,
             system_prompt,
             description,
@@ -137,22 +140,55 @@ async fn create_agent(
     Ok((StatusCode::CREATED, Json(record.into())))
 }
 
-async fn list_agents(State(state): State<AppState>) -> Result<Json<Vec<AgentResponse>>, HttpError> {
-    let rows = state.agents.list().await?;
-    Ok(Json(rows.into_iter().map(AgentResponse::from).collect()))
+async fn list_agents(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<Json<Vec<AgentResponse>>, HttpError> {
+    // Tenant-scoped read: open a tx, set `app.user_id` via the GUC, and
+    // let the `agents_org_isolation` RLS policy do the filtering. Mirrors
+    // the mcp_servers route — bypasses the store's privileged read path
+    // so the user can see only their own org's rows.
+    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
+    let rows = sqlx::query_as::<_, AgentRowForList>(
+        "SELECT id, org_id, name, system_prompt, description, is_default, \
+                allowed_mcp_servers, created_at, updated_at \
+         FROM agents ORDER BY created_at ASC",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(AuthError::from)?;
+    tx.commit().await.map_err(AuthError::from)?;
+    let out = rows
+        .into_iter()
+        .map(AgentRowForList::into_response)
+        .collect();
+    Ok(Json(out))
 }
 
 async fn read_agent(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgentResponse>, HttpError> {
     let id = AgentId::from(id);
-    let row = state.agents.read(id).await?;
-    Ok(Json(row.into()))
+    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
+    let row = sqlx::query_as::<_, AgentRowForList>(
+        "SELECT id, org_id, name, system_prompt, description, is_default, \
+                allowed_mcp_servers, created_at, updated_at \
+         FROM agents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AuthError::from)?;
+    tx.commit().await.map_err(AuthError::from)?;
+    let row = row.ok_or(HttpError::NotFound)?;
+    Ok(Json(row.into_response()))
 }
 
 async fn update_agent(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateAgentRequest>,
 ) -> Result<Json<AgentResponse>, HttpError> {
@@ -177,6 +213,18 @@ async fn update_agent(
         .map(AllowedMcpServers::try_from)
         .transpose()
         .map_err(HttpError::Parse)?;
+    // Tenant gate: 404 cross-org / unknown ids without leaking existence
+    // before dispatching the privileged update.
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::Agents,
+        id.as_uuid(),
+    )
+    .await?
+    {
+        return Err(HttpError::NotFound);
+    }
     let row = state
         .agents
         .update(
@@ -195,9 +243,53 @@ async fn update_agent(
 
 async fn delete_agent(
     State(state): State<AppState>,
+    principal: Principal,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, HttpError> {
     let id = AgentId::from(id);
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::Agents,
+        id.as_uuid(),
+    )
+    .await?
+    {
+        return Err(HttpError::NotFound);
+    }
     state.agents.delete(id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// Local row type for the tenant-scoped SELECTs. Mirrors the columns
+// returned by the store's read path but lives here so the route can run
+// raw SQL inside the principal-scoped tx without going through the
+// store's privileged transaction.
+#[derive(sqlx::FromRow)]
+struct AgentRowForList {
+    id: AgentId,
+    org_id: crate::auth::OrgId,
+    name: String,
+    system_prompt: String,
+    description: String,
+    is_default: bool,
+    allowed_mcp_servers: Vec<McpServerId>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl AgentRowForList {
+    fn into_response(self) -> AgentResponse {
+        let _ = self.org_id; // not on the wire shape — RLS already filtered.
+        AgentResponse {
+            id: self.id,
+            name: self.name,
+            system_prompt: self.system_prompt,
+            description: self.description,
+            is_default: self.is_default,
+            allowed_mcp_servers: self.allowed_mcp_servers,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
 }

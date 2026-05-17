@@ -48,7 +48,7 @@ fn build_memory(db: &TestDb, clock: SharedClock) -> Fixture {
     let sessions: SharedSessionStore =
         Arc::new(PgSessionStore::new(db.pool.clone(), clock.clone()));
     let prompt_cache = AgentPromptCache::new(8, Duration::from_secs(60), clock.clone());
-    let names_cache = AgentNamesCache::new(Duration::from_secs(60), clock.clone());
+    let names_cache = AgentNamesCache::new(16, Duration::from_secs(60), clock.clone());
     let store: SharedMemoryStore = Arc::new(PgMemoryStore::new(
         db.pool.clone(),
         clock.clone(),
@@ -78,7 +78,13 @@ async fn assembles_core_then_role_in_order() {
     let clock: SharedClock = Arc::new(TestClock::new());
     let f = build_memory(&db, clock);
 
-    let session = human_to_agent_session(f.sessions.as_ref(), db.default_agent_id).await;
+    let session = human_to_agent_session(
+        f.sessions.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let viewer = Participant::agent(db.default_agent_id);
     let prompt = f
         .memory
@@ -127,7 +133,13 @@ async fn date_section_sits_between_role_and_memory() {
         .await
         .expect("write");
 
-    let session = human_to_agent_session(f.sessions.as_ref(), agent_id).await;
+    let session = human_to_agent_session(
+        f.sessions.as_ref(),
+        agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let prompt = f
         .memory
         .system_prompt(
@@ -170,7 +182,13 @@ async fn empty_memory_skips_memory_section() {
     let clock: SharedClock = Arc::new(TestClock::new());
     let f = build_memory(&db, clock);
 
-    let session = human_to_agent_session(f.sessions.as_ref(), db.default_agent_id).await;
+    let session = human_to_agent_session(
+        f.sessions.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let prompt = f
         .memory
         .system_prompt(
@@ -206,7 +224,13 @@ async fn renders_memory_section_after_role() {
         .await
         .expect("write");
 
-    let session = human_to_agent_session(f.sessions.as_ref(), agent_id).await;
+    let session = human_to_agent_session(
+        f.sessions.as_ref(),
+        agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let prompt = f
         .memory
         .system_prompt(
@@ -241,7 +265,13 @@ async fn frozen_during_session_returns_identical_prompt() {
     let clock: SharedClock = Arc::new(TestClock::new());
     let f = build_memory(&db, clock);
     let agent_id = db.default_agent_id;
-    let session = human_to_agent_session(f.sessions.as_ref(), agent_id).await;
+    let session = human_to_agent_session(
+        f.sessions.as_ref(),
+        agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let viewer = Participant::agent(agent_id);
 
     let first = f
@@ -307,7 +337,13 @@ async fn resolve_handle_round_trips_to_memory_id() {
         .await
         .expect("write");
 
-    let session = human_to_agent_session(f.sessions.as_ref(), agent_id).await;
+    let session = human_to_agent_session(
+        f.sessions.as_ref(),
+        agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     // Compose the section so the handle map is populated.
     let _ = f
         .memory

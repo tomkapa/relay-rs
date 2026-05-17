@@ -12,6 +12,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::agents::AgentId;
+use crate::auth::UserId;
 use crate::provider::{ToolCall, ToolResult};
 
 use super::error::ResponseError;
@@ -130,6 +131,26 @@ pub trait ResponseSink: fmt::Debug + Send + Sync {
         chunk: ResponseChunk,
     ) -> Result<ChunkSeq, ResponseError>;
     async fn close(&self, request_id: PromptRequestId) -> Result<(), ResponseError>;
+
+    /// Tenant-scoped variant of [`Self::publish`]. Opens
+    /// `begin_as_user(acting_user_id)` so the `prompt_response_streams`
+    /// / `prompt_response_chunks` INSERTs are RLS-checked against the
+    /// acting principal. Worker / tool callers source `acting_user_id`
+    /// from the claimed session's `created_by_user_id`; HTTP and
+    /// scheduler paths keep the existing privileged entry point.
+    async fn publish_for_user(
+        &self,
+        acting_user_id: UserId,
+        request_id: PromptRequestId,
+        chunk: ResponseChunk,
+    ) -> Result<ChunkSeq, ResponseError>;
+
+    /// Tenant-scoped variant of [`Self::close`].
+    async fn close_for_user(
+        &self,
+        acting_user_id: UserId,
+        request_id: PromptRequestId,
+    ) -> Result<(), ResponseError>;
 }
 
 #[async_trait]

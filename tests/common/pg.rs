@@ -22,6 +22,7 @@ use relay_rs::agents::{
     AgentDescription, AgentId, AgentName, AgentSystemPrompt, DefaultAgentSeed, PgAgentStore,
     SharedAgentStore,
 };
+use relay_rs::auth::{OrgId, UserId};
 use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{SessionId, SessionStore};
@@ -44,6 +45,15 @@ pub struct TestDb {
     /// `SET search_path TO "<schema>", public`.
     pub pool: PgPool,
     pub default_agent_id: AgentId,
+    /// Seeded org id — present on every freshly-created test schema so
+    /// store-level tests that insert into RLS-bound tables (like
+    /// `mcp_servers`) have a valid `org_id` to use without minting
+    /// their own.
+    pub default_org_id: OrgId,
+    /// Owner of `default_org_id`. Tests that need a `Principal` for the
+    /// HTTP-layer probes use this id; see `tests/common/auth.rs` for
+    /// the cookie helper.
+    pub default_user_id: UserId,
     schema: String,
     admin: PgPool,
 }
@@ -91,23 +101,62 @@ impl TestDb {
             .await
             .expect("run migrations");
 
+        // Seed an org + user up front so RLS-bound table tests have a
+        // valid `org_id` to insert against without minting their own.
+        let default_user_id = UserId::new();
+        let default_org_id = OrgId::new();
+        let now = chrono::Utc::now();
+        let user_email = format!("seed-{}@example.test", Uuid::new_v4().simple());
+        let org_slug = format!("seed-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        sqlx::query("INSERT INTO users (id, email, display_name, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)")
+            .bind(default_user_id)
+            .bind(&user_email)
+            .bind("Seeded Test User")
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+        sqlx::query("INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)")
+            .bind(default_org_id)
+            .bind("Seeded Test Org")
+            .bind(&org_slug)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("seed org");
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role, created_at) VALUES ($1, $2, 'owner', $3)")
+            .bind(default_org_id)
+            .bind(default_user_id)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("seed membership");
+
         // Seed a default agent so `sessions.agent_id` (NOT NULL REFERENCES
         // agents) can be satisfied by tests calling `sessions.create(id)`.
+        // The seed is scoped to `default_org_id` so `agents.default_id_for`
+        // resolves for tests that go through the HTTP path with a principal
+        // pinned to the same org.
         let agents = agent_store(pool.clone(), SystemClock::shared());
         let default_agent_id = agents
-            .seed_default(DefaultAgentSeed {
-                name: AgentName::try_from("test-default").expect("valid name"),
-                system_prompt: AgentSystemPrompt::try_from("test default prompt")
-                    .expect("valid prompt"),
-                description: AgentDescription::try_from("Default test agent.")
-                    .expect("valid description"),
-            })
+            .seed_default(
+                default_org_id,
+                DefaultAgentSeed {
+                    name: AgentName::try_from("test-default").expect("valid name"),
+                    system_prompt: AgentSystemPrompt::try_from("test default prompt")
+                        .expect("valid prompt"),
+                    description: AgentDescription::try_from("Default test agent.")
+                        .expect("valid description"),
+                },
+            )
             .await
             .expect("seed default agent");
 
         Self {
             pool,
             default_agent_id,
+            default_org_id,
+            default_user_id,
             schema,
             admin,
         }
@@ -135,14 +184,31 @@ pub fn shared_agent_store(pool: PgPool, clock: SharedClock) -> SharedAgentStore 
 /// [`SessionStore::resolve_or_create_for_pair`] API. Tests use this to obtain
 /// a session without going through the queue.
 ///
+/// `org_id` / `user_id` pin the row to the seeded test tenant — every
+/// caller passes [`TestDb::default_org_id`] / [`TestDb::default_user_id`]
+/// because the seeded `default_agent_id` lives in that org and the
+/// trigger on `sessions` would reject a cross-org `(agent, org)` pair.
+///
 /// The synthetic `root_request_id` is generated locally; nothing dereferences
 /// it (no FK from `sessions.root_request_id` to `prompt_requests.id`), but
 /// integration tests that also exercise `prompt_requests` should mint a real
 /// request id and pass it in instead.
-pub async fn human_to_agent_session(sessions: &dyn SessionStore, agent_id: AgentId) -> SessionId {
+pub async fn human_to_agent_session(
+    sessions: &dyn SessionStore,
+    agent_id: AgentId,
+    org_id: OrgId,
+    user_id: UserId,
+) -> SessionId {
     let root = PromptRequestId::new();
     sessions
-        .resolve_or_create_for_pair(root, Participant::Human, Participant::agent(agent_id), None)
+        .resolve_or_create_for_pair(
+            root,
+            Participant::Human,
+            Participant::agent(agent_id),
+            None,
+            org_id,
+            user_id,
+        )
         .await
         .expect("create human-to-agent session")
 }
@@ -158,20 +224,22 @@ pub async fn seed_prompt_request(
     pool: &PgPool,
     session: SessionId,
     agent_id: AgentId,
+    org_id: OrgId,
 ) -> PromptRequestId {
     let id = PromptRequestId::new();
     let now = chrono::Utc::now();
     sqlx::query(
         "INSERT INTO prompt_requests
-             (id, session_id, content, idempotency_key, status,
+             (id, session_id, org_id, content, idempotency_key, status,
               sender_kind, receiver_kind, receiver_agent_id, root_request_id,
               created_at, updated_at)
-         VALUES ($1, $2, 'test', $3, 'pending',
-                 'human', 'agent', $4, $1,
-                 $5, $5)",
+         VALUES ($1, $2, $3, 'test', $4, 'pending',
+                 'human', 'agent', $5, $1,
+                 $6, $6)",
     )
     .bind(id)
     .bind(session)
+    .bind(org_id)
     .bind(format!("k-{id}"))
     .bind(agent_id)
     .bind(now)

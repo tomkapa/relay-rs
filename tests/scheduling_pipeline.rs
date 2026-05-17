@@ -71,6 +71,8 @@ async fn scheduler_fires_due_once_task_and_marks_done() {
     let due_at = Utc::now() - ChronoDuration::seconds(30);
     let payload = NewScheduledTask {
         owner_agent_id: f.db.default_agent_id,
+        org_id: f.db.default_org_id,
+        created_by_user_id: f.db.default_user_id,
         name: ScheduledTaskName::try_from("draft tomorrow's brief").expect("name"),
         prompt: ScheduledPrompt::try_from("Draft tomorrow's morning brief.").expect("prompt"),
         schedule: ScheduleSpec::Once {
@@ -152,6 +154,8 @@ async fn scheduler_advances_recurring_task_after_fire() {
     let due_at = Utc::now() - ChronoDuration::seconds(30);
     let payload = NewScheduledTask {
         owner_agent_id: f.db.default_agent_id,
+        org_id: f.db.default_org_id,
+        created_by_user_id: f.db.default_user_id,
         name: ScheduledTaskName::try_from("morning email").expect("name"),
         prompt: ScheduledPrompt::try_from("Summarize new email.").expect("prompt"),
         schedule: ScheduleSpec::Recurring {
@@ -222,6 +226,8 @@ async fn scheduler_idempotent_on_repeated_ticks_for_same_fire() {
     let due_at = Utc::now() - ChronoDuration::seconds(30);
     let payload = NewScheduledTask {
         owner_agent_id: f.db.default_agent_id,
+        org_id: f.db.default_org_id,
+        created_by_user_id: f.db.default_user_id,
         name: ScheduledTaskName::try_from("idempotent").expect("name"),
         prompt: ScheduledPrompt::try_from("body").expect("prompt"),
         schedule: ScheduleSpec::Recurring {
@@ -252,6 +258,8 @@ async fn scheduler_idempotent_on_repeated_ticks_for_same_fire() {
             None,
             Prompt::try_from(task.prompt.as_str().to_string()).expect("p"),
             k,
+            f.db.default_org_id,
+            f.db.default_user_id,
         )
     };
     let first = f.queue.enqueue(make_req(key1)).await.expect("first");

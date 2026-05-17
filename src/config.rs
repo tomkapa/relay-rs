@@ -26,6 +26,9 @@ pub enum SettingsError {
 
     #[error("default timezone {raw:?} is not a valid IANA name")]
     InvalidDefaultTimezone { raw: String },
+
+    #[error("auth: jwt secret too short — need at least 32 bytes")]
+    AuthSecretTooShort,
 }
 
 /// Process-wide configuration loaded once at startup. Secrets are wrapped in
@@ -50,6 +53,27 @@ pub struct Settings {
     /// override loaded by id; until then the resolver hands every caller
     /// this same value.
     pub default_timezone: Tz,
+    /// Auth / tenancy configuration.
+    pub auth: AuthSettings,
+}
+
+/// Auth subsystem configuration. All fields are required; the OAuth
+/// flow refuses to start without a real Google client.
+#[derive(Debug, Clone)]
+pub struct AuthSettings {
+    /// HS256 signing secret for session JWTs. Must be ≥32 bytes.
+    pub jwt_secret: SecretString,
+    /// Google OAuth client id (no secret material).
+    pub google_client_id: SecretString,
+    /// Google OAuth client secret.
+    pub google_client_secret: SecretString,
+    /// Redirect URL registered with Google, e.g.
+    /// `http://localhost:8080/auth/google/callback`.
+    pub google_redirect_url: String,
+    /// Whether to set the `Secure` flag on the session cookie. Off in
+    /// local-dev to keep `http://localhost` workable; on everywhere
+    /// else.
+    pub cookie_secure: bool,
 }
 
 /// Embedding-provider settings — `EMBEDDING_API_KEY` /
@@ -124,6 +148,24 @@ struct RawSettings {
 
     #[serde(default = "default_timezone_raw")]
     default_timezone: String,
+
+    // Auth — required at startup. Missing values surface as the
+    // `config` crate's own "missing field" error via `SettingsError::Source`,
+    // same as `database_url` / `brave_search_api_key` above.
+    relay_jwt_secret: SecretString,
+    google_client_id: SecretString,
+    google_client_secret: SecretString,
+    google_redirect_url: String,
+    // Secure by default — forgetting to set this in any https-fronted
+    // deploy must not silently drop the `Secure` cookie flag. Local-dev
+    // (http://localhost) overrides via `RELAY_COOKIE_SECURE=false` in
+    // `.env`.
+    #[serde(default = "default_cookie_secure")]
+    relay_cookie_secure: bool,
+}
+
+const fn default_cookie_secure() -> bool {
+    true
 }
 
 fn default_timezone_raw() -> String {
@@ -177,6 +219,16 @@ impl TryFrom<RawSettings> for Settings {
                 raw: raw.default_timezone.clone(),
             }
         })?;
+        if raw.relay_jwt_secret.expose().len() < 32 {
+            return Err(SettingsError::AuthSecretTooShort);
+        }
+        let auth = AuthSettings {
+            jwt_secret: raw.relay_jwt_secret,
+            google_client_id: raw.google_client_id,
+            google_client_secret: raw.google_client_secret,
+            google_redirect_url: raw.google_redirect_url,
+            cookie_secure: raw.relay_cookie_secure,
+        };
         Ok(Self {
             provider,
             brave_search_api_key: raw.brave_search_api_key,
@@ -185,6 +237,7 @@ impl TryFrom<RawSettings> for Settings {
             database_url: raw.database_url,
             embedding,
             default_timezone,
+            auth,
         })
     }
 }
@@ -233,6 +286,11 @@ mod tests {
             embedding_model: Some("text-embedding-3-small".to_string()),
             embedding_dimensions: None,
             default_timezone: default_timezone_raw(),
+            relay_jwt_secret: secret(&"a".repeat(64)),
+            google_client_id: secret("test-client-id"),
+            google_client_secret: secret("test-client-secret"),
+            google_redirect_url: "http://localhost:8080/auth/google/callback".to_string(),
+            relay_cookie_secure: false,
         }
     }
 

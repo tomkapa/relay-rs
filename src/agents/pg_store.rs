@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
+use crate::auth::{OrgId, TxScope, UserId};
 use crate::clock::SharedClock;
 use crate::mcp::McpServerId;
 use crate::pg_vector;
@@ -45,7 +46,7 @@ const AGENT_DEFAULT_SEED_LOCK_KEY: i64 = 0x6167_656E_745F_6473;
 /// Single source of truth for the `agents` column list. Every SELECT that
 /// hydrates an [`AgentRow`] must use this — adding a column then becomes a
 /// one-line edit here plus the matching `AgentRow` field.
-const AGENT_COLS: &str = "id, name, system_prompt, description, is_default, \
+const AGENT_COLS: &str = "id, org_id, name, system_prompt, description, is_default, \
     allowed_mcp_servers, created_at, updated_at";
 
 /// Postgres-backed [`AgentStore`]. Holds a cheap clone of a [`PgPool`], a
@@ -68,7 +69,7 @@ impl PgAgentStore {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 
     /// Embed `description` synchronously. Errors propagate so the
@@ -80,14 +81,14 @@ impl PgAgentStore {
             .map_err(|e| AgentStoreError::Backend(format!("description embed: {e}")))
     }
 
-    /// Idempotent seed: insert `seed` as the default agent if no default row
-    /// exists. Returns the id of the resulting default row, whether minted here
-    /// or already present.
-    ///
-    /// Concurrent app starts are serialised by a transaction-scoped advisory
-    /// lock; the partial unique index `agents_default_unique` is the last line
-    /// of defence if the lock is bypassed.
-    pub async fn seed_default(&self, seed: DefaultAgentSeed) -> Result<AgentId, AgentStoreError> {
+    /// See [`AgentStore::seed_default`]. Kept as an inherent method so
+    /// tests that hold an `Arc<PgAgentStore>` can call it directly
+    /// without coercing through the trait object.
+    pub async fn seed_default(
+        &self,
+        org_id: OrgId,
+        seed: DefaultAgentSeed,
+    ) -> Result<AgentId, AgentStoreError> {
         // Embed before opening the transaction so a slow embedding call
         // does not hold the advisory lock. On embed failure the seeder
         // aborts without inserting; the next process start will retry.
@@ -95,7 +96,11 @@ impl PgAgentStore {
         let embedding_literal = pg_vector::encode(&embedding);
 
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        // Privileged tx: the seeder runs from the composition root (or
+        // the OAuth callback) without a `Principal` in hand. RLS is
+        // bypassed; tenant scoping is provided by the explicit `org_id`
+        // bound on every statement.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(AGENT_DEFAULT_SEED_LOCK_KEY)
@@ -103,7 +108,8 @@ impl PgAgentStore {
             .await?;
 
         let existing: Option<(AgentId,)> =
-            sqlx::query_as("SELECT id FROM agents WHERE is_default = TRUE")
+            sqlx::query_as("SELECT id FROM agents WHERE is_default = TRUE AND org_id = $1")
+                .bind(org_id)
                 .fetch_optional(&mut *tx)
                 .await?;
         if let Some((id,)) = existing {
@@ -117,11 +123,12 @@ impl PgAgentStore {
         // operator opts it in to specific servers via PUT after startup.
         sqlx::query(
             "INSERT INTO agents \
-                 (id, name, system_prompt, description, description_embedding, \
+                 (id, org_id, name, system_prompt, description, description_embedding, \
                   is_default, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5::vector, TRUE, $6, $6)",
+             VALUES ($1, $2, $3, $4, $5, $6::vector, TRUE, $7, $7)",
         )
         .bind(id)
+        .bind(org_id)
         .bind(seed.name.as_str())
         .bind(seed.system_prompt.as_str())
         .bind(seed.description.as_str())
@@ -143,86 +150,44 @@ impl fmt::Debug for PgAgentStore {
 
 #[async_trait]
 impl AgentStore for PgAgentStore {
+    async fn seed_default(
+        &self,
+        org_id: OrgId,
+        seed: DefaultAgentSeed,
+    ) -> Result<AgentId, AgentStoreError> {
+        Self::seed_default(self, org_id, seed).await
+    }
+
     async fn create(&self, payload: NewAgent) -> Result<AgentRecord, AgentStoreError> {
-        // Embed before opening the transaction — same as memory store
-        // (CLAUDE.md §11 timing rule and the no-locks-held-across-IO
-        // principle). On embed failure the create aborts with no row
-        // inserted.
-        let embedding = self.embed(payload.description.as_str()).await?;
-        let embedding_literal = pg_vector::encode(&embedding);
+        create_impl(self, TxScope::Privileged, payload).await
+    }
 
-        let now = self.now();
-        let mut tx = self.pool.begin().await?;
-
-        // Promoting a new row to default first demotes the existing default so
-        // the partial unique index `agents_default_unique` stays satisfied.
-        if payload.is_default {
-            sqlx::query(
-                "UPDATE agents SET is_default = FALSE, updated_at = $1 \
-                 WHERE is_default = TRUE",
-            )
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        let id = AgentId::new();
-        let insert = sqlx::query(
-            "INSERT INTO agents \
-                 (id, name, system_prompt, description, description_embedding, \
-                  is_default, allowed_mcp_servers, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $8)",
-        )
-        .bind(id)
-        .bind(payload.name.as_str())
-        .bind(payload.system_prompt.as_str())
-        .bind(payload.description.as_str())
-        .bind(embedding_literal)
-        .bind(payload.is_default)
-        .bind(payload.allowed_mcp_servers.as_slice())
-        .bind(now)
-        .execute(&mut *tx)
-        .await;
-        match insert {
-            Ok(_) => {}
-            // 23505 = unique_violation. The only unique index that can fire
-            // on this INSERT is `agents_name_lower_unique` — `is_default`
-            // races are excluded by the same-tx demote above and the partial
-            // index, and ids are freshly minted UUIDs.
-            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
-                return Err(AgentStoreError::NameTaken(payload.name));
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        tx.commit().await?;
-
-        Ok(AgentRecord {
-            id,
-            name: payload.name,
-            system_prompt: payload.system_prompt,
-            description: payload.description,
-            is_default: payload.is_default,
-            allowed_mcp_servers: payload.allowed_mcp_servers,
-            created_at: now,
-            updated_at: now,
-        })
+    async fn create_for_user(
+        &self,
+        acting_user_id: UserId,
+        payload: NewAgent,
+    ) -> Result<AgentRecord, AgentStoreError> {
+        create_impl(self, TxScope::AsUser(acting_user_id), payload).await
     }
 
     async fn list(&self) -> Result<Vec<AgentRecord>, AgentStoreError> {
         let sql = format!("SELECT {AGENT_COLS} FROM agents ORDER BY created_at ASC");
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query_as::<_, AgentRow>(&sql)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
         rows.into_iter().map(AgentRecord::try_from).collect()
     }
 
     async fn read(&self, id: AgentId) -> Result<AgentRecord, AgentStoreError> {
         let sql = format!("SELECT {AGENT_COLS} FROM agents WHERE id = $1");
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(&sql)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         let row = row.ok_or(AgentStoreError::NotFound(id))?;
         row.try_into()
     }
@@ -241,7 +206,7 @@ impl AgentStore for PgAgentStore {
         };
 
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         let sql = format!("SELECT {AGENT_COLS} FROM agents WHERE id = $1 FOR UPDATE");
         let existing: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(&sql)
@@ -251,10 +216,10 @@ impl AgentStore for PgAgentStore {
         let existing = existing.ok_or(AgentStoreError::NotFound(id))?;
         let mut current = AgentRecord::try_from(existing)?;
 
-        // Demoting the only default would leave the system without one, which
-        // breaks every session-create that omits `agent_id`. Reject it; the
-        // caller must promote another row first (which atomically demotes this
-        // one).
+        // Demoting the only default in this org would leave the org
+        // without one, which breaks every session-create that omits
+        // `agent_id`. Reject it; the caller must promote another row
+        // first (which atomically demotes this one).
         if matches!(payload.is_default, Some(false)) && current.is_default {
             return Err(AgentStoreError::DefaultDeletionForbidden);
         }
@@ -272,14 +237,16 @@ impl AgentStore for PgAgentStore {
             current.allowed_mcp_servers = allowed;
         }
 
-        // Promote: clear the old default in the same transaction, then set the
-        // flag on this row. No-op if this row is already the default.
+        // Promote: clear the old default in the *same org* in the same
+        // transaction, then set the flag on this row. No-op if this row
+        // is already the default.
         if matches!(payload.is_default, Some(true)) && !current.is_default {
             sqlx::query(
                 "UPDATE agents SET is_default = FALSE, updated_at = $1 \
-                 WHERE is_default = TRUE",
+                 WHERE is_default = TRUE AND org_id = $2",
             )
             .bind(now)
+            .bind(current.org_id)
             .execute(&mut *tx)
             .await?;
             current.is_default = true;
@@ -314,7 +281,7 @@ impl AgentStore for PgAgentStore {
     }
 
     async fn delete(&self, id: AgentId) -> Result<(), AgentStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row: Option<(bool,)> =
             sqlx::query_as("SELECT is_default FROM agents WHERE id = $1 FOR UPDATE")
                 .bind(id)
@@ -340,31 +307,58 @@ impl AgentStore for PgAgentStore {
         }
     }
 
-    async fn default_id(&self) -> Result<AgentId, AgentStoreError> {
+    async fn default_id_for(&self, org_id: OrgId) -> Result<AgentId, AgentStoreError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row: Option<(AgentId,)> =
-            sqlx::query_as("SELECT id FROM agents WHERE is_default = TRUE")
-                .fetch_optional(&self.pool)
+            sqlx::query_as("SELECT id FROM agents WHERE is_default = TRUE AND org_id = $1")
+                .bind(org_id)
+                .fetch_optional(&mut *tx)
                 .await?;
+        tx.commit().await?;
         let (id,) = row.ok_or(AgentStoreError::NoDefault)?;
         Ok(id)
     }
 
-    async fn read_by_name(&self, name: &AgentName) -> Result<AgentRecord, AgentStoreError> {
-        let sql = format!("SELECT {AGENT_COLS} FROM agents WHERE lower(name) = lower($1)");
+    async fn read_by_name_for_viewer(
+        &self,
+        viewer: AgentId,
+        name: &AgentName,
+    ) -> Result<AgentRecord, AgentStoreError> {
+        // Scope the lookup to the viewer's org via a correlated subquery
+        // on `agents.org_id`. A name that's taken in a different org is
+        // invisible — the model addressing only resolves peers it can
+        // legitimately talk to.
+        let sql = format!(
+            "SELECT {AGENT_COLS} FROM agents \
+             WHERE lower(name) = lower($1) \
+               AND org_id = (SELECT org_id FROM agents WHERE id = $2)"
+        );
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row: Option<AgentRow> = sqlx::query_as::<_, AgentRow>(&sql)
             .bind(name.as_str())
-            .fetch_optional(&self.pool)
+            .bind(viewer)
+            .fetch_optional(&mut *tx)
             .await?;
+        tx.commit().await?;
         let row = row.ok_or_else(|| AgentStoreError::NameNotFound(name.clone()))?;
         row.try_into()
     }
 
-    async fn list_names(&self) -> Result<Vec<(AgentId, AgentName)>, AgentStoreError> {
-        let rows: Vec<(AgentId, String)> =
-            sqlx::query_as("SELECT id, name FROM agents ORDER BY lower(name) ASC LIMIT $1")
-                .bind(LIST_NAMES_MAX_ROWS)
-                .fetch_all(&self.pool)
-                .await?;
+    async fn list_names_for_viewer(
+        &self,
+        viewer: AgentId,
+    ) -> Result<Vec<(AgentId, AgentName)>, AgentStoreError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+        let rows: Vec<(AgentId, String)> = sqlx::query_as(
+            "SELECT id, name FROM agents \
+             WHERE org_id = (SELECT org_id FROM agents WHERE id = $1) \
+             ORDER BY lower(name) ASC LIMIT $2",
+        )
+        .bind(viewer)
+        .bind(LIST_NAMES_MAX_ROWS)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
         let mut out = Vec::with_capacity(rows.len());
         for (id, name) in rows {
             out.push((id, AgentName::try_from(name)?));
@@ -385,20 +379,24 @@ impl AgentStore for PgAgentStore {
 
         // Caller-excluded at the SQL boundary so the self row never lands
         // in the projection — keeps the three caller-excluded surfaces
-        // (`<agents>`, `search_agents`, `send_message`) consistent.
+        // (`<agents>`, `search_agents`, `send_message`) consistent. The
+        // org-scope subquery restricts results to the viewer's tenant.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows: Vec<(AgentId, String, String)> = sqlx::query_as(
             "SELECT id, name, description \
              FROM agents \
              WHERE description_embedding IS NOT NULL \
                AND id <> $3 \
+               AND org_id = (SELECT org_id FROM agents WHERE id = $3) \
              ORDER BY description_embedding <=> $1::vector ASC \
              LIMIT $2",
         )
         .bind(pg_vector::encode(embedding))
         .bind(limit)
         .bind(viewer)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for (id, name, description) in rows {
@@ -412,9 +410,81 @@ impl AgentStore for PgAgentStore {
     }
 }
 
+/// Body of `create` / `create_for_user`. Embed runs ahead of the tx
+/// so the embedding call doesn't hold row locks; the INSERT runs
+/// either privileged (HTTP route) or under `begin_as_user`
+/// (`create_agent` tool) for RLS enforcement.
+async fn create_impl(
+    store: &PgAgentStore,
+    scope: TxScope,
+    payload: NewAgent,
+) -> Result<AgentRecord, AgentStoreError> {
+    let embedding = store.embed(payload.description.as_str()).await?;
+    let embedding_literal = pg_vector::encode(&embedding);
+
+    let now = store.now();
+    let mut tx = scope.begin(&store.pool).await?;
+
+    // Promoting a new row to default first demotes the existing
+    // default in the same org so the partial unique index
+    // `agents_default_unique` on `(org_id) WHERE is_default` stays
+    // satisfied.
+    if payload.is_default {
+        sqlx::query(
+            "UPDATE agents SET is_default = FALSE, updated_at = $1 \
+                 WHERE is_default = TRUE AND org_id = $2",
+        )
+        .bind(now)
+        .bind(payload.org_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let id = AgentId::new();
+    let insert = sqlx::query(
+        "INSERT INTO agents \
+                 (id, org_id, name, system_prompt, description, description_embedding, \
+                  is_default, allowed_mcp_servers, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8, $9, $9)",
+    )
+    .bind(id)
+    .bind(payload.org_id)
+    .bind(payload.name.as_str())
+    .bind(payload.system_prompt.as_str())
+    .bind(payload.description.as_str())
+    .bind(embedding_literal)
+    .bind(payload.is_default)
+    .bind(payload.allowed_mcp_servers.as_slice())
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    match insert {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            return Err(AgentStoreError::NameTaken(payload.name));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    tx.commit().await?;
+
+    Ok(AgentRecord {
+        id,
+        org_id: payload.org_id,
+        name: payload.name,
+        system_prompt: payload.system_prompt,
+        description: payload.description,
+        is_default: payload.is_default,
+        allowed_mcp_servers: payload.allowed_mcp_servers,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
 #[derive(sqlx::FromRow)]
 struct AgentRow {
     id: AgentId,
+    org_id: OrgId,
     name: String,
     system_prompt: String,
     description: String,
@@ -430,6 +500,7 @@ impl TryFrom<AgentRow> for AgentRecord {
     fn try_from(row: AgentRow) -> Result<Self, Self::Error> {
         Ok(Self {
             id: row.id,
+            org_id: row.org_id,
             name: AgentName::try_from(row.name)?,
             system_prompt: AgentSystemPrompt::try_from(row.system_prompt)?,
             description: AgentDescription::try_from(row.description)?,

@@ -7,6 +7,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::auth::UserId;
 use crate::hook::{ToolContext, TurnContext};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, ToolCall, ToolCallId, ToolResult, UserContent,
@@ -37,6 +38,7 @@ impl Agent {
         viewer_as_sender: MessageSender,
         root_request_id: PromptRequestId,
         request_id: PromptRequestId,
+        acting_user_id: UserId,
         kind_payload: &RequestKindPayload,
         send_message_calls: &mut usize,
         cancel: &CancellationToken,
@@ -61,7 +63,8 @@ impl Agent {
         }
 
         self.sessions()
-            .append(
+            .append_for_user(
+                acting_user_id,
                 ctx.session_id,
                 viewer_as_sender,
                 counterpart,
@@ -91,6 +94,7 @@ impl Agent {
             root_request_id,
             request_id,
             kind_payload: kind_payload.clone(),
+            acting_user_id,
         };
         // Counted regardless of tool error — the model already saw the failure
         // via the tool result; the worker's ping-pong guard cares only about
@@ -114,7 +118,8 @@ impl Agent {
         // Sender = `System` so the row renders to viewer-as-User without
         // claiming the human authored the result.
         self.sessions()
-            .append(
+            .append_for_user(
+                acting_user_id,
                 ctx.session_id,
                 MessageSender::System,
                 viewer,

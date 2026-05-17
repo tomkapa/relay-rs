@@ -137,7 +137,8 @@ impl Tool for MemoryValidateTool {
         let row = self
             .deps
             .store()
-            .record_validation(
+            .record_validation_for_user(
+                ctx.acting_user_id,
                 agent,
                 memory_id,
                 ValidationOrigin::Agent(ctx.request_id),

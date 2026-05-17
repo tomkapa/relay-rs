@@ -221,7 +221,13 @@ impl SendMessageTool {
             ));
         }
 
-        let receiver = self.resolve_receiver(input.receiver).await?;
+        let viewer_agent_id = ctx
+            .viewer
+            .agent_id()
+            .expect("invariant: viewer guard above rejects non-agent callers");
+        let receiver = self
+            .resolve_receiver(viewer_agent_id, input.receiver)
+            .await?;
 
         // Self-message would create a one-party session: representationally
         // invalid (CLAUDE.md §1).
@@ -241,26 +247,35 @@ impl SendMessageTool {
     }
 
     /// Resolve the wire-side receiver into a [`Participant`]. The agent
-    /// branch hits the store for case-insensitive name lookup; the human
-    /// branch is direct. NotFound is the model's fault (`InvalidInput`);
-    /// a DB-level failure is infrastructure (`Backend`).
-    async fn resolve_receiver(&self, raw: SendMessageReceiver) -> Result<Participant, ToolError> {
+    /// branch hits the store for case-insensitive name lookup scoped to
+    /// the caller's org; the human branch is direct. NotFound is the
+    /// model's fault (`InvalidInput`); a DB-level failure is
+    /// infrastructure (`Backend`).
+    async fn resolve_receiver(
+        &self,
+        viewer: crate::agents::AgentId,
+        raw: SendMessageReceiver,
+    ) -> Result<Participant, ToolError> {
         let name = match raw {
             SendMessageReceiver::Human => return Ok(Participant::Human),
             SendMessageReceiver::Agent { name } => name,
         };
-        let record = self.agents.read_by_name(&name).await.map_err(|e| match e {
-            AgentStoreError::NameNotFound(_) => {
-                set_outcome("unknown_agent");
-                warn!(relay.agent.name = %name, "send_message.unknown_agent");
-                ToolError::InvalidInput(format!("send_message: unknown agent name {name}"))
-            }
-            err => {
-                set_outcome("backend_error");
-                warn!(error = %err, relay.agent.name = %name, "send_message.agent_lookup_failed");
-                ToolError::Backend(format!("send_message: agent lookup: {err}"))
-            }
-        })?;
+        let record = self
+            .agents
+            .read_by_name_for_viewer(viewer, &name)
+            .await
+            .map_err(|e| match e {
+                AgentStoreError::NameNotFound(_) => {
+                    set_outcome("unknown_agent");
+                    warn!(relay.agent.name = %name, "send_message.unknown_agent");
+                    ToolError::InvalidInput(format!("send_message: unknown agent name {name}"))
+                }
+                err => {
+                    set_outcome("backend_error");
+                    warn!(error = %err, relay.agent.name = %name, "send_message.agent_lookup_failed");
+                    ToolError::Backend(format!("send_message: agent lookup: {err}"))
+                }
+            })?;
         Ok(Participant::Agent {
             agent_id: record.id,
         })
@@ -269,6 +284,7 @@ impl SendMessageTool {
     /// Opening framing — only on a freshly-minted receiver session, and only
     /// when `summary` is non-empty after trim. "Freshly minted" is detected
     /// by checking whether the session already has any messages.
+    #[allow(clippy::too_many_arguments)]
     async fn maybe_append_opening_note(
         &self,
         receiver_session: SessionId,
@@ -276,6 +292,7 @@ impl SendMessageTool {
         viewer: Participant,
         summary: &str,
         request_id: PromptRequestId,
+        acting_user_id: crate::auth::UserId,
     ) -> Result<(), ToolError> {
         let trimmed = summary.trim();
         if trimmed.is_empty() {
@@ -290,7 +307,8 @@ impl SendMessageTool {
             return Ok(());
         }
         self.sessions
-            .append_system_nudge(
+            .append_system_nudge_for_user(
+                acting_user_id,
                 receiver_session,
                 receiver,
                 format!("[context from {viewer}] {trimmed}"),
@@ -317,6 +335,7 @@ impl SendMessageTool {
             relay.receiver.session.id = tracing::field::Empty,
         ),
     )]
+    #[allow(clippy::too_many_lines)] // straight-line dispatch with branches per receiver kind / error
     async fn handle(
         &self,
         input: SendMessageInput,
@@ -324,15 +343,26 @@ impl SendMessageTool {
     ) -> Result<SendMessageOutput, ToolError> {
         let (content, summary, receiver) = self.validate(input, ctx).await?;
 
+        // Tenancy: a child / sibling session inherits the caller's
+        // session's `(org_id, created_by_user_id)`. The trigger on
+        // `sessions` rejects any cross-org parent/child fork, so this is
+        // both the right value and the only value the DB will accept.
+        let tenancy = self.sessions.tenancy(ctx.session_id).await.map_err(|e| {
+            set_outcome("session_resolve_failed");
+            ToolError::Backend(format!("send_message: tenancy lookup failed: {e}"))
+        })?;
+
         // Resolve-or-create the receiver session, parented to the caller's
         // current session. Same path for both branches: an Agent receiver
         // hits an existing or fresh sibling; a Human receiver hits the root
         // session(human, caller_agent) or, for descendant agents that have
         // not yet messaged the human, a freshly-minted (Human, Agent(X))
         // session in the same DAG.
+        let caller = crate::auth::Caller::new(ctx.acting_user_id, tenancy.org_id);
         let receiver_session = self
             .sessions
-            .resolve_or_create_for_pair(
+            .resolve_or_create_for_pair_for_user(
+                &caller,
                 ctx.root_request_id,
                 ctx.viewer,
                 receiver,
@@ -355,6 +385,7 @@ impl SendMessageTool {
                 ctx.viewer,
                 s,
                 ctx.request_id,
+                ctx.acting_user_id,
             )
             .await
             .inspect_err(|_| set_outcome("opening_note_failed"))?;
@@ -376,7 +407,8 @@ impl SendMessageTool {
         // because the caller's tool_call lives in a different session.
         if matches!(receiver, Participant::Human) && receiver_session != ctx.session_id {
             self.sessions
-                .append(
+                .append_for_user(
+                    ctx.acting_user_id,
                     receiver_session,
                     MessageSender::from_participant(ctx.viewer),
                     receiver,
@@ -394,7 +426,11 @@ impl SendMessageTool {
         // intentionally don't roll the message append back, so callers see
         // exactly which message broke the budget. The bump's atomicity means
         // two concurrent callers cannot both squeeze past the cap.
-        match self.dag.bump_or_fail(ctx.root_request_id).await {
+        match self
+            .dag
+            .bump_or_fail_for_user(ctx.acting_user_id, ctx.root_request_id)
+            .await
+        {
             Ok(bumped) => {
                 debug!(
                     relay.dag.turns_used = bumped.turns_used,
@@ -412,8 +448,14 @@ impl SendMessageTool {
                 // surfaces as a benign NotFound and is dropped.
                 let chunk =
                     ResponseChunk::from_failure(&crate::runtime::FailureReason::DagBudgetExceeded);
-                let _ = self.sink.publish(ctx.root_request_id, chunk).await;
-                let _ = self.sink.close(ctx.root_request_id).await;
+                let _ = self
+                    .sink
+                    .publish_for_user(ctx.acting_user_id, ctx.root_request_id, chunk)
+                    .await;
+                let _ = self
+                    .sink
+                    .close_for_user(ctx.acting_user_id, ctx.root_request_id)
+                    .await;
                 return Err(ToolError::InvalidInput(format!(
                     "send_message: dag budget exceeded: {e}"
                 )));
@@ -436,7 +478,7 @@ impl SendMessageTool {
                     .await
             }
             Participant::Agent { agent_id } => {
-                self.enqueue_for_agent(ctx, receiver_session, agent_id, content)
+                self.enqueue_for_agent(ctx, receiver_session, agent_id, content, tenancy)
                     .await
             }
             Participant::System => {
@@ -474,7 +516,11 @@ impl SendMessageTool {
             from,
             content: content.to_string(),
         };
-        if let Err(e) = self.sink.publish(ctx.request_id, chunk).await {
+        if let Err(e) = self
+            .sink
+            .publish_for_user(ctx.acting_user_id, ctx.request_id, chunk)
+            .await
+        {
             set_outcome("publish_failed");
             warn!(
                 error = %e,
@@ -509,6 +555,7 @@ impl SendMessageTool {
         receiver_session: SessionId,
         receiver_agent_id: AgentId,
         content: Prompt,
+        tenancy: crate::session::SessionTenancy,
     ) -> Result<SendMessageOutput, ToolError> {
         let key = idempotency_key(ctx, receiver_session, content.as_str());
         let key = IdempotencyKey::try_from(key).map_err(|e| {
@@ -523,14 +570,19 @@ impl SendMessageTool {
             .expect("invariant: validate() rejects non-agent callers");
         let outcome = self
             .queue
-            .enqueue(NewPromptRequest::normal(
-                Some(receiver_session),
-                ctx.viewer,
-                receiver_agent_id,
-                Some(ctx.session_id),
-                content,
-                key,
-            ))
+            .enqueue_for_user(
+                ctx.acting_user_id,
+                NewPromptRequest::normal(
+                    Some(receiver_session),
+                    ctx.viewer,
+                    receiver_agent_id,
+                    Some(ctx.session_id),
+                    content,
+                    key,
+                    tenancy.org_id,
+                    tenancy.created_by_user_id,
+                ),
+            )
             .await
             .map_err(|e| {
                 set_outcome("enqueue_failed");

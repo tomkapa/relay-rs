@@ -28,8 +28,9 @@ fn seed(name: &str, prompt: &str) -> DefaultAgentSeed {
     }
 }
 
-fn new_agent(name: &str, prompt: &str, is_default: bool) -> NewAgent {
+fn new_agent(db: &TestDb, name: &str, prompt: &str, is_default: bool) -> NewAgent {
     NewAgent {
+        org_id: db.default_org_id,
         name: AgentName::try_from(name).expect("valid name"),
         system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
         description: AgentDescription::try_from(format!("Role: {name}")).expect("valid desc"),
@@ -50,14 +51,14 @@ async fn seed_default_is_idempotent() {
     // First seed: TestDb::fresh already inserted one. A second call must return
     // the same id rather than minting a new row.
     let again = store
-        .seed_default(seed("ignored", "ignored"))
+        .seed_default(db.default_org_id, seed("ignored", "ignored"))
         .await
         .expect("seed again");
     assert_eq!(again, db.default_agent_id);
 
     // Third call from a totally fresh seed payload still resolves to the same row.
     let third = store
-        .seed_default(seed("also-ignored", "also-ignored"))
+        .seed_default(db.default_org_id, seed("also-ignored", "also-ignored"))
         .await
         .expect("seed third");
     assert_eq!(third, db.default_agent_id);
@@ -71,7 +72,10 @@ async fn seed_default_does_not_overwrite_existing_prompt() {
     // Re-seed with a different prompt; the existing row's prompt must be
     // preserved per the design conversation ("seed-only, no overwrite").
     let _ = store
-        .seed_default(seed("new-name", "this should be ignored"))
+        .seed_default(
+            db.default_org_id,
+            seed("new-name", "this should be ignored"),
+        )
         .await
         .expect("seed again");
 
@@ -97,7 +101,10 @@ async fn default_id_returns_seeded_row() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
-    let id = store.default_id().await.expect("default");
+    let id = store
+        .default_id_for(db.default_org_id)
+        .await
+        .expect("default");
     assert_eq!(id, db.default_agent_id);
 }
 
@@ -107,11 +114,11 @@ async fn create_then_list_round_trip() {
     let store = store(&db);
 
     let a = store
-        .create(new_agent("alpha", "you are alpha", false))
+        .create(new_agent(&db, "alpha", "you are alpha", false))
         .await
         .expect("create alpha");
     let b = store
-        .create(new_agent("beta", "you are beta", false))
+        .create(new_agent(&db, "beta", "you are beta", false))
         .await
         .expect("create beta");
     assert!(!a.is_default);
@@ -132,7 +139,7 @@ async fn create_with_is_default_demotes_previous_default() {
     let store = store(&db);
 
     let promoted = store
-        .create(new_agent("new-default", "I am the new default", true))
+        .create(new_agent(&db, "new-default", "I am the new default", true))
         .await
         .expect("create promoted");
     assert!(promoted.is_default);
@@ -141,7 +148,10 @@ async fn create_with_is_default_demotes_previous_default() {
     let old = store.read(db.default_agent_id).await.expect("read old");
     assert!(!old.is_default);
     // And there is exactly one default now.
-    let now_default = store.default_id().await.expect("default");
+    let now_default = store
+        .default_id_for(db.default_org_id)
+        .await
+        .expect("default");
     assert_eq!(now_default, promoted.id);
 }
 
@@ -151,7 +161,7 @@ async fn update_promotes_to_default_atomically() {
     let store = store(&db);
 
     let other = store
-        .create(new_agent("other", "I am other", false))
+        .create(new_agent(&db, "other", "I am other", false))
         .await
         .expect("create other");
     assert!(!other.is_default);
@@ -170,7 +180,10 @@ async fn update_promotes_to_default_atomically() {
 
     let old = store.read(db.default_agent_id).await.expect("read old");
     assert!(!old.is_default);
-    let now_default = store.default_id().await.expect("default");
+    let now_default = store
+        .default_id_for(db.default_org_id)
+        .await
+        .expect("default");
     assert_eq!(now_default, other.id);
 }
 
@@ -198,7 +211,7 @@ async fn update_changes_name_and_prompt() {
     let store = store(&db);
 
     let agent = store
-        .create(new_agent("orig", "orig prompt", false))
+        .create(new_agent(&db, "orig", "orig prompt", false))
         .await
         .expect("create");
     let updated = store
@@ -224,7 +237,7 @@ async fn delete_removes_non_default_row() {
     let store = store(&db);
 
     let agent = store
-        .create(new_agent("disposable", "throwaway", false))
+        .create(new_agent(&db, "disposable", "throwaway", false))
         .await
         .expect("create");
     store.delete(agent.id).await.expect("delete");
@@ -252,7 +265,7 @@ async fn create_default_allowed_mcp_servers_is_empty() {
 
     // Operator opts in explicitly; absence of opt-in means no MCP tools.
     let agent = store
-        .create(new_agent("scoped", "I have no MCP yet", false))
+        .create(new_agent(&db, "scoped", "I have no MCP yet", false))
         .await
         .expect("create");
     assert!(agent.allowed_mcp_servers.is_empty());
@@ -271,6 +284,7 @@ async fn create_with_explicit_allowed_mcp_servers_round_trips() {
     let s1 = McpServerId::new();
     let s2 = McpServerId::new();
     let payload = NewAgent {
+        org_id: db.default_org_id,
         name: AgentName::try_from("scoped").expect("name"),
         system_prompt: AgentSystemPrompt::try_from("scoped agent").expect("prompt"),
         description: AgentDescription::try_from("Scoped agent.").expect("desc"),
@@ -297,6 +311,7 @@ async fn update_replaces_allowed_mcp_servers() {
 
     let agent = store
         .create(NewAgent {
+            org_id: db.default_org_id,
             name: AgentName::try_from("rotates").expect("name"),
             system_prompt: AgentSystemPrompt::try_from("rotating MCP").expect("prompt"),
             description: AgentDescription::try_from("Rotating MCP agent.").expect("desc"),
@@ -364,11 +379,12 @@ async fn delete_refuses_when_referenced_by_a_session() {
     let store = store(&db);
 
     let agent = store
-        .create(new_agent("attached", "in use", false))
+        .create(new_agent(&db, "attached", "in use", false))
         .await
         .expect("create");
     let sessions = PgSessionStore::new(db.pool.clone(), SystemClock::shared());
-    let _ = human_to_agent_session(&sessions, agent.id).await;
+    let _ =
+        human_to_agent_session(&sessions, agent.id, db.default_org_id, db.default_user_id).await;
 
     let err = store.delete(agent.id).await.expect_err("in use");
     assert!(matches!(err, AgentStoreError::InUse(_)));

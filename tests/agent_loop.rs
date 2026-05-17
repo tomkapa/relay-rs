@@ -33,8 +33,15 @@ use common::pg::{TestDb, human_to_agent_session, seed_prompt_request};
 /// `session_messages.request_id` FK-references it on every append.
 async fn fresh_session(db: &TestDb) -> (relay_rs::session::SessionId, PromptRequestId) {
     let store = PgSessionStore::new(db.pool.clone(), SystemClock::shared());
-    let session = human_to_agent_session(&store, db.default_agent_id).await;
-    let request = seed_prompt_request(&db.pool, session, db.default_agent_id).await;
+    let session = human_to_agent_session(
+        &store,
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
+    let request =
+        seed_prompt_request(&db.pool, session, db.default_agent_id, db.default_org_id).await;
     (session, request)
 }
 
@@ -179,6 +186,7 @@ async fn returns_text_when_no_tool_call() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            db.default_user_id,
             relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
@@ -208,6 +216,7 @@ async fn runs_tool_then_returns_text() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            db.default_user_id,
             relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
@@ -237,6 +246,7 @@ async fn unknown_tool_does_not_loop_forever() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            db.default_user_id,
             relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,
@@ -267,6 +277,7 @@ async fn cancellation_short_circuits() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            db.default_user_id,
             relay_rs::runtime::RequestKindPayload::Normal {},
             cancel,
             None,
@@ -294,6 +305,7 @@ async fn provider_specs_match_registered_tools() {
             Participant::agent(db.default_agent_id),
             vec![prompt],
             request_id,
+            db.default_user_id,
             relay_rs::runtime::RequestKindPayload::Normal {},
             CancellationToken::new(),
             None,

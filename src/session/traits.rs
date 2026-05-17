@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::auth::{Caller, OrgId, UserId};
 use crate::provider::ChatMessage;
 use crate::runtime::PromptRequestId;
 use crate::types::{MessageSender, Participant};
@@ -19,6 +20,15 @@ use super::error::SessionError;
 crate::uuid_newtype! {
     /// Opaque session identifier. Constructed by the store, opaque to callers.
     pub SessionId
+}
+
+/// Tenancy projection of a session row — the columns the worker pool
+/// needs to set `app.user_id` and the columns the `send_message` tool
+/// needs to pin a child session to its parent's org.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTenancy {
+    pub org_id: OrgId,
+    pub created_by_user_id: UserId,
 }
 
 /// Storage trait for conversation history. Implementations must be thread-safe.
@@ -36,8 +46,39 @@ pub trait SessionStore: fmt::Debug + Send + Sync {
     ///
     /// `parent_session_id` is the session this conversation forks from (the
     /// caller's own session — `None` for the root human-to-agent session).
+    ///
+    /// `org_id` is the owning organisation; `created_by_user_id` is the
+    /// human at the DAG root. Both are required because the underlying
+    /// `sessions` row is `NOT NULL` on these columns and a trigger pins
+    /// every child session to its parent's org so cross-tenant forks are
+    /// rejected at the database boundary (see
+    /// `migrations/00000000000016_sessions_tenancy.up.sql`).
     async fn resolve_or_create_for_pair(
         &self,
+        root_request_id: PromptRequestId,
+        a: Participant,
+        b: Participant,
+        parent_session_id: Option<SessionId>,
+        org_id: OrgId,
+        created_by_user_id: UserId,
+    ) -> Result<SessionId, SessionError>;
+
+    /// Tenant-scoped variant of [`Self::resolve_or_create_for_pair`].
+    ///
+    /// Opens a `begin_as_user(caller.user_id)` transaction so the row's
+    /// RLS predicate is evaluated against the acting principal —
+    /// cross-tenant forks fail at the WITH CHECK boundary. Used from
+    /// worker / tool paths where the acting user is read off the
+    /// claim's `created_by_user_id`; HTTP route paths keep the
+    /// existing privileged entry point because they have already
+    /// gated through `begin_as` upstream.
+    ///
+    /// The new session inherits `(org_id, created_by_user_id)` from
+    /// `caller` — both `caller.org_id` and `caller.user_id` land on the
+    /// row. They cannot diverge by construction (see [`Caller`]).
+    async fn resolve_or_create_for_pair_for_user(
+        &self,
+        caller: &Caller,
         root_request_id: PromptRequestId,
         a: Participant,
         b: Participant,
@@ -65,12 +106,40 @@ pub trait SessionStore: fmt::Debug + Send + Sync {
         request_id: PromptRequestId,
     ) -> Result<(), SessionError>;
 
+    /// Tenant-scoped variant of [`Self::append`]. Opens a
+    /// `begin_as_user(acting_user_id)` transaction so the
+    /// `session_messages` INSERT is gated by the RLS WITH CHECK on
+    /// `org_id`; a worker or tool acting on behalf of a foreign-org
+    /// user is rejected at the database boundary. The session's
+    /// `org_id` is derived inside the same statement from the parent
+    /// row so the column stays self-consistent.
+    async fn append_for_user(
+        &self,
+        acting_user_id: UserId,
+        id: SessionId,
+        sender: MessageSender,
+        receiver: Participant,
+        message: ChatMessage,
+        request_id: PromptRequestId,
+    ) -> Result<(), SessionError>;
+
     /// Append a worker-injected `system`-kind nudge addressed to `receiver`.
     /// The body is wrapped as `ChatMessage::User(vec![Text(note)])` on the
     /// way in so the receiving agent renders it as user-side context.
     /// `request_id` follows the same contract as [`Self::append`].
     async fn append_system_nudge(
         &self,
+        id: SessionId,
+        receiver: Participant,
+        note: String,
+        request_id: PromptRequestId,
+    ) -> Result<(), SessionError>;
+
+    /// Tenant-scoped variant of [`Self::append_system_nudge`]. Same
+    /// RLS gate as [`Self::append_for_user`].
+    async fn append_system_nudge_for_user(
+        &self,
+        acting_user_id: UserId,
         id: SessionId,
         receiver: Participant,
         note: String,
@@ -140,6 +209,13 @@ pub trait SessionStore: fmt::Debug + Send + Sync {
     /// tree this session belongs to. Used by the `send_message` tool to
     /// resolve sibling sessions and by the DAG-budget bump.
     async fn root_request_id(&self, id: SessionId) -> Result<PromptRequestId, SessionError>;
+
+    /// Tenancy lookup — `(org_id, created_by_user_id)` for the row.
+    /// Used by callers that derive a child session's tenancy from the
+    /// parent (the `send_message` tool, the runtime queue's
+    /// implicit-create path on enqueue) and by the worker pool to set
+    /// `app.user_id` from the claimed session.
+    async fn tenancy(&self, id: SessionId) -> Result<SessionTenancy, SessionError>;
 
     /// Drop the session and every message it owns.
     async fn delete(&self, id: SessionId) -> Result<(), SessionError>;

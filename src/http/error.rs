@@ -5,6 +5,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::agents::AgentStoreError;
+use crate::auth::AuthError;
 use crate::mcp::McpError;
 use crate::runtime::{PromptError, ResponseError};
 use crate::session::SessionError;
@@ -44,6 +45,9 @@ pub enum HttpError {
     #[error("mcp: {0}")]
     Mcp(#[from] McpError),
 
+    #[error("auth: {0}")]
+    Auth(#[from] AuthError),
+
     #[error("internal error")]
     Internal,
 }
@@ -55,7 +59,9 @@ impl IntoResponse for HttpError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             Self::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too large".into()),
-            Self::Parse(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+            Self::Parse(e) | Self::Auth(AuthError::Parse(e)) => {
+                (StatusCode::BAD_REQUEST, e.to_string())
+            }
             Self::Session(SessionError::NotFound(_)) => {
                 (StatusCode::NOT_FOUND, "session not found".into())
             }
@@ -102,6 +108,18 @@ impl IntoResponse for HttpError {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
             Self::Mcp(_) => (StatusCode::INTERNAL_SERVER_ERROR, "mcp store error".into()),
+            Self::Auth(
+                AuthError::Unauthenticated | AuthError::Jwt(_) | AuthError::OAuthStateInvalid,
+            ) => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
+            Self::Auth(AuthError::EmailUnverified) => (
+                StatusCode::FORBIDDEN,
+                "email not verified by provider".into(),
+            ),
+            Self::Auth(AuthError::NotMember(_)) => (StatusCode::FORBIDDEN, self.to_string()),
+            Self::Auth(AuthError::OAuthProvider(_)) => {
+                (StatusCode::BAD_GATEWAY, "oauth provider unavailable".into())
+            }
+            Self::Auth(_) => (StatusCode::INTERNAL_SERVER_ERROR, "auth error".into()),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
         (status, Json(json!({ "error": message }))).into_response()

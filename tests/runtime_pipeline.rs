@@ -103,6 +103,8 @@ struct Harness {
     hub: Arc<PgResponseHub>,
     sessions: SharedSessionStore,
     default_agent_id: relay_rs::agents::AgentId,
+    default_org_id: relay_rs::auth::OrgId,
+    default_user_id: relay_rs::auth::UserId,
     pool: relay_rs::runtime::WorkerPoolHandle,
 }
 
@@ -148,7 +150,7 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
     let memory_store_for_pool: relay_rs::memory::SharedMemoryStore =
         Arc::new(relay_rs::memory::PgMemoryStore::new(
             db.pool.clone(),
-            clock,
+            clock.clone(),
             common::embedding::FakeEmbeddingProvider::shared(),
         ));
 
@@ -169,12 +171,15 @@ async fn build_harness(provider: Arc<ScriptedProvider>) -> Harness {
         dag,
         db.pool.clone(),
         memory_store_for_pool,
+        clock.clone(),
         cfg,
     )
     .spawn();
 
     Harness {
         default_agent_id: db.default_agent_id,
+        default_org_id: db.default_org_id,
+        default_user_id: db.default_user_id,
         db,
         queue: queue_impl,
         hub,
@@ -188,6 +193,8 @@ fn req(
     agent_id: relay_rs::agents::AgentId,
     content: &str,
     key: &str,
+    org_id: relay_rs::auth::OrgId,
+    user_id: relay_rs::auth::UserId,
 ) -> NewPromptRequest {
     NewPromptRequest {
         session: Some(session),
@@ -196,6 +203,8 @@ fn req(
         parent_session: None,
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
+        org_id,
+        created_by_user_id: user_id,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }
@@ -204,7 +213,13 @@ fn req(
 /// session AND seed `prompt_request_dags` in one transaction. Required by
 /// any test whose script invokes `send_message`, since the tool's
 /// `dag.bump_or_fail` needs the DAG row to exist.
-fn req_root(agent_id: relay_rs::agents::AgentId, content: &str, key: &str) -> NewPromptRequest {
+fn req_root(
+    agent_id: relay_rs::agents::AgentId,
+    content: &str,
+    key: &str,
+    org_id: relay_rs::auth::OrgId,
+    user_id: relay_rs::auth::UserId,
+) -> NewPromptRequest {
     NewPromptRequest {
         session: None,
         sender: relay_rs::types::Participant::Human,
@@ -212,6 +227,8 @@ fn req_root(agent_id: relay_rs::agents::AgentId, content: &str, key: &str) -> Ne
         parent_session: None,
         content: Prompt::try_from(content).expect("p"),
         idempotency_key: IdempotencyKey::try_from(key).expect("k"),
+        org_id,
+        created_by_user_id: user_id,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
     }
 }
@@ -276,7 +293,13 @@ async fn round_trip_publishes_done_chunk() {
     let h = build_harness(provider).await;
     let id = h
         .queue
-        .enqueue(req_root(h.default_agent_id, "hi", "k1"))
+        .enqueue(req_root(
+            h.default_agent_id,
+            "hi",
+            "k1",
+            h.default_org_id,
+            h.default_user_id,
+        ))
         .await
         .expect("enqueue")
         .request_id();
@@ -302,10 +325,23 @@ async fn cancellation_finishes_inflight_and_skips_next_turn() {
         delay: Duration::from_millis(150),
     });
     let h = build_harness(provider).await;
-    let s = human_to_agent_session(h.sessions.as_ref(), h.default_agent_id).await;
+    let s = human_to_agent_session(
+        h.sessions.as_ref(),
+        h.default_agent_id,
+        h.default_org_id,
+        h.default_user_id,
+    )
+    .await;
     let first = h
         .queue
-        .enqueue(req(s, h.default_agent_id, "first", "k-first"))
+        .enqueue(req(
+            s,
+            h.default_agent_id,
+            "first",
+            "k-first",
+            h.default_org_id,
+            h.default_user_id,
+        ))
         .await
         .expect("enqueue1")
         .request_id();
@@ -315,7 +351,14 @@ async fn cancellation_finishes_inflight_and_skips_next_turn() {
 
     let second = h
         .queue
-        .enqueue(req(s, h.default_agent_id, "second", "k-second"))
+        .enqueue(req(
+            s,
+            h.default_agent_id,
+            "second",
+            "k-second",
+            h.default_org_id,
+            h.default_user_id,
+        ))
         .await
         .expect("enqueue2")
         .request_id();
@@ -348,7 +391,13 @@ async fn streaming_emits_text_before_done() {
     let h = build_harness(provider).await;
     let id = h
         .queue
-        .enqueue(req_root(h.default_agent_id, "hi", "stream-key"))
+        .enqueue(req_root(
+            h.default_agent_id,
+            "hi",
+            "stream-key",
+            h.default_org_id,
+            h.default_user_id,
+        ))
         .await
         .expect("enqueue")
         .request_id();
@@ -387,10 +436,23 @@ async fn mid_turn_cancellation_aborts_in_flight_turn() {
         delay: Duration::from_secs(2),
     });
     let h = build_harness(provider).await;
-    let s = human_to_agent_session(h.sessions.as_ref(), h.default_agent_id).await;
+    let s = human_to_agent_session(
+        h.sessions.as_ref(),
+        h.default_agent_id,
+        h.default_org_id,
+        h.default_user_id,
+    )
+    .await;
     let id = h
         .queue
-        .enqueue(req(s, h.default_agent_id, "slow", "k-mid-cancel"))
+        .enqueue(req(
+            s,
+            h.default_agent_id,
+            "slow",
+            "k-mid-cancel",
+            h.default_org_id,
+            h.default_user_id,
+        ))
         .await
         .expect("enqueue")
         .request_id();
@@ -428,16 +490,36 @@ async fn idempotent_repeat_returns_same_request_id() {
         delay: Duration::ZERO,
     });
     let h = build_harness(provider).await;
-    let s = human_to_agent_session(h.sessions.as_ref(), h.default_agent_id).await;
+    let s = human_to_agent_session(
+        h.sessions.as_ref(),
+        h.default_agent_id,
+        h.default_org_id,
+        h.default_user_id,
+    )
+    .await;
     let a = h
         .queue
-        .enqueue(req(s, h.default_agent_id, "hi", "same-key"))
+        .enqueue(req(
+            s,
+            h.default_agent_id,
+            "hi",
+            "same-key",
+            h.default_org_id,
+            h.default_user_id,
+        ))
         .await
         .expect("a")
         .request_id();
     let b = h
         .queue
-        .enqueue(req(s, h.default_agent_id, "hi", "same-key"))
+        .enqueue(req(
+            s,
+            h.default_agent_id,
+            "hi",
+            "same-key",
+            h.default_org_id,
+            h.default_user_id,
+        ))
         .await
         .expect("b")
         .request_id();

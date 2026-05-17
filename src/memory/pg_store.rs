@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use crate::agents::AgentId;
+use crate::auth::{TxScope, UserId};
 use crate::clock::SharedClock;
 use crate::pg_vector;
 use crate::provider::SharedEmbeddingProvider;
@@ -34,10 +35,11 @@ use super::types::{
 /// Column list reused by every `agent_memories` SELECT — keeping it in one
 /// place removes drift between `list` / `get` / `lock_existing` and the
 /// `RETURNING` clauses on the mutation paths.
-const MEMORY_ROW_COLUMNS: &str = "id, agent_id, kind, content, state, pinned, source_turn_id, \
-                                  created_at, last_validated_at, last_accessed_at, access_count";
+const MEMORY_ROW_COLUMNS: &str = "id, agent_id, org_id, kind, content, state, pinned, \
+                                  source_turn_id, created_at, last_validated_at, \
+                                  last_accessed_at, access_count";
 
-const MEMORY_EVENT_COLUMNS: &str = "id, agent_id, mutation, target_memory_id, \
+const MEMORY_EVENT_COLUMNS: &str = "id, agent_id, org_id, mutation, target_memory_id, \
                                     content_before, content_after, source_kind, source_turn_id, \
                                     created_at, kind, state, pinned";
 
@@ -58,7 +60,7 @@ impl PgMemoryStore {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 
     /// Embed `content` synchronously. Errors propagate so the mutation
@@ -80,56 +82,51 @@ impl fmt::Debug for PgMemoryStore {
 #[allow(clippy::too_many_lines)] // exhaustive dispatch on a 3-arm enum
 impl MemoryStore for PgMemoryStore {
     async fn apply(&self, mutation: MemoryMutation) -> Result<MutationOutcome, MemoryStoreError> {
-        // Embed BEFORE opening the transaction — embedding can be slow,
-        // and we don't want to hold locks across a network call. `Forget`
-        // touches no content so it skips the call.
-        let embedding: Option<Vec<f32>> = match &mutation {
-            MemoryMutation::Write { content, .. } | MemoryMutation::Update { content, .. } => {
-                Some(self.embed(content.as_str()).await?)
-            }
-            MemoryMutation::Forget { .. } => None,
-        };
+        apply_impl(self, TxScope::Privileged, mutation).await
+    }
 
-        let now = self.now();
-        let mut tx = self.pool.begin().await?;
+    async fn apply_for_user(
+        &self,
+        acting_user_id: UserId,
+        mutation: MemoryMutation,
+    ) -> Result<MutationOutcome, MemoryStoreError> {
+        apply_impl(self, TxScope::AsUser(acting_user_id), mutation).await
+    }
 
-        let outcome = match mutation {
-            MemoryMutation::Write {
-                agent,
-                kind,
-                content,
-                state,
-                pinned,
-                source,
-            } => {
-                let embedding = embedding.expect("invariant: Write produced an embedding above");
-                apply_write(
-                    &mut tx, agent, kind, content, state, pinned, source, embedding, now,
-                )
-                .await?
-            }
-            MemoryMutation::Update {
-                agent,
-                target,
-                content,
-                state,
-                source,
-            } => {
-                let embedding = embedding.expect("invariant: Update produced an embedding above");
-                apply_update(
-                    &mut tx, agent, target, content, state, source, embedding, now,
-                )
-                .await?
-            }
-            MemoryMutation::Forget {
-                agent,
-                target,
-                source,
-            } => apply_forget(&mut tx, agent, target, source, now).await?,
-        };
+    async fn record_validation_for_user(
+        &self,
+        acting_user_id: UserId,
+        agent: AgentId,
+        memory: MemoryId,
+        origin: ValidationOrigin,
+        detail: Option<&str>,
+    ) -> Result<MemoryRow, MemoryStoreError> {
+        record_validation_impl(
+            self,
+            TxScope::AsUser(acting_user_id),
+            agent,
+            memory,
+            origin,
+            detail,
+        )
+        .await
+    }
 
-        tx.commit().await?;
-        Ok(outcome)
+    async fn resolve_contradiction_for_user(
+        &self,
+        acting_user_id: UserId,
+        id: ContradictionEventId,
+        outcome: ResolutionOutcome,
+    ) -> Result<(), MemoryStoreError> {
+        resolve_contradiction_impl(self, TxScope::AsUser(acting_user_id), id, outcome).await
+    }
+
+    async fn record_access_for_user(
+        &self,
+        acting_user_id: UserId,
+        ids: &[MemoryId],
+    ) -> Result<(), MemoryStoreError> {
+        record_access_impl(self, TxScope::AsUser(acting_user_id), ids).await
     }
 
     async fn list(&self, agent: AgentId) -> Result<Vec<MemoryRow>, MemoryStoreError> {
@@ -144,11 +141,17 @@ impl MemoryStore for PgMemoryStore {
              ORDER BY created_at ASC, id ASC
              LIMIT $2",
         );
+        // Privileged tx: the store has no `Principal` in scope, and
+        // `agent_memories` is RLS-forced post-migration-17. Tenant scope
+        // is provided by the explicit `agent_id` bind plus the row's
+        // denormalised `org_id` (parity-checked on insert).
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query(&sql)
             .bind(agent)
             .bind(probe_limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         assert!(
             rows.len() <= MAX_MEMORIES_PER_AGENT,
@@ -165,10 +168,9 @@ impl MemoryStore for PgMemoryStore {
 
     async fn get(&self, id: MemoryId) -> Result<Option<MemoryRow>, MemoryStoreError> {
         let sql = format!("SELECT {MEMORY_ROW_COLUMNS} FROM agent_memories WHERE id = $1");
-        let row = sqlx::query(&sql)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+        let row = sqlx::query(&sql).bind(id).fetch_optional(&mut *tx).await?;
+        tx.commit().await?;
         row.as_ref().map(decode_memory_row).transpose()
     }
 
@@ -181,11 +183,13 @@ impl MemoryStore for PgMemoryStore {
              ORDER BY created_at ASC, id ASC
              LIMIT $2",
         );
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query(&sql)
             .bind(agent)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -195,7 +199,23 @@ impl MemoryStore for PgMemoryStore {
     }
 
     async fn rebuild_materialized(&self, agent: AgentId) -> Result<(), MemoryStoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+
+        // Snapshot embeddings before DELETE so we can re-attach them after
+        // replay. `memory_events` does not carry the embedding (it's
+        // derived from content and lives only in the materialized view),
+        // so a naive DELETE-then-replay would leave every row with
+        // `embedding IS NULL` and silently break `search_by_embedding`
+        // / `similar_pairs`. Snapshot is keyed by memory id; replay
+        // re-creates the same ids from `event.target_memory_id`, so the
+        // restore-by-id maps the right vector to the right row.
+        let embedding_snapshot: Vec<(MemoryId, String)> = sqlx::query_as(
+            "SELECT id, embedding::text FROM agent_memories
+             WHERE agent_id = $1 AND embedding IS NOT NULL",
+        )
+        .bind(agent)
+        .fetch_all(&mut *tx)
+        .await?;
 
         sqlx::query("DELETE FROM agent_memories WHERE agent_id = $1")
             .bind(agent)
@@ -212,6 +232,16 @@ impl MemoryStore for PgMemoryStore {
         for row in event_rows {
             let event = decode_memory_event(&row)?;
             apply_replay(&mut tx, agent, &event).await?;
+        }
+
+        // Restore embeddings for rows that still exist (Forget events
+        // dropped some during replay; the UPDATE no-ops for those).
+        for (id, embedding) in embedding_snapshot {
+            sqlx::query("UPDATE agent_memories SET embedding = $1::vector WHERE id = $2")
+                .bind(embedding)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
 
         tx.commit().await?;
@@ -260,14 +290,16 @@ impl MemoryStore for PgMemoryStore {
             Some(kinds_filter)
         };
 
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query(&sql)
             .bind(agent)
             .bind(pg_vector::encode(embedding))
             .bind(kinds_arg)
             .bind(min_state_priority)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -311,12 +343,14 @@ impl MemoryStore for PgMemoryStore {
             b_cols = aliased_columns("b", "b"),
         );
 
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query(&sql)
             .bind(agent)
             .bind(f64_threshold)
             .bind(limit)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -336,7 +370,7 @@ impl MemoryStore for PgMemoryStore {
         cutoff: DateTime<Utc>,
     ) -> Result<usize, MemoryStoreError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         let sql = format!(
             "SELECT {MEMORY_ROW_COLUMNS} FROM agent_memories
@@ -387,7 +421,7 @@ impl MemoryStore for PgMemoryStore {
         cutoff: DateTime<Utc>,
     ) -> Result<usize, MemoryStoreError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         // Pinned rows are excluded for symmetry with decay_validated —
         // pinning is an authority signal, so the operator has already
@@ -450,69 +484,7 @@ impl MemoryStore for PgMemoryStore {
         origin: ValidationOrigin,
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError> {
-        let now = self.now();
-        let mut tx = self.pool.begin().await?;
-        let wrapping_source = origin.mutation_source();
-
-        let prior = lock_existing(&mut tx, agent, memory, wrapping_source).await?;
-
-        sqlx::query(
-            "INSERT INTO validation_events
-                 (id, agent_id, memory_id, source, detail, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(ValidationEventId::new())
-        .bind(agent)
-        .bind(memory)
-        .bind(origin.source().as_str())
-        .bind(detail)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        // Promotion: Tentative → Held; Held → Validated. Core stays put
-        // (operator-pinned floor); pinned non-Core rows still promote on
-        // operator-driven validation since pinning is an authority signal
-        // separate from confidence.
-        let new_state = match prior.state {
-            MemoryState::Tentative => MemoryState::Held,
-            MemoryState::Held => MemoryState::Validated,
-            MemoryState::Validated | MemoryState::Core => prior.state,
-        };
-
-        let payload = MemoryEventPayload::Update {
-            before: prior.content.clone(),
-            after: prior.content.clone(),
-            kind: prior.kind,
-            state: new_state,
-            pinned: prior.pinned,
-        };
-        insert_event(
-            &mut tx,
-            MemoryEventId::new(),
-            agent,
-            memory,
-            wrapping_source,
-            now,
-            &payload,
-        )
-        .await?;
-
-        let sql = format!(
-            "UPDATE agent_memories
-             SET state = $1, last_validated_at = $2
-             WHERE id = $3
-             RETURNING {MEMORY_ROW_COLUMNS}",
-        );
-        let row = sqlx::query(&sql)
-            .bind(new_state)
-            .bind(now)
-            .bind(memory)
-            .fetch_one(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-        decode_memory_row(&row)
+        record_validation_impl(self, TxScope::Privileged, agent, memory, origin, detail).await
     }
 
     async fn record_contradiction(
@@ -531,9 +503,16 @@ impl MemoryStore for PgMemoryStore {
         };
         let now = self.now();
 
+        // Privileged tx — `contradiction_events` is RLS-forced; the
+        // store has no `Principal` in scope. `org_id` is derived from
+        // the parent agent and parity-checked by the trigger.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         // Idempotency: if an unresolved row already exists for this pair,
         // return its id.
-        let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
+        // Typed lookup — `ContradictionEventId` round-trips via the
+        // `uuid_newtype!` sqlx impls; never traffic in raw `uuid::Uuid`
+        // at the app boundary (CLAUDE.md §1).
+        let existing: Option<ContradictionEventId> = sqlx::query_scalar(
             "SELECT id FROM contradiction_events
              WHERE agent_id = $1 AND memory_a = $2 AND memory_b = $3 AND resolved_at IS NULL
              ORDER BY created_at DESC LIMIT 1",
@@ -541,17 +520,19 @@ impl MemoryStore for PgMemoryStore {
         .bind(agent)
         .bind(lo)
         .bind(hi)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        if let Some((id,)) = existing {
-            return Ok(ContradictionEventId::from(id));
+        if let Some(id) = existing {
+            tx.commit().await?;
+            return Ok(id);
         }
 
         let id = ContradictionEventId::new();
         sqlx::query(
             "INSERT INTO contradiction_events
-                 (id, agent_id, memory_a, memory_b, reason, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+                 (id, agent_id, org_id, memory_a, memory_b, reason, created_at)
+             VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
+                     $3, $4, $5, $6)",
         )
         .bind(id)
         .bind(agent)
@@ -559,8 +540,9 @@ impl MemoryStore for PgMemoryStore {
         .bind(hi)
         .bind(reason)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -569,8 +551,9 @@ impl MemoryStore for PgMemoryStore {
         agent: AgentId,
     ) -> Result<Vec<ContradictionEventRow>, MemoryStoreError> {
         let limit = i64::try_from(MAX_SIMILAR_PAIRS_PER_AGENT).expect("invariant: cap fits in i64");
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows = sqlx::query(
-            "SELECT id, agent_id, memory_a, memory_b, reason, created_at,
+            "SELECT id, agent_id, org_id, memory_a, memory_b, reason, created_at,
                     resolved_at, resolution_event_id, resolution_reason
              FROM contradiction_events
              WHERE agent_id = $1 AND resolved_at IS NULL
@@ -579,8 +562,9 @@ impl MemoryStore for PgMemoryStore {
         )
         .bind(agent)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -593,14 +577,16 @@ impl MemoryStore for PgMemoryStore {
         &self,
         id: ContradictionEventId,
     ) -> Result<Option<ContradictionEventRow>, MemoryStoreError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let row = sqlx::query(
-            "SELECT id, agent_id, memory_a, memory_b, reason, created_at,
+            "SELECT id, agent_id, org_id, memory_a, memory_b, reason, created_at,
                     resolved_at, resolution_event_id, resolution_reason
              FROM contradiction_events WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         row.as_ref().map(decode_contradiction_row).transpose()
     }
 
@@ -609,23 +595,7 @@ impl MemoryStore for PgMemoryStore {
         id: ContradictionEventId,
         outcome: ResolutionOutcome,
     ) -> Result<(), MemoryStoreError> {
-        let now = self.now();
-        let (event_id, reason): (Option<MemoryEventId>, Option<String>) = match outcome {
-            ResolutionOutcome::Mutation(event_id) => (Some(event_id), None),
-            ResolutionOutcome::NoAction { reason } => (None, Some(reason.into_inner())),
-        };
-        sqlx::query(
-            "UPDATE contradiction_events
-             SET resolved_at = $1, resolution_event_id = $2, resolution_reason = $3
-             WHERE id = $4 AND resolved_at IS NULL",
-        )
-        .bind(now)
-        .bind(event_id)
-        .bind(reason)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        resolve_contradiction_impl(self, TxScope::Privileged, id, outcome).await
     }
 
     async fn evict_overflow(
@@ -634,7 +604,7 @@ impl MemoryStore for PgMemoryStore {
         quota: usize,
     ) -> Result<Vec<MemoryId>, MemoryStoreError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM agent_memories WHERE agent_id = $1")
@@ -703,21 +673,9 @@ impl MemoryStore for PgMemoryStore {
         event: MemoryEventId,
     ) -> Result<Option<MemoryRow>, MemoryStoreError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
-        let sql = format!(
-            "SELECT {MEMORY_EVENT_COLUMNS} FROM memory_events WHERE id = $1 AND agent_id = $2",
-        );
-        let row = sqlx::query(&sql)
-            .bind(event)
-            .bind(agent)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let evt = match row {
-            Some(r) => decode_memory_event(&r)?,
-            None => return Err(MemoryStoreError::EventNotFound { id: event }),
-        };
-
+        let evt = load_event(&mut tx, agent, event).await?;
         let target = evt.target_memory_id;
         // Inverse mapping (payload variants carry everything replay needs —
         // no defensive defaults, no extra journal scans):
@@ -727,24 +685,7 @@ impl MemoryStore for PgMemoryStore {
         let inverse_event = MemoryEventId::new();
         match evt.payload {
             MemoryEventPayload::Write { .. } => {
-                let prior = lock_existing(&mut tx, agent, target, MutationSource::Operator).await?;
-                let payload = MemoryEventPayload::Forget {
-                    before: prior.content.clone(),
-                };
-                insert_event(
-                    &mut tx,
-                    inverse_event,
-                    agent,
-                    target,
-                    MutationSource::Operator,
-                    now,
-                    &payload,
-                )
-                .await?;
-                sqlx::query("DELETE FROM agent_memories WHERE id = $1")
-                    .bind(target)
-                    .execute(&mut *tx)
-                    .await?;
+                revert_write(&mut tx, agent, target, inverse_event, now).await?;
             }
             MemoryEventPayload::Update {
                 before,
@@ -753,73 +694,21 @@ impl MemoryStore for PgMemoryStore {
                 pinned,
                 ..
             } => {
-                let prior = lock_existing(&mut tx, agent, target, MutationSource::Operator).await?;
-                let payload = MemoryEventPayload::Update {
-                    before: prior.content.clone(),
-                    after: before.clone(),
+                revert_update(
+                    &mut tx,
+                    agent,
+                    target,
+                    inverse_event,
+                    now,
+                    before,
                     kind,
                     state,
                     pinned,
-                };
-                insert_event(
-                    &mut tx,
-                    inverse_event,
-                    agent,
-                    target,
-                    MutationSource::Operator,
-                    now,
-                    &payload,
                 )
-                .await?;
-                sqlx::query(
-                    "UPDATE agent_memories SET content = $1, state = $2, pinned = $3 WHERE id = $4",
-                )
-                .bind(before.as_str())
-                .bind(state)
-                .bind(pinned)
-                .bind(target)
-                .execute(&mut *tx)
                 .await?;
             }
             MemoryEventPayload::Forget { before } => {
-                // Walk back to the most recent write/update event for this
-                // memory to recover the lifecycle attrs (the forget event
-                // itself does not carry them). Missing means journal
-                // corruption — surface, don't default.
-                let attrs = restore_attrs_for(&mut tx, agent, target).await?;
-                let payload = MemoryEventPayload::Write {
-                    content: before.clone(),
-                    kind: attrs.kind,
-                    state: attrs.state,
-                    pinned: attrs.pinned,
-                };
-                insert_event(
-                    &mut tx,
-                    inverse_event,
-                    agent,
-                    target,
-                    MutationSource::Operator,
-                    now,
-                    &payload,
-                )
-                .await?;
-                sqlx::query(
-                    "INSERT INTO agent_memories
-                         (id, agent_id, kind, content, state, pinned,
-                          source_turn_id,
-                          created_at, last_validated_at, last_accessed_at, access_count)
-                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $7, $7, 0)
-                     ON CONFLICT (id) DO NOTHING",
-                )
-                .bind(target)
-                .bind(agent)
-                .bind(attrs.kind)
-                .bind(before.as_str())
-                .bind(attrs.state)
-                .bind(attrs.pinned)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+                revert_forget(&mut tx, agent, target, inverse_event, now, before).await?;
             }
         }
 
@@ -840,7 +729,7 @@ impl MemoryStore for PgMemoryStore {
         pinned: bool,
     ) -> Result<MemoryRow, MemoryStoreError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let prior = lock_existing(&mut tx, agent, memory, MutationSource::Operator).await?;
         let payload = MemoryEventPayload::Update {
             before: prior.content.clone(),
@@ -872,25 +761,362 @@ impl MemoryStore for PgMemoryStore {
     }
 
     async fn record_access(&self, ids: &[MemoryId]) -> Result<(), MemoryStoreError> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        assert!(
-            ids.len() <= MAX_MEMORIES_PER_AGENT,
-            "invariant: record_access batch ≤ MAX_MEMORIES_PER_AGENT"
-        );
-        let now = self.now();
-        sqlx::query(
-            "UPDATE agent_memories
-             SET last_accessed_at = $1, access_count = access_count + 1
-             WHERE id = ANY($2)",
-        )
-        .bind(now)
-        .bind(ids)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        record_access_impl(self, TxScope::Privileged, ids).await
     }
+}
+
+/// Load the `memory_events` row to be reverted, gated by `(id, agent_id)`.
+async fn load_event(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    event: MemoryEventId,
+) -> Result<MemoryEvent, MemoryStoreError> {
+    let sql = format!(
+        "SELECT {MEMORY_EVENT_COLUMNS} FROM memory_events WHERE id = $1 AND agent_id = $2",
+    );
+    let row = sqlx::query(&sql)
+        .bind(event)
+        .bind(agent)
+        .fetch_optional(&mut **tx)
+        .await?;
+    row.map_or_else(
+        || Err(MemoryStoreError::EventNotFound { id: event }),
+        |r| decode_memory_event(&r),
+    )
+}
+
+/// Inverse of a `Write` event: forget the materialised row and journal
+/// the deletion (with the now-current content captured as `before`).
+async fn revert_write(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    target: MemoryId,
+    inverse_event: MemoryEventId,
+    now: DateTime<Utc>,
+) -> Result<(), MemoryStoreError> {
+    let prior = lock_existing(tx, agent, target, MutationSource::Operator).await?;
+    let payload = MemoryEventPayload::Forget {
+        before: prior.content.clone(),
+    };
+    insert_event(
+        tx,
+        inverse_event,
+        agent,
+        target,
+        MutationSource::Operator,
+        now,
+        &payload,
+    )
+    .await?;
+    sqlx::query("DELETE FROM agent_memories WHERE id = $1")
+        .bind(target)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Inverse of an `Update` event: write the prior `before` back into the
+/// row and journal a fresh `Update` whose `before` is the now-current
+/// content.
+#[allow(clippy::too_many_arguments)]
+async fn revert_update(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    target: MemoryId,
+    inverse_event: MemoryEventId,
+    now: DateTime<Utc>,
+    before: MemoryContent,
+    kind: MemoryKind,
+    state: MemoryState,
+    pinned: bool,
+) -> Result<(), MemoryStoreError> {
+    let prior = lock_existing(tx, agent, target, MutationSource::Operator).await?;
+    let payload = MemoryEventPayload::Update {
+        before: prior.content.clone(),
+        after: before.clone(),
+        kind,
+        state,
+        pinned,
+    };
+    insert_event(
+        tx,
+        inverse_event,
+        agent,
+        target,
+        MutationSource::Operator,
+        now,
+        &payload,
+    )
+    .await?;
+    sqlx::query("UPDATE agent_memories SET content = $1, state = $2, pinned = $3 WHERE id = $4")
+        .bind(before.as_str())
+        .bind(state)
+        .bind(pinned)
+        .bind(target)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Inverse of a `Forget` event: walk the journal for the most-recent
+/// lifecycle attrs, write a fresh `agent_memories` row with the prior
+/// `before` content, and journal a `Write` event marking the restore.
+async fn revert_forget(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agent: AgentId,
+    target: MemoryId,
+    inverse_event: MemoryEventId,
+    now: DateTime<Utc>,
+    before: MemoryContent,
+) -> Result<(), MemoryStoreError> {
+    // Walk back to the most recent write/update event for this memory
+    // to recover the lifecycle attrs (the forget event itself does not
+    // carry them). Missing means journal corruption — surface, don't
+    // default.
+    let attrs = restore_attrs_for(tx, agent, target).await?;
+    let payload = MemoryEventPayload::Write {
+        content: before.clone(),
+        kind: attrs.kind,
+        state: attrs.state,
+        pinned: attrs.pinned,
+    };
+    insert_event(
+        tx,
+        inverse_event,
+        agent,
+        target,
+        MutationSource::Operator,
+        now,
+        &payload,
+    )
+    .await?;
+    // `org_id` derived from the parent agent via subquery — see
+    // `apply_write` for the rationale. The
+    // `agent_memories_enforce_org` trigger parity-checks it.
+    sqlx::query(
+        "INSERT INTO agent_memories
+             (id, agent_id, org_id, kind, content, state, pinned,
+              source_turn_id,
+              created_at, last_validated_at, last_accessed_at, access_count)
+         VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
+                 $3, $4, $5, $6, NULL, $7, $7, $7, 0)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(target)
+    .bind(agent)
+    .bind(attrs.kind)
+    .bind(before.as_str())
+    .bind(attrs.state)
+    .bind(attrs.pinned)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Body of `apply` / `apply_for_user`. Opens the tx via `scope` so the
+/// journal + materialized writes run privileged (librarian sweeps) or
+/// RLS-checked (worker / tool mutations).
+async fn apply_impl(
+    store: &PgMemoryStore,
+    scope: TxScope,
+    mutation: MemoryMutation,
+) -> Result<MutationOutcome, MemoryStoreError> {
+    // Embed BEFORE opening the transaction — embedding can be slow,
+    // and we don't want to hold locks across a network call. `Forget`
+    // touches no content so it skips the call.
+    let embedding: Option<Vec<f32>> = match &mutation {
+        MemoryMutation::Write { content, .. } | MemoryMutation::Update { content, .. } => {
+            Some(store.embed(content.as_str()).await?)
+        }
+        MemoryMutation::Forget { .. } => None,
+    };
+
+    let now = store.now();
+    let mut tx = scope.begin(&store.pool).await?;
+
+    let outcome = match mutation {
+        MemoryMutation::Write {
+            agent,
+            kind,
+            content,
+            state,
+            pinned,
+            source,
+        } => {
+            let embedding = embedding.expect("invariant: Write produced an embedding above");
+            apply_write(
+                &mut tx, agent, kind, content, state, pinned, source, embedding, now,
+            )
+            .await?
+        }
+        MemoryMutation::Update {
+            agent,
+            target,
+            content,
+            state,
+            source,
+        } => {
+            let embedding = embedding.expect("invariant: Update produced an embedding above");
+            apply_update(
+                &mut tx, agent, target, content, state, source, embedding, now,
+            )
+            .await?
+        }
+        MemoryMutation::Forget {
+            agent,
+            target,
+            source,
+        } => apply_forget(&mut tx, agent, target, source, now).await?,
+    };
+
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// Body of `record_validation` / `record_validation_for_user`.
+async fn record_validation_impl(
+    store: &PgMemoryStore,
+    scope: TxScope,
+    agent: AgentId,
+    memory: MemoryId,
+    origin: ValidationOrigin,
+    detail: Option<&str>,
+) -> Result<MemoryRow, MemoryStoreError> {
+    let now = store.now();
+    let mut tx = scope.begin(&store.pool).await?;
+    let wrapping_source = origin.mutation_source();
+
+    let prior = lock_existing(&mut tx, agent, memory, wrapping_source).await?;
+
+    sqlx::query(
+        "INSERT INTO validation_events
+             (id, agent_id, org_id, memory_id, source, detail, created_at)
+         VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
+                 $3, $4, $5, $6)",
+    )
+    .bind(ValidationEventId::new())
+    .bind(agent)
+    .bind(memory)
+    .bind(origin.source().as_str())
+    .bind(detail)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let new_state = match prior.state {
+        MemoryState::Tentative => MemoryState::Held,
+        MemoryState::Held => MemoryState::Validated,
+        MemoryState::Validated | MemoryState::Core => prior.state,
+    };
+
+    let payload = MemoryEventPayload::Update {
+        before: prior.content.clone(),
+        after: prior.content.clone(),
+        kind: prior.kind,
+        state: new_state,
+        pinned: prior.pinned,
+    };
+    insert_event(
+        &mut tx,
+        MemoryEventId::new(),
+        agent,
+        memory,
+        wrapping_source,
+        now,
+        &payload,
+    )
+    .await?;
+
+    let sql = format!(
+        "UPDATE agent_memories
+         SET state = $1, last_validated_at = $2
+         WHERE id = $3
+         RETURNING {MEMORY_ROW_COLUMNS}",
+    );
+    let row = sqlx::query(&sql)
+        .bind(new_state)
+        .bind(now)
+        .bind(memory)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    decode_memory_row(&row)
+}
+
+/// Body of `resolve_contradiction` / `resolve_contradiction_for_user`.
+async fn resolve_contradiction_impl(
+    store: &PgMemoryStore,
+    scope: TxScope,
+    id: ContradictionEventId,
+    outcome: ResolutionOutcome,
+) -> Result<(), MemoryStoreError> {
+    let now = store.now();
+    let (event_id, reason): (Option<MemoryEventId>, Option<String>) = match outcome {
+        ResolutionOutcome::Mutation(event_id) => (Some(event_id), None),
+        ResolutionOutcome::NoAction { reason } => (None, Some(reason.into_inner())),
+    };
+    let mut tx = scope.begin(&store.pool).await?;
+    let result = sqlx::query(
+        "UPDATE contradiction_events
+         SET resolved_at = $1, resolution_event_id = $2, resolution_reason = $3
+         WHERE id = $4 AND resolved_at IS NULL",
+    )
+    .bind(now)
+    .bind(event_id)
+    .bind(reason)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    // Zero rows affected has two distinct meanings that we must
+    // disambiguate: (1) the row is already resolved — idempotent
+    // success, preserving the original stamped time (a contract the
+    // librarian and `resolve_contradiction_is_idempotent` test both
+    // rely on); (2) the row doesn't exist, or is filtered out by RLS
+    // in `AsUser` scope — real error, must surface so retry-loops
+    // don't mistake silent skips for resolution.
+    if result.rows_affected() == 0 {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contradiction_events WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(MemoryStoreError::ContradictionNotFound(id));
+        }
+        // Row exists and was already resolved → idempotent no-op.
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Body of `record_access` / `record_access_for_user`.
+async fn record_access_impl(
+    store: &PgMemoryStore,
+    scope: TxScope,
+    ids: &[MemoryId],
+) -> Result<(), MemoryStoreError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    assert!(
+        ids.len() <= MAX_MEMORIES_PER_AGENT,
+        "invariant: record_access batch ≤ MAX_MEMORIES_PER_AGENT"
+    );
+    let now = store.now();
+    let mut tx = scope.begin(&store.pool).await?;
+    sqlx::query(
+        "UPDATE agent_memories
+         SET last_accessed_at = $1, access_count = access_count + 1
+         WHERE id = ANY($2)",
+    )
+    .bind(now)
+    .bind(ids)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Lifecycle attrs salvaged from the most recent write/update event when
@@ -958,12 +1184,15 @@ async fn apply_write(
     insert_event(tx, event_id, agent, memory_id, source, now, &payload).await?;
 
     let embedding_lit = pg_vector::encode(&embedding);
+    // `org_id` is derived from the parent agent via a correlated subquery
+    // and parity-checked by the `agent_memories_enforce_org` trigger.
     let sql = format!(
         "INSERT INTO agent_memories
-             (id, agent_id, kind, content, state, pinned,
+             (id, agent_id, org_id, kind, content, state, pinned,
               source_turn_id,
               created_at, last_validated_at, last_accessed_at, access_count, embedding)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8, 0, $9::vector)
+         VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
+                 $3, $4, $5, $6, $7, $8, $8, $8, 0, $9::vector)
          RETURNING {MEMORY_ROW_COLUMNS}",
     );
     let row = sqlx::query(&sql)
@@ -1105,13 +1334,18 @@ async fn insert_event(
         ),
     };
 
+    // `org_id` is derived from the parent agent via a correlated subquery
+    // and parity-checked by the `memory_events_enforce_org` trigger. The
+    // store has no `OrgId` in scope (callers pass `AgentId` only), so the
+    // store sources tenancy from the agent row inside the same tx.
     sqlx::query(
         "INSERT INTO memory_events
-             (id, agent_id, mutation, target_memory_id,
+             (id, agent_id, org_id, mutation, target_memory_id,
               content_before, content_after,
               source_kind, source_turn_id, created_at,
               kind, state, pinned)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+         VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
+                 $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(event_id)
     .bind(agent)
@@ -1176,12 +1410,16 @@ async fn apply_replay(
             state,
             pinned,
         } => {
+            // Replay mirrors the live mutation; `org_id` is derived from
+            // the parent agent inside the rebuild tx for the same reason
+            // the live insert does it (no `OrgId` in scope at replay).
             sqlx::query(
                 "INSERT INTO agent_memories
-                     (id, agent_id, kind, content, state, pinned,
+                     (id, agent_id, org_id, kind, content, state, pinned,
                       source_turn_id,
                       created_at, last_validated_at, last_accessed_at, access_count)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8, 0)",
+                 VALUES ($1, $2, (SELECT org_id FROM agents WHERE id = $2),
+                         $3, $4, $5, $6, $7, $8, $8, $8, 0)",
             )
             .bind(event.target_memory_id)
             .bind(agent)
@@ -1244,6 +1482,7 @@ fn decode_memory_row_with_suffix(
     Ok(MemoryRow {
         id: row.try_get(col("id").as_str())?,
         agent_id: row.try_get(col("agent_id").as_str())?,
+        org_id: row.try_get(col("org_id").as_str())?,
         kind: row.try_get(col("kind").as_str())?,
         content: MemoryContent::try_from(content_raw)?,
         state: row.try_get(col("state").as_str())?,
@@ -1330,6 +1569,7 @@ fn decode_memory_event(row: &sqlx::postgres::PgRow) -> Result<MemoryEvent, Memor
     Ok(MemoryEvent {
         id: row.try_get("id")?,
         agent_id: row.try_get("agent_id")?,
+        org_id: row.try_get("org_id")?,
         target_memory_id: row.try_get("target_memory_id")?,
         source,
         created_at: row.try_get("created_at")?,
@@ -1343,6 +1583,7 @@ fn decode_contradiction_row(
     Ok(ContradictionEventRow {
         id: row.try_get("id")?,
         agent_id: row.try_get("agent_id")?,
+        org_id: row.try_get("org_id")?,
         memory_a: row.try_get("memory_a")?,
         memory_b: row.try_get("memory_b")?,
         reason: row.try_get("reason")?,

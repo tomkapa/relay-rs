@@ -25,8 +25,14 @@ async fn create_append_snapshot_roundtrip() {
     let store = store(&db);
 
     let agent = Participant::agent(db.default_agent_id);
-    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
-    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
+    let id = human_to_agent_session(
+        store.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id, db.default_org_id).await;
     store
         .append(
             id,
@@ -92,8 +98,14 @@ async fn enforces_message_cap() {
         SystemClock::shared(),
         2,
     ));
-    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
-    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
+    let id = human_to_agent_session(
+        store.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id, db.default_org_id).await;
     let agent = Participant::agent(db.default_agent_id);
     for _ in 0..2 {
         store
@@ -124,8 +136,14 @@ async fn enforces_message_cap() {
 async fn delete_cascades_messages() {
     let db = TestDb::fresh().await;
     let store = store(&db);
-    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
-    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
+    let id = human_to_agent_session(
+        store.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id, db.default_org_id).await;
     let agent = Participant::agent(db.default_agent_id);
     store
         .append(
@@ -154,7 +172,14 @@ async fn create_with_unknown_agent_returns_agent_not_found() {
     let phantom = AgentId::new();
     let root = PromptRequestId::new();
     let err = store
-        .resolve_or_create_for_pair(root, Participant::Human, Participant::agent(phantom), None)
+        .resolve_or_create_for_pair(
+            root,
+            Participant::Human,
+            Participant::agent(phantom),
+            None,
+            db.default_org_id,
+            db.default_user_id,
+        )
         .await
         .expect_err("fk");
     assert!(matches!(err, SessionError::AgentNotFound(_)));
@@ -166,7 +191,13 @@ async fn participants_round_trip_through_session() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
-    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
+    let id = human_to_agent_session(
+        store.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
     let (a, b) = store.participants(id).await.expect("resolve");
     assert_eq!(a, Participant::agent(db.default_agent_id));
     assert_eq!(b, Participant::Human);
@@ -180,8 +211,14 @@ async fn snapshot_renders_messages_from_viewer_perspective() {
     let store = store(&db);
     let agent = Participant::agent(db.default_agent_id);
 
-    let id = human_to_agent_session(store.as_ref(), db.default_agent_id).await;
-    let req = seed_prompt_request(&db.pool, id, db.default_agent_id).await;
+    let id = human_to_agent_session(
+        store.as_ref(),
+        db.default_agent_id,
+        db.default_org_id,
+        db.default_user_id,
+    )
+    .await;
+    let req = seed_prompt_request(&db.pool, id, db.default_agent_id, db.default_org_id).await;
     // Human → Agent: text prompt.
     store
         .append(

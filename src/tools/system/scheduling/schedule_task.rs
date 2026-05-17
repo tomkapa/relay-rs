@@ -6,14 +6,16 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
+use crate::agents::SharedAgentStore;
 use crate::clock::SharedClock;
 use crate::scheduling::{
     DefaultTimezone, MAX_ONESHOT_HORIZON_DAYS, NewScheduledTask, SCHEDULED_TASK_NAME_MAX_LEN,
     ScheduleSpec, ScheduledPrompt, ScheduledTaskError, ScheduledTaskId, ScheduledTaskName,
     SharedScheduledTaskStore,
 };
+use crate::session::SharedSessionStore;
 use crate::tools::{Tool, ToolCallContext, ToolError};
 use crate::types::{PROMPT_MAX_BYTES, ToolName};
 
@@ -73,6 +75,8 @@ pub struct ScheduleTaskTool {
     description: &'static str,
     input_schema: Arc<Value>,
     store: SharedScheduledTaskStore,
+    agents: SharedAgentStore,
+    sessions: SharedSessionStore,
     default_tz: DefaultTimezone,
     clock: SharedClock,
 }
@@ -87,6 +91,8 @@ impl ScheduleTaskTool {
     #[must_use]
     pub fn new(
         store: SharedScheduledTaskStore,
+        agents: SharedAgentStore,
+        sessions: SharedSessionStore,
         default_tz: DefaultTimezone,
         clock: SharedClock,
     ) -> Self {
@@ -151,6 +157,8 @@ impl ScheduleTaskTool {
             description: TOOL_DESCRIPTION,
             input_schema,
             store,
+            agents,
+            sessions,
             default_tz,
             clock,
         }
@@ -188,14 +196,46 @@ impl ScheduleTaskTool {
             ToolError::InvalidInput("schedule_task: schedule produces no future fire time".into())
         })?;
 
+        // Tenancy: `org_id` is the calling agent's org (every agent has
+        // a NOT NULL `agents.org_id` — single source of truth for which
+        // tenant the scheduled task belongs to). `created_by_user_id`
+        // is the human at the DAG root of this session, fetched via
+        // `SessionStore::tenancy` so a retried fire resolves the same
+        // principal even if the agent loop has churned through several
+        // sessions in the interim.
+        let agent_record = self.agents.read(owner).await.map_err(|e| {
+            set_outcome(TaskOutcome::BackendError);
+            error!(error = ?e, relay.agent.id = %owner, "schedule_task.agent_lookup_failed");
+            ToolError::Backend(format!("schedule_task: agent lookup: {e}"))
+        })?;
+        let session_tenancy = self.sessions.tenancy(ctx.session_id).await.map_err(|e| {
+            set_outcome(TaskOutcome::BackendError);
+            error!(error = ?e, relay.session.id = %ctx.session_id,
+                "schedule_task.session_lookup_failed");
+            ToolError::Backend(format!("schedule_task: session lookup: {e}"))
+        })?;
+
         let payload = NewScheduledTask {
             owner_agent_id: owner,
+            org_id: agent_record.org_id,
+            created_by_user_id: session_tenancy.created_by_user_id,
             name,
             prompt,
             schedule,
             next_run_at: Some(next_run_at),
         };
-        let row = match self.store.create(payload).await {
+        // Authorise + persist as the session-derived principal (the
+        // human at the DAG root). `ctx.acting_user_id` and
+        // `session_tenancy.created_by_user_id` agree under normal
+        // worker dispatch, but if the call ever arrives via a path
+        // where they diverge the row must commit under the same
+        // principal that the fire-tx will later assume — otherwise the
+        // task auths under one user and executes under another.
+        let row = match self
+            .store
+            .create_for_user(session_tenancy.created_by_user_id, payload)
+            .await
+        {
             Ok(row) => row,
             Err(ScheduledTaskError::PerAgentCapExceeded { max, .. }) => {
                 set_outcome(TaskOutcome::CapExceeded);

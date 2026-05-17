@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::auth::OrgId;
+
 use super::error::McpError;
 use super::types::{
     DiscoveredTool, McpDescription, McpServerAlias, McpServerId, McpServerRecord, McpTransport,
@@ -18,6 +20,9 @@ use super::types::{
 /// in HTTP) because the registry's own bootstrapping reaches the same trait method.
 #[derive(Debug, Clone)]
 pub struct McpServerCreate {
+    /// Owning organisation. Set by the HTTP handler from the request
+    /// principal; required because `mcp_servers.org_id` is `NOT NULL`.
+    pub org_id: OrgId,
     pub alias: McpServerAlias,
     pub config: McpTransport,
     pub description: Option<McpDescription>,
@@ -44,17 +49,34 @@ pub struct McpHealthUpdate {
 #[async_trait]
 pub trait McpServerStore: fmt::Debug + Send + Sync {
     async fn create(&self, payload: McpServerCreate) -> Result<McpServerRecord, McpError>;
+
+    /// **PRIVILEGED — cross-tenant.** Returns every row across every org.
+    /// The only legitimate caller is the registry refresher (one process-
+    /// wide task that scans every enabled server). Never call from an
+    /// HTTP handler; use a tenant-scoped raw query inside
+    /// [`crate::auth::begin_as`] instead. RLS is bypassed here.
     async fn list(&self) -> Result<Vec<McpServerRecord>, McpError>;
+
+    /// **PRIVILEGED — cross-tenant.** Same caveat as [`Self::list`].
     async fn list_enabled(&self) -> Result<Vec<McpServerRecord>, McpError>;
-    async fn read(&self, id: McpServerId) -> Result<McpServerRecord, McpError>;
+
+    async fn read(&self, id: McpServerId, org_id: OrgId) -> Result<McpServerRecord, McpError>;
+
     async fn update(
         &self,
         id: McpServerId,
+        org_id: OrgId,
         payload: McpServerUpdate,
     ) -> Result<McpServerRecord, McpError>;
-    async fn delete(&self, id: McpServerId) -> Result<(), McpError>;
-    async fn update_health(&self, id: McpServerId, health: McpHealthUpdate)
-    -> Result<(), McpError>;
+
+    async fn delete(&self, id: McpServerId, org_id: OrgId) -> Result<(), McpError>;
+
+    async fn update_health(
+        &self,
+        id: McpServerId,
+        org_id: OrgId,
+        health: McpHealthUpdate,
+    ) -> Result<(), McpError>;
 }
 
 pub type SharedMcpServerStore = Arc<dyn McpServerStore>;
@@ -86,20 +108,26 @@ pub(crate) mod test_support {
         async fn list_enabled(&self) -> Result<Vec<McpServerRecord>, McpError> {
             panic!("invariant: McpRegistry::for_test must not consult the store");
         }
-        async fn read(&self, _: McpServerId) -> Result<McpServerRecord, McpError> {
+        async fn read(&self, _: McpServerId, _: OrgId) -> Result<McpServerRecord, McpError> {
             panic!("invariant: McpRegistry::for_test must not consult the store");
         }
         async fn update(
             &self,
             _: McpServerId,
+            _: OrgId,
             _: McpServerUpdate,
         ) -> Result<McpServerRecord, McpError> {
             panic!("invariant: McpRegistry::for_test must not consult the store");
         }
-        async fn delete(&self, _: McpServerId) -> Result<(), McpError> {
+        async fn delete(&self, _: McpServerId, _: OrgId) -> Result<(), McpError> {
             panic!("invariant: McpRegistry::for_test must not consult the store");
         }
-        async fn update_health(&self, _: McpServerId, _: McpHealthUpdate) -> Result<(), McpError> {
+        async fn update_health(
+            &self,
+            _: McpServerId,
+            _: OrgId,
+            _: McpHealthUpdate,
+        ) -> Result<(), McpError> {
             panic!("invariant: McpRegistry::for_test must not consult the store");
         }
     }

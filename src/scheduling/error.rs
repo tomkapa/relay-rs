@@ -44,4 +44,11 @@ pub enum ScheduledTaskError {
 
     #[error("scheduled task store db error: {0}")]
     Db(#[from] sqlx::Error),
+
+    /// Infrastructure error not covered by the typed variants — used
+    /// for `begin_as_user` failures (auth store unreachable) so the
+    /// `_for_user` paths can surface them without a fresh enum
+    /// dependency on `AuthError`.
+    #[error("scheduled task store backend: {0}")]
+    Backend(String),
 }

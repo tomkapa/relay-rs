@@ -36,6 +36,10 @@ struct PromptsHarness {
     queue: SharedPromptQueue,
     agents: SharedAgentStore,
     state: AppState,
+    /// `Cookie:` header value carrying a valid JWT for the seeded test
+    /// principal. Threaded into every request these tests issue so the
+    /// auth layer admits them.
+    auth_cookie: String,
     #[allow(dead_code)]
     refresher: McpRefresher,
 }
@@ -75,6 +79,15 @@ impl PromptsHarness {
                 clock.clone(),
                 common::embedding::FakeEmbeddingProvider::shared(),
             ));
+        let jwt = common::auth::test_jwt(clock.clone());
+        let oauth = common::auth::test_oauth();
+        let users = common::auth::user_store(pool.clone());
+        // Pin the principal to the same org as `db.default_agent_id` so
+        // the `default_id_for(principal.active_org_id)` fallback in the
+        // route resolves to the seeded default. The cross-org isolation
+        // path is exercised in `tests/auth_agents.rs`.
+        let seeded =
+            common::auth::principal_for_default_org(db.default_user_id, db.default_org_id, &jwt);
         let state = AppState {
             queue: queue.clone(),
             leases,
@@ -87,6 +100,12 @@ impl PromptsHarness {
             mcp_refresh,
             thread_stream,
             pool,
+            jwt,
+            oauth,
+            users,
+            clock: clock.clone(),
+            cookie_secure: false,
+            memberships: std::sync::Arc::new(relay_rs::http::MembershipCache::new(clock.clone())),
         };
 
         Self {
@@ -94,6 +113,7 @@ impl PromptsHarness {
             queue,
             agents,
             state,
+            auth_cookie: seeded.cookie_header(),
             refresher,
         }
     }
@@ -101,6 +121,7 @@ impl PromptsHarness {
     async fn create_agent(&self, name: &str) -> relay_rs::agents::AgentId {
         self.agents
             .create(NewAgent {
+                org_id: self.db.default_org_id,
                 name: AgentName::try_from(name).expect("name"),
                 system_prompt: AgentSystemPrompt::try_from("test prompt").expect("prompt"),
                 description: relay_rs::agents::AgentDescription::try_from("test agent")
@@ -118,6 +139,7 @@ async fn post_json(
     state: AppState,
     uri: &str,
     body: serde_json::Value,
+    cookie: &str,
 ) -> (axum::http::StatusCode, serde_json::Value) {
     let app = router(state);
     let res = app
@@ -126,6 +148,7 @@ async fn post_json(
                 .method("POST")
                 .uri(uri)
                 .header("content-type", "application/json")
+                .header("cookie", cookie)
                 .body(axum::body::Body::from(body.to_string()))
                 .expect("request"),
         )
@@ -164,6 +187,8 @@ async fn followup_with_session_id_routes_to_session_agent() {
             parent_session: None,
             content: Prompt::try_from("hi").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-root").expect("key"),
+            org_id: h.db.default_org_id,
+            created_by_user_id: h.db.default_user_id,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
@@ -180,6 +205,7 @@ async fn followup_with_session_id_routes_to_session_agent() {
             "content": "follow-up",
             "idempotency_key": Uuid::new_v4().to_string(),
         }),
+        &h.auth_cookie,
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::ACCEPTED);
@@ -211,6 +237,7 @@ async fn followup_with_session_id_routes_to_session_agent() {
             "content": "follow-up 2",
             "idempotency_key": Uuid::new_v4().to_string(),
         }),
+        &h.auth_cookie,
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::ACCEPTED);
@@ -241,6 +268,7 @@ async fn new_session_without_agent_id_uses_default() {
             "content": "first hello",
             "idempotency_key": Uuid::new_v4().to_string(),
         }),
+        &h.auth_cookie,
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::ACCEPTED);

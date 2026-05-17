@@ -363,6 +363,13 @@ async fn fetch_item(
     payload: &NotifyPayload,
 ) -> Result<ThreadStreamItem, ThreadStreamError> {
     let chunk_seq = payload.chunk_seq();
+    // Privileged: the listener task is process-global infrastructure
+    // — one Postgres connection demuxing notifications across every
+    // tenant. RLS would otherwise filter to the (unset) anonymous
+    // role's org. HTTP-side authorization happens at the
+    // `GET /threads/{root}/stream` gate which runs `begin_as`
+    // before subscribing.
+    let mut tx = crate::auth::begin_privileged(pool).await?;
     let row: Option<(serde_json::Value, AgentId)> = sqlx::query_as(
         "SELECT prc.payload, pr.receiver_agent_id
          FROM prompt_response_chunks prc
@@ -371,8 +378,9 @@ async fn fetch_item(
     )
     .bind(payload.request_id)
     .bind(chunk_seq)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let (raw, receiver_agent_id) = row.ok_or_else(|| {
         ThreadStreamError::Backend(format!(

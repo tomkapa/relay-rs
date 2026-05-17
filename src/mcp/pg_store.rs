@@ -21,6 +21,18 @@ use super::types::{
 /// for not colliding with any other advisory lock the system uses.
 const MCP_CREATE_LOCK_KEY: i64 = 0x006D_6370_5F63_7265;
 
+/// Column list for the `McpServerRow` `FromRow` impl. Centralised so the
+/// list stays in lockstep with the struct shape across every query in
+/// this module. Macro form (vs `const &str`) so call sites can splice the
+/// projection into a `concat!`-built compile-time literal and avoid
+/// `format!`-assembled SQL (CLAUDE.md §10).
+macro_rules! mcp_row_cols {
+    () => {
+        "id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
+         discovered_tools, created_at, updated_at"
+    };
+}
+
 pub struct PgMcpServerStore {
     pool: PgPool,
     clock: SharedClock,
@@ -43,7 +55,7 @@ impl PgMcpServerStore {
     }
 
     fn now(&self) -> DateTime<Utc> {
-        DateTime::<Utc>::from(self.clock.now_wall())
+        self.clock.now_utc()
     }
 }
 
@@ -59,6 +71,7 @@ impl fmt::Debug for PgMcpServerStore {
 impl McpServerStore for PgMcpServerStore {
     async fn create(&self, payload: McpServerCreate) -> Result<McpServerRecord, McpError> {
         let McpServerCreate {
+            org_id,
             alias,
             config,
             description,
@@ -66,17 +79,23 @@ impl McpServerStore for PgMcpServerStore {
         } = payload;
         let now = self.now();
 
-        let mut tx = self.pool.begin().await?;
-        // §6: serialise the cap-check + insert window. Without this lock two concurrent
-        // creates can both observe `count == cap-1` and both insert, breaching the cap.
-        // The lock is transaction-scoped and released automatically on commit/rollback.
+        // Store-internal SQL runs privileged because the registry refresher
+        // and the HTTP handler share this trait; the per-org cap check
+        // below needs to count across the org (the RLS policy already
+        // restricts to the caller's orgs when an HTTP handler calls in
+        // through `begin_as`, but we serve both paths uniformly here).
+        // The tenant boundary is provided by the explicit `org_id`
+        // column on every row.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(MCP_CREATE_LOCK_KEY)
             .execute(&mut *tx)
             .await?;
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mcp_servers")
-            .fetch_one(&mut *tx)
-            .await?;
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mcp_servers WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&mut *tx)
+                .await?;
         let server_cap_i64 = i64::try_from(self.server_cap)
             .expect("invariant: MAX_MCP_SERVERS is a small constant that fits in i64");
         if count.0 >= server_cap_i64 {
@@ -91,10 +110,11 @@ impl McpServerStore for PgMcpServerStore {
 
         let result = sqlx::query(
             "INSERT INTO mcp_servers \
-             (id, alias, enabled, config, description, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+             (id, org_id, alias, enabled, config, description, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
         )
         .bind(id)
+        .bind(org_id)
         .bind(alias.as_str())
         .bind(enabled)
         .bind(&config_json)
@@ -110,6 +130,7 @@ impl McpServerStore for PgMcpServerStore {
 
         Ok(McpServerRecord {
             id,
+            org_id,
             alias,
             enabled,
             config,
@@ -123,53 +144,70 @@ impl McpServerStore for PgMcpServerStore {
     }
 
     async fn list(&self) -> Result<Vec<McpServerRecord>, McpError> {
-        let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
-                    discovered_tools, created_at, updated_at \
-             FROM mcp_servers ORDER BY alias ASC",
-        )
-        .fetch_all(&self.pool)
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+        let rows = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers ORDER BY alias ASC",
+        ))
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         rows.into_iter().map(McpServerRow::into_record).collect()
     }
 
     async fn list_enabled(&self) -> Result<Vec<McpServerRecord>, McpError> {
-        let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
-                    discovered_tools, created_at, updated_at \
-             FROM mcp_servers WHERE enabled = TRUE ORDER BY alias ASC",
-        )
-        .fetch_all(&self.pool)
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+        let rows = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers WHERE enabled = TRUE ORDER BY alias ASC",
+        ))
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         rows.into_iter().map(McpServerRow::into_record).collect()
     }
 
-    async fn read(&self, id: McpServerId) -> Result<McpServerRecord, McpError> {
-        let row = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
-                    discovered_tools, created_at, updated_at \
-             FROM mcp_servers WHERE id = $1",
-        )
+    async fn read(
+        &self,
+        id: McpServerId,
+        org_id: crate::auth::OrgId,
+    ) -> Result<McpServerRecord, McpError> {
+        // Privileged tx (RLS is bypassed) but the `WHERE … AND org_id = $2`
+        // makes the cross-tenant fence explicit at the query layer — even
+        // a future HTTP handler that forgets the `begin_as` pre-gate
+        // cannot fetch another org's row by id.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+        let row = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers WHERE id = $1 AND org_id = $2",
+        ))
         .bind(id)
-        .fetch_optional(&self.pool)
+        .bind(org_id)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         row.map_or_else(|| Err(McpError::NotFound(id)), McpServerRow::into_record)
     }
 
     async fn update(
         &self,
         id: McpServerId,
+        org_id: crate::auth::OrgId,
         payload: McpServerUpdate,
     ) -> Result<McpServerRecord, McpError> {
         let now = self.now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
 
-        let existing: Option<McpServerRow> = sqlx::query_as::<_, McpServerRow>(
-            "SELECT id, alias, enabled, config, description, last_seen_at, last_error, \
-                    discovered_tools, created_at, updated_at \
-             FROM mcp_servers WHERE id = $1 FOR UPDATE",
-        )
+        let existing: Option<McpServerRow> = sqlx::query_as::<_, McpServerRow>(concat!(
+            "SELECT ",
+            mcp_row_cols!(),
+            " FROM mcp_servers WHERE id = $1 AND org_id = $2 FOR UPDATE",
+        ))
         .bind(id)
+        .bind(org_id)
         .fetch_optional(&mut *tx)
         .await?;
         let existing = existing.ok_or(McpError::NotFound(id))?;
@@ -193,11 +231,12 @@ impl McpServerStore for PgMcpServerStore {
             .map_err(|e| McpError::Backend(format!("serialize transport: {e}")))?;
 
         let result = sqlx::query(
-            "UPDATE mcp_servers SET alias = $2, enabled = $3, config = $4, description = $5, \
-                                    updated_at = $6 \
-             WHERE id = $1",
+            "UPDATE mcp_servers SET alias = $3, enabled = $4, config = $5, description = $6, \
+                                    updated_at = $7 \
+             WHERE id = $1 AND org_id = $2",
         )
         .bind(id)
+        .bind(org_id)
         .bind(current.alias.as_str())
         .bind(current.enabled)
         .bind(&config_json)
@@ -212,11 +251,14 @@ impl McpServerStore for PgMcpServerStore {
         Ok(current)
     }
 
-    async fn delete(&self, id: McpServerId) -> Result<(), McpError> {
-        let res = sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
+    async fn delete(&self, id: McpServerId, org_id: crate::auth::OrgId) -> Result<(), McpError> {
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
+        let res = sqlx::query("DELETE FROM mcp_servers WHERE id = $1 AND org_id = $2")
             .bind(id)
-            .execute(&self.pool)
+            .bind(org_id)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         if res.rows_affected() == 0 {
             return Err(McpError::NotFound(id));
         }
@@ -226,6 +268,7 @@ impl McpServerStore for PgMcpServerStore {
     async fn update_health(
         &self,
         id: McpServerId,
+        org_id: crate::auth::OrgId,
         health: McpHealthUpdate,
     ) -> Result<(), McpError> {
         let discovered_json = health
@@ -235,19 +278,22 @@ impl McpServerStore for PgMcpServerStore {
             .transpose()
             .map_err(|e| McpError::Backend(format!("serialize discovered_tools: {e}")))?;
         let now = self.now();
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let res = sqlx::query(
-            "UPDATE mcp_servers SET last_seen_at = $2, last_error = $3, \
-                                    discovered_tools = COALESCE($4, discovered_tools), \
-                                    updated_at = $5 \
-             WHERE id = $1",
+            "UPDATE mcp_servers SET last_seen_at = $3, last_error = $4, \
+                                    discovered_tools = COALESCE($5, discovered_tools), \
+                                    updated_at = $6 \
+             WHERE id = $1 AND org_id = $2",
         )
         .bind(id)
+        .bind(org_id)
         .bind(health.last_seen_at)
         .bind(health.last_error.as_deref())
         .bind(discovered_json)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         if res.rows_affected() == 0 {
             return Err(McpError::NotFound(id));
         }
@@ -268,6 +314,7 @@ fn map_unique_violation(err: sqlx::Error, alias: &McpServerAlias) -> McpError {
 #[derive(sqlx::FromRow)]
 struct McpServerRow {
     id: McpServerId,
+    org_id: crate::auth::OrgId,
     alias: String,
     enabled: bool,
     config: serde_json::Value,
@@ -296,6 +343,7 @@ impl McpServerRow {
             .map_err(|e| McpError::Backend(format!("deserialize discovered: {e}")))?;
         Ok(McpServerRecord {
             id: self.id,
+            org_id: self.org_id,
             alias,
             enabled: self.enabled,
             config,

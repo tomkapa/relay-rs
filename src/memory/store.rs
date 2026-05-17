@@ -18,14 +18,15 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId};
 use crate::provider::ProviderError;
 use crate::runtime::PromptRequestId;
 use crate::types::ParseError;
 
 use super::limits::{CONTRADICTION_REASON_MAX_BYTES, VALIDATION_EVIDENCE_MAX_BYTES};
 use super::types::{
-    MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState, MutationKind,
-    MutationSourceKind,
+    ContradictionEventId, MemoryContent, MemoryEventId, MemoryId, MemoryKind, MemoryState,
+    MutationKind, MutationSourceKind,
 };
 
 /// All failure modes the memory store can surface. CLAUDE.md §12 — one error
@@ -41,6 +42,13 @@ pub enum MemoryStoreError {
     /// by the revert path against a stale id.
     #[error("memory event {id:?} not found")]
     EventNotFound { id: MemoryEventId },
+
+    /// Resolve-contradiction touched zero rows. Either the row was
+    /// already resolved, the id is unknown, or RLS filtered it out as
+    /// belonging to another tenant. Treating zero-affected as success
+    /// would silently lie to the librarian / resolution turn.
+    #[error("contradiction {0:?} not found or already resolved")]
+    ContradictionNotFound(ContradictionEventId),
 
     /// Target row exists but belongs to a different agent. Memory is
     /// per-agent and private (doc/memory.md §1.11) — a cross-agent edit is
@@ -197,6 +205,9 @@ pub struct MutationOutcome {
 pub struct MemoryRow {
     pub id: MemoryId,
     pub agent_id: AgentId,
+    /// Owning org of the parent agent, denormalised onto every row by
+    /// the tenancy retrofit (migration 17). RLS keys on it directly.
+    pub org_id: OrgId,
     pub kind: MemoryKind,
     pub content: MemoryContent,
     pub state: MemoryState,
@@ -256,6 +267,9 @@ impl MemoryEventPayload {
 pub struct MemoryEvent {
     pub id: MemoryEventId,
     pub agent_id: AgentId,
+    /// Owning org of the parent agent, denormalised onto every event by
+    /// the tenancy retrofit (migration 17).
+    pub org_id: OrgId,
     pub target_memory_id: MemoryId,
     pub source: MutationSource,
     pub created_at: DateTime<Utc>,
@@ -303,6 +317,19 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     /// Apply one mutation. Appends a journal row and updates the
     /// materialized table in a single transaction.
     async fn apply(&self, mutation: MemoryMutation) -> Result<MutationOutcome, MemoryStoreError>;
+
+    /// Tenant-scoped variant of [`Self::apply`]. Opens
+    /// `begin_as_user(acting_user_id)` so the journal +
+    /// materialized-row INSERT/UPDATE/DELETE run under the acting
+    /// principal's RLS context — a worker or tool acting on behalf
+    /// of a foreign-org user is rejected at the WITH CHECK boundary
+    /// on `agent_memories` / `memory_events`. The librarian's
+    /// cross-tenant sweeps stay on the privileged entry point.
+    async fn apply_for_user(
+        &self,
+        acting_user_id: UserId,
+        mutation: MemoryMutation,
+    ) -> Result<MutationOutcome, MemoryStoreError>;
 
     /// Snapshot every materialized row for `agent`, ordered by `created_at`
     /// ascending.
@@ -382,6 +409,16 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
         detail: Option<&str>,
     ) -> Result<MemoryRow, MemoryStoreError>;
 
+    /// Tenant-scoped variant of [`Self::record_validation`].
+    async fn record_validation_for_user(
+        &self,
+        acting_user_id: UserId,
+        agent: AgentId,
+        memory: MemoryId,
+        origin: ValidationOrigin,
+        detail: Option<&str>,
+    ) -> Result<MemoryRow, MemoryStoreError>;
+
     /// Insert a librarian-detected contradiction event for the given pair.
     /// Idempotent on `(memory_a, memory_b)` against currently-unresolved
     /// rows — duplicate insert returns the existing id.
@@ -410,6 +447,14 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     /// already-closed row a no-op.
     async fn resolve_contradiction(
         &self,
+        id: crate::memory::ContradictionEventId,
+        outcome: ResolutionOutcome,
+    ) -> Result<(), MemoryStoreError>;
+
+    /// Tenant-scoped variant of [`Self::resolve_contradiction`].
+    async fn resolve_contradiction_for_user(
+        &self,
+        acting_user_id: UserId,
         id: crate::memory::ContradictionEventId,
         outcome: ResolutionOutcome,
     ) -> Result<(), MemoryStoreError>;
@@ -443,6 +488,13 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
     /// matching rows. Bounded — `ids.len()` ≤ `MAX_MEMORIES_PER_AGENT`.
     /// Reading does NOT advance validation (doc/memory.md §1.7).
     async fn record_access(&self, ids: &[MemoryId]) -> Result<(), MemoryStoreError>;
+
+    /// Tenant-scoped variant of [`Self::record_access`].
+    async fn record_access_for_user(
+        &self,
+        acting_user_id: UserId,
+        ids: &[MemoryId],
+    ) -> Result<(), MemoryStoreError>;
 }
 
 /// One row in `contradiction_events`. Three valid shapes mirror the
@@ -454,6 +506,8 @@ pub trait MemoryStore: fmt::Debug + Send + Sync {
 pub struct ContradictionEventRow {
     pub id: crate::memory::ContradictionEventId,
     pub agent_id: AgentId,
+    /// Owning org of the parent agent, denormalised by migration 17.
+    pub org_id: OrgId,
     pub memory_a: MemoryId,
     pub memory_b: MemoryId,
     pub reason: String,

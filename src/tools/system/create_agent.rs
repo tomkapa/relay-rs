@@ -133,12 +133,10 @@ impl CreateAgentTool {
         ),
     )]
     async fn handle(&self, input: Input, ctx: &ToolCallContext) -> Result<Output, ToolError> {
-        if ctx.viewer.agent_id().is_none() {
+        let viewer_agent_id = ctx.viewer.agent_id().ok_or_else(|| {
             set_outcome(Outcome::InvalidInput);
-            return Err(ToolError::InvalidInput(
-                "create_agent: caller must be an agent".into(),
-            ));
-        }
+            ToolError::InvalidInput("create_agent: caller must be an agent".into())
+        })?;
 
         let parse = |field: &str, e: crate::types::ParseError| {
             set_outcome(Outcome::InvalidInput);
@@ -152,10 +150,21 @@ impl CreateAgentTool {
         let allowed_mcp_servers = AllowedMcpServers::try_from(input.allowed_mcp_servers)
             .map_err(|e| parse("allowed_mcp_servers", e))?;
 
+        // Hire into the calling agent's org. The viewer is always an
+        // agent (guarded above), and every agent row has a NOT NULL
+        // `org_id`, so this read is the single source of truth for which
+        // tenant the new hire belongs to.
+        let viewer_record = self.agents.read(viewer_agent_id).await.map_err(|e| {
+            set_outcome(Outcome::BackendError);
+            error!(error = ?e, event = "create_agent.viewer_lookup_failed");
+            ToolError::Backend(format!("create_agent: caller lookup: {e}"))
+        })?;
+
         // `is_default` is intentionally not on the input schema and not
         // patched here — promoting the default stays an operator action via
         // `PUT /agents/{id}`.
         let payload = NewAgent {
+            org_id: viewer_record.org_id,
             name,
             system_prompt,
             description,
@@ -167,7 +176,11 @@ impl CreateAgentTool {
         // so `AgentStoreError::Parse` from `create` can only mean an
         // internal invariant violation — let it fall through to the
         // backend-error arm with full context.
-        let record = match self.agents.create(payload).await {
+        let record = match self
+            .agents
+            .create_for_user(ctx.acting_user_id, payload)
+            .await
+        {
             Ok(r) => r,
             Err(AgentStoreError::NameTaken(taken)) => {
                 set_outcome(Outcome::NameTaken);

@@ -72,6 +72,8 @@ async fn send_message_human_publishes_agent_message_on_root_stream() {
             parent_session: None,
             content: Prompt::try_from("ping the agent").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-human").expect("key"),
+            org_id: h.default_org_id,
+            created_by_user_id: h.default_user_id,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
@@ -127,6 +129,8 @@ async fn send_message_human_keeps_tool_call_and_result_adjacent() {
             parent_session: None,
             content: Prompt::try_from("ping the agent").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-adjacent").expect("key"),
+            org_id: h.default_org_id,
+            created_by_user_id: h.default_user_id,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
@@ -200,6 +204,8 @@ async fn followup_prompt_publishes_agent_message_on_open_sink() {
             parent_session: None,
             content: Prompt::try_from("first prompt").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-first").expect("key"),
+            org_id: h.default_org_id,
+            created_by_user_id: h.default_user_id,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await
@@ -216,6 +222,8 @@ async fn followup_prompt_publishes_agent_message_on_open_sink() {
             parent_session: None,
             content: Prompt::try_from("second prompt").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("k-second").expect("key"),
+            org_id: h.default_org_id,
+            created_by_user_id: h.default_user_id,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await

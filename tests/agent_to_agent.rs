@@ -144,6 +144,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         common::pg::shared_agent_store(db.pool.clone(), clock.clone());
     let translator_record = agent_store
         .create(NewAgent {
+            org_id: db.default_org_id,
             name: AgentName::try_from("translator").expect("name"),
             system_prompt: AgentSystemPrompt::try_from(
                 "You translate phrases into French. Reply via send_message.",
@@ -256,7 +257,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         factory,
         AGENT_PROMPT_CACHE_CAP,
         AGENT_PROMPT_CACHE_TTL,
-        clock,
+        clock.clone(),
     ));
     let memory_store_for_pool: relay_rs::memory::SharedMemoryStore =
         Arc::new(relay_rs::memory::PgMemoryStore::new(
@@ -288,6 +289,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
         dag.clone(),
         db.pool.clone(),
         memory_store_for_pool,
+        clock.clone(),
         cfg,
     )
     .spawn();
@@ -311,6 +313,8 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
             parent_session: None,
             content: Prompt::try_from("translate 'hello' to French please").expect("prompt"),
             idempotency_key: IdempotencyKey::try_from("a2a-root").expect("key"),
+            org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
             kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         })
         .await

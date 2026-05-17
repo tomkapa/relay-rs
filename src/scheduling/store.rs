@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId};
 use crate::runtime::PromptRequestId;
 
 use super::error::ScheduledTaskError;
@@ -24,9 +25,19 @@ use super::types::{
 /// Server-side fields (`id`, `created_at`, `updated_at`, `state`) are
 /// minted by the store; `next_run_at` is computed by the tool boundary
 /// so the inserted row is immediately due-pollable.
+///
+/// `org_id` is the owning organisation (sourced from the calling agent's
+/// `agents.org_id`); `created_by_user_id` is the human at the DAG root
+/// of the session that produced the `schedule_task` tool call. Both are
+/// load-bearing — the scheduler reads them off the row at fire-time and
+/// pins the enqueued `prompt_requests` row to the same tenant, and the
+/// parity trigger on `scheduled_tasks` (migration 19) rejects an INSERT
+/// whose `org_id` ≠ the owning agent's org.
 #[derive(Debug, Clone)]
 pub struct NewScheduledTask {
     pub owner_agent_id: AgentId,
+    pub org_id: OrgId,
+    pub created_by_user_id: UserId,
     pub name: ScheduledTaskName,
     pub prompt: ScheduledPrompt,
     pub schedule: ScheduleSpec,
@@ -54,6 +65,18 @@ pub trait ScheduledTaskStore: fmt::Debug + Send + Sync {
         payload: NewScheduledTask,
     ) -> Result<ScheduledTaskRecord, ScheduledTaskError>;
 
+    /// Tenant-scoped variant of [`Self::create`]. Opens
+    /// `begin_as_user(acting_user_id)` so the `scheduled_tasks`
+    /// INSERT runs RLS-checked. The `schedule_task` tool sources
+    /// `acting_user_id` from the session's
+    /// `created_by_user_id`; the scheduler / HTTP paths stay on
+    /// the privileged entry point.
+    async fn create_for_user(
+        &self,
+        acting_user_id: UserId,
+        payload: NewScheduledTask,
+    ) -> Result<ScheduledTaskRecord, ScheduledTaskError>;
+
     /// Snapshot of every active task for `owner`, ordered by
     /// `created_at` ascending. Cancelled / done rows are excluded —
     /// the agent only manages its live tasks.
@@ -69,6 +92,14 @@ pub trait ScheduledTaskStore: fmt::Debug + Send + Sync {
     /// cancelled / done rows.
     async fn cancel(&self, task: ScheduledTaskId, owner: AgentId)
     -> Result<(), ScheduledTaskError>;
+
+    /// Tenant-scoped variant of [`Self::cancel`].
+    async fn cancel_for_user(
+        &self,
+        acting_user_id: UserId,
+        task: ScheduledTaskId,
+        owner: AgentId,
+    ) -> Result<(), ScheduledTaskError>;
 
     /// Read due rows for the scheduler. Plain SELECT (no row-level
     /// locking); concurrent scheduler nodes dedupe at the queue layer

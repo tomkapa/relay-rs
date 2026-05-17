@@ -268,6 +268,7 @@ mod tests {
         MemoryRow {
             id: MemoryId::new(),
             agent_id: AgentId::new(),
+            org_id: crate::auth::OrgId::new(),
             kind,
             content: MemoryContent::try_from(content).expect("valid"),
             state,

@@ -22,6 +22,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::agents::AgentId;
+use crate::auth::{AuthError, Principal};
 use crate::runtime::{
     DEFAULT_THREAD_HISTORY_LIMIT, DEFAULT_THREAD_LIST_LIMIT, MAX_THREAD_HISTORY_LIMIT,
     MAX_THREAD_LIST_LIMIT, PromptRequestId, RequestStatus, ResponseChunk, THREAD_PREVIEW_MAX_CHARS,
@@ -96,9 +97,15 @@ type ThreadRow = (
 /// `foldHistoryIntoBubbles`): one bubble per delivered `send_message` call.
 /// Plain assistant rows, system rows carrying tool_results, and the
 /// human's own prompt are conversation plumbing, not user-visible replies.
-const THREAD_LIST_SQL: &str = "WITH human_roots AS (
-    SELECT pr.id AS root_request_id
+// Filtering joins `prompt_requests` through `sessions`. Under
+// `begin_as`, `sessions` is RLS-bound to the caller's org so only
+// human roots whose conversation session belongs to the caller's org
+// pass the inner JOIN — RLS provides isolation without the SQL
+// having to name `org_id` itself.
+const THREAD_LIST_SQL: &str = "WITH visible_human_roots AS (
+    SELECT pr.id AS root_request_id, pr.session_id
     FROM prompt_requests pr
+    JOIN sessions s ON s.id = pr.session_id
     WHERE pr.id = pr.root_request_id
       AND pr.sender_kind = 'human'
 ),
@@ -110,7 +117,7 @@ thread_stats AS (
            ) AS reply_count,
            MAX(sm.created_at) AS last_msg_at
     FROM sessions s
-    JOIN human_roots hr ON hr.root_request_id = s.root_request_id
+    JOIN visible_human_roots hr ON hr.root_request_id = s.root_request_id
     LEFT JOIN session_messages sm ON sm.session_id = s.id
     GROUP BY s.root_request_id
 )
@@ -126,11 +133,10 @@ SELECT
     pr.status,
     pr.created_at
 FROM prompt_requests pr
+JOIN visible_human_roots vhr ON vhr.root_request_id = pr.id
 JOIN agents a ON a.id = pr.receiver_agent_id
 LEFT JOIN thread_stats ts ON ts.root_request_id = pr.id
-WHERE pr.id = pr.root_request_id
-  AND pr.sender_kind = 'human'
-  AND ($2::timestamptz IS NULL
+WHERE ($2::timestamptz IS NULL
        OR GREATEST(pr.created_at,
                    COALESCE(ts.last_msg_at, pr.created_at)) < $2)
 ORDER BY last_activity_at DESC
@@ -139,6 +145,7 @@ LIMIT $3";
 #[tracing::instrument(skip_all, name = "thread.list", fields(relay.thread.list.size = tracing::field::Empty))]
 async fn list_threads(
     State(state): State<AppState>,
+    principal: Principal,
     Query(q): Query<ListThreadsQuery>,
 ) -> Result<Json<Vec<ThreadSummary>>, HttpError> {
     let limit = q
@@ -148,13 +155,23 @@ async fn list_threads(
     let preview_chars = i32::try_from(THREAD_PREVIEW_MAX_CHARS)
         .expect("invariant: THREAD_PREVIEW_MAX_CHARS fits in i32");
 
+    // Tenant-scoped read: the `thread_stats` CTE joins through
+    // `sessions`, which now has an `org_id` column and an isolation
+    // policy. `begin_as` sets `app.user_id` so the policy filters to
+    // the caller's org. The `prompt_requests` retrofit lands later;
+    // until then the outer SELECT against `prompt_requests` is
+    // unfiltered, but the inner JOIN to RLS-bound `sessions` keeps the
+    // wire response tenant-scoped to roots whose conversation session
+    // the caller can see.
+    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let rows: Vec<ThreadRow> = sqlx::query_as(THREAD_LIST_SQL)
         .bind(preview_chars)
         .bind(q.before)
         .bind(i64::from(limit))
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| HttpError::Response(e.into()))?;
+        .map_err(AuthError::from)?;
+    tx.commit().await.map_err(AuthError::from)?;
 
     tracing::Span::current().record("relay.thread.list.size", rows.len());
     Ok(Json(rows.into_iter().map(thread_row_to_summary).collect()))
@@ -248,6 +265,7 @@ const THREAD_HISTORY_SQL: &str = "SELECT sm.session_id, sm.seq,
 )]
 async fn thread_messages(
     State(state): State<AppState>,
+    principal: Principal,
     Path(root): Path<Uuid>,
     Query(q): Query<ThreadMessagesQuery>,
 ) -> Result<Json<Vec<ThreadMessage>>, HttpError> {
@@ -269,14 +287,21 @@ async fn thread_messages(
         }
     };
 
+    // Tenant-scoped read: `session_messages` is RLS-bound on `org_id`
+    // so the join through `sessions` filters to rows the caller can see.
+    // A cross-org `root` id therefore yields an empty result — the same
+    // shape as "root exists but has no messages yet" — rather than
+    // leaking a 404 vs 200 distinction across orgs.
+    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let rows: Vec<HistoryRow> = sqlx::query_as(THREAD_HISTORY_SQL)
         .bind(root)
         .bind(before_ts)
         .bind(before_seq)
         .bind(i64::from(limit))
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(|e| HttpError::Response(e.into()))?;
+        .map_err(AuthError::from)?;
+    tx.commit().await.map_err(AuthError::from)?;
 
     tracing::Span::current().record("relay.thread.history.size", rows.len());
     Ok(Json(rows.into_iter().map(history_row_to_message).collect()))
@@ -303,9 +328,27 @@ fn history_row_to_message(row: HistoryRow) -> ThreadMessage {
 
 async fn stream_thread(
     State(state): State<AppState>,
+    principal: Principal,
     Path(root): Path<Uuid>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, HttpError> {
     let root = PromptRequestId::from(root);
+    // Authorisation gate: only subscribe if the caller can see *any*
+    // session in this DAG. RLS on `sessions` filters cross-org rows
+    // automatically — if the caller can't see them, the lookup returns
+    // None and we 404 cleanly without subscribing to the broadcast.
+    {
+        let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
+        let visible: Option<(SessionId,)> =
+            sqlx::query_as("SELECT id FROM sessions WHERE root_request_id = $1 LIMIT 1")
+                .bind(root)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(AuthError::from)?;
+        tx.commit().await.map_err(AuthError::from)?;
+        if visible.is_none() {
+            return Err(HttpError::NotFound);
+        }
+    }
     let inner = state.thread_stream.subscribe(root);
 
     // Per-connection monotonic cursor for the SSE `id:` header. Lossy on

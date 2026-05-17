@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agents::AgentId;
+use crate::auth::{OrgId, UserId};
 use crate::clock::SharedClock;
 use crate::provider::{AssistantContent, ChatMessage, UserContent};
 use crate::runtime::{
@@ -141,12 +142,18 @@ impl SchedulerInner {
         &self,
         cutoff: DateTime<Utc>,
     ) -> Result<Vec<ReflectionCandidate>, sqlx::Error> {
+        // Privileged tx — the scheduler scans across every tenant's
+        // agent sessions; RLS on `sessions` / `reflection_checkpoints`
+        // / `session_messages` would otherwise hide every row.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows: Vec<(
             AgentId,
             SessionId,
             PromptRequestId,
             DateTime<Utc>,
             Option<PromptRequestId>,
+            OrgId,
+            UserId,
         )> = sqlx::query_as(
             // The `seed.kind = $6` filter on the session's root prompt_request
             // keeps the scheduler off its own off-DAG reflection sessions —
@@ -154,6 +161,11 @@ impl SchedulerInner {
             // output, indefinitely, once per idle window. `seed.kind IS NULL`
             // covers test fixtures that mint a session with a synthetic
             // root_request_id; production always inserts the root row.
+            //
+            // `s.org_id` / `s.created_by_user_id` are carried out so the
+            // enqueue path can mint the reflection's off-DAG `(agent,
+            // system)` session pinned to the same tenant — the trigger
+            // on `sessions` would reject a cross-org child otherwise.
             "WITH latest_per_session AS (
                  SELECT m.session_id,
                         MAX(m.seq) AS latest_seq,
@@ -162,11 +174,13 @@ impl SchedulerInner {
                  GROUP BY m.session_id
              ),
              agent_sessions AS (
-                 SELECT id, participant_a_agent_id AS agent_id, root_request_id
+                 SELECT id, participant_a_agent_id AS agent_id, root_request_id,
+                        org_id, created_by_user_id
                  FROM sessions
                  WHERE participant_a_kind = 'agent'
                  UNION ALL
-                 SELECT id, participant_b_agent_id AS agent_id, root_request_id
+                 SELECT id, participant_b_agent_id AS agent_id, root_request_id,
+                        org_id, created_by_user_id
                  FROM sessions
                  WHERE participant_b_kind = 'agent'
              )
@@ -174,7 +188,9 @@ impl SchedulerInner {
                     a.id AS session_id,
                     sm.request_id AS last_turn_id,
                     l.latest_at,
-                    rc.last_turn_id AS previous_cursor
+                    rc.last_turn_id AS previous_cursor,
+                    a.org_id,
+                    a.created_by_user_id
              FROM agent_sessions a
              JOIN latest_per_session l ON l.session_id = a.id
              JOIN session_messages sm
@@ -201,19 +217,30 @@ impl SchedulerInner {
         .bind(RequestStatus::Pending)
         .bind(RequestStatus::Processing)
         .bind(RequestKind::Normal)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
             .map(
-                |(agent_id, session_id, last_turn_id, latest_at, previous_cursor)| {
+                |(
+                    agent_id,
+                    session_id,
+                    last_turn_id,
+                    latest_at,
+                    previous_cursor,
+                    org_id,
+                    created_by_user_id,
+                )| {
                     ReflectionCandidate {
                         agent_id,
                         session_id,
                         last_turn_id,
                         latest_at,
                         previous_cursor,
+                        org_id,
+                        created_by_user_id,
                     }
                 },
             )
@@ -248,6 +275,8 @@ impl SchedulerInner {
             parent_session: None,
             content,
             idempotency_key: key,
+            org_id: c.org_id,
+            created_by_user_id: c.created_by_user_id,
             kind_payload: RequestKindPayload::Reflection {
                 session_id: c.session_id,
                 up_to_turn_id: c.last_turn_id,
@@ -274,6 +303,9 @@ impl SchedulerInner {
         up_to: PromptRequestId,
     ) -> Result<Vec<ChatMessage>, EnqueueError> {
         let viewer_agent_id = agent.as_uuid();
+        // Privileged tx: `session_messages` is RLS-forced; the
+        // scheduler scans tenant-wide.
+        let mut tx = crate::auth::begin_privileged(&self.pool).await?;
         let rows: Vec<(Option<uuid::Uuid>, serde_json::Value)> = sqlx::query_as(
             "WITH bounds AS (
                  SELECT
@@ -298,8 +330,9 @@ impl SchedulerInner {
         .bind(conversation)
         .bind(previous_cursor)
         .bind(up_to)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for (sender_agent_id, body) in rows {
@@ -452,6 +485,13 @@ struct ReflectionCandidate {
     /// Lower end of the slice from the existing checkpoint, joined inline
     /// by `find_candidates`. `None` on the first reflection.
     previous_cursor: Option<PromptRequestId>,
+    /// Owning org of the conversation session; the reflection's off-DAG
+    /// `(agent, system)` session inherits it.
+    org_id: OrgId,
+    /// User the conversation session is attributed to. The reflection
+    /// runs against the same principal so RLS-bound reads inside the
+    /// worker turn see the right scope.
+    created_by_user_id: UserId,
 }
 
 // SQL paths are covered by `tests/reflection_pipeline.rs` against a real

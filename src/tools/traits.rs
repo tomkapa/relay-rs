@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::auth::UserId;
 use crate::runtime::{PromptRequestId, RequestKindPayload};
 use crate::session::SessionId;
 use crate::types::{Participant, ToolName};
@@ -76,6 +77,13 @@ pub struct ToolCallContext {
     /// keeps agent_core ignorant of which variants exist; new payload
     /// variants are added without touching the turn loop.
     pub kind_payload: RequestKindPayload,
+    /// Human at the DAG root of the claimed session. Threaded from the
+    /// worker pool (`ClaimedSession.created_by_user_id`) into every
+    /// tool call so the store mutations can open a `begin_as_user`
+    /// transaction and the database RLS WITH CHECK fires against the
+    /// right principal — a worker that tried to write into a foreign
+    /// org's tables would be rejected at the boundary.
+    pub acting_user_id: UserId,
 }
 
 /// A side-effecting capability the model can request.

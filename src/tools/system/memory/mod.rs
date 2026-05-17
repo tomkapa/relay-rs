@@ -159,6 +159,7 @@ pub(super) fn store_to_tool_err(e: MemoryStoreError) -> ToolError {
     match e {
         MemoryStoreError::NotFound { .. }
         | MemoryStoreError::EventNotFound { .. }
+        | MemoryStoreError::ContradictionNotFound(_)
         | MemoryStoreError::WrongAgent { .. }
         | MemoryStoreError::PinnedImmutable { .. }
         | MemoryStoreError::Parse(_) => ToolError::InvalidInput(e.to_string()),
@@ -180,7 +181,8 @@ pub(super) async fn maybe_close_resolution(
     } = &ctx.kind_payload
     {
         deps.store()
-            .resolve_contradiction(
+            .resolve_contradiction_for_user(
+                ctx.acting_user_id,
                 *contradiction_event_id,
                 ResolutionOutcome::Mutation(event_id),
             )
