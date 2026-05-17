@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 // in `bun dev`. Production (`bun build`) is unaffected.
 import { QueryClientProvider } from "@tanstack/react-query";
 import { QueryClient } from "@tanstack/query-core";
+import { BrowserRouter } from "react-router-dom";
 import { App } from "./App";
 
 const queryClient = new QueryClient();
@@ -16,7 +17,9 @@ if (!rootElement) throw new Error("invariant: #root must exist");
 createRoot(rootElement).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <BrowserRouter>
+        <App />
+      </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>,
 );

@@ -16,6 +16,7 @@ use axum::middleware;
 use tower_http::trace::TraceLayer;
 
 use super::auth_layer::require_principal;
+use super::csrf::require_csrf;
 use super::state::AppState;
 
 pub fn router(state: AppState) -> Router {
@@ -28,6 +29,11 @@ pub fn router(state: AppState) -> Router {
         .merge(memory::router())
         .merge(threads::router())
         .merge(me::router())
+        // CSRF guards every state-changing request inside the
+        // authenticated subtree. Order matters: it runs AFTER
+        // `require_principal` so the public subtree is never reached
+        // (OAuth login/callback have no cookie to compare yet).
+        .route_layer(middleware::from_fn(require_csrf))
         // route_layer is the only correct place for auth middleware —
         // applying it via `.layer` would also wrap the public subtree
         // below and reject `/auth/google/*` with 401.

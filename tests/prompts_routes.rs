@@ -149,6 +149,10 @@ async fn post_json(
                 .uri(uri)
                 .header("content-type", "application/json")
                 .header("cookie", cookie)
+                .header(
+                    relay_rs::auth::limits::CSRF_HEADER_NAME,
+                    common::auth::TEST_CSRF_TOKEN,
+                )
                 .body(axum::body::Body::from(body.to_string()))
                 .expect("request"),
         )

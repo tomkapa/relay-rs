@@ -24,6 +24,7 @@ use tracing::info;
 
 use crate::auth::{OAuthStateRow, limits::COOKIE_NAME};
 
+use super::super::csrf::{build_csrf_cookie, mint_csrf_token};
 use super::super::error::HttpError;
 use super::super::state::AppState;
 
@@ -142,8 +143,13 @@ async fn callback(
         relay.user.new = upserted.is_new_user,
     );
 
-    let cookie = build_session_cookie(token, state.cookie_secure(), state.jwt.ttl_secs());
-    let jar = jar.add(cookie);
+    let session_cookie = build_session_cookie(token, state.cookie_secure(), state.jwt.ttl_secs());
+    let csrf_cookie = build_csrf_cookie(
+        mint_csrf_token(),
+        state.cookie_secure(),
+        state.jwt.ttl_secs(),
+    );
+    let jar = jar.add(session_cookie).add(csrf_cookie);
     let dest = consumed.redirect_to.unwrap_or_else(|| "/".to_owned());
     // axum-extra: tupling a CookieJar with a Redirect produces a
     // response that carries both `Set-Cookie` and `Location` headers.

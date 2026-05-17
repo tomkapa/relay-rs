@@ -10,8 +10,12 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use cookie::time::Duration as CookieDuration;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthError, OrgId, OrgMembership, Principal, Role, User, limits::COOKIE_NAME};
+use crate::auth::{
+    AuthError, OrgId, OrgMembership, Principal, Role, User,
+    limits::{COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_TOKEN_MAX_LEN},
+};
 
+use super::super::csrf::{build_csrf_cookie, build_expired_csrf_cookie, mint_csrf_token};
 use super::super::error::HttpError;
 use super::super::state::AppState;
 use super::auth::build_session_cookie;
@@ -50,19 +54,40 @@ struct OrgView {
 async fn me(
     State(state): State<AppState>,
     principal: Principal,
-) -> Result<Json<MeResponse>, HttpError> {
+    jar: CookieJar,
+) -> Result<Response, HttpError> {
     let user = state
         .users
         .read_user(principal.user_id)
         .await?
         .ok_or(AuthError::Unauthenticated)?;
     let orgs = state.users.list_user_orgs(principal.user_id).await?;
-    Ok(Json(MeResponse {
+    // Only mint a CSRF cookie if the client doesn't already have a
+    // valid one — /me is polled, and rotating the token every poll
+    // defeats the SPA's cached value and bloats every response with a
+    // Set-Cookie. Mirror require_csrf's accept-band so a malformed
+    // cookie gets repaired instead of locking the session out of
+    // every POST.
+    let needs_csrf = jar.get(CSRF_COOKIE_NAME).is_none_or(|c| {
+        let bytes = c.value().as_bytes();
+        bytes.is_empty() || bytes.len() > CSRF_TOKEN_MAX_LEN
+    });
+    let response_jar = if needs_csrf {
+        jar.add(build_csrf_cookie(
+            mint_csrf_token(),
+            state.cookie_secure(),
+            state.jwt.ttl_secs(),
+        ))
+    } else {
+        jar
+    };
+    let body = Json(MeResponse {
         user: view_user(user),
         orgs: orgs.iter().map(view_org).collect(),
         active_org_id: principal.active_org_id,
         role: principal.role,
-    }))
+    });
+    Ok((response_jar, body).into_response())
 }
 
 fn view_user(u: User) -> UserView {
@@ -90,7 +115,9 @@ async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
     cookie.set_same_site(SameSite::Lax);
     cookie.set_secure(state.cookie_secure());
     cookie.set_max_age(CookieDuration::seconds(0));
-    let jar = jar.add(cookie);
+    let jar = jar
+        .add(cookie)
+        .add(build_expired_csrf_cookie(state.cookie_secure()));
     (StatusCode::NO_CONTENT, jar).into_response()
 }
 
@@ -111,8 +138,13 @@ async fn switch_org(
         .await?
         .ok_or(AuthError::NotMember(req.org_id))?;
     let token = state.jwt.mint(principal.user_id, req.org_id)?;
-    let cookie = build_session_cookie(token, state.cookie_secure(), state.jwt.ttl_secs());
-    let jar = jar.add(cookie);
+    let session_cookie = build_session_cookie(token, state.cookie_secure(), state.jwt.ttl_secs());
+    let csrf_cookie = build_csrf_cookie(
+        mint_csrf_token(),
+        state.cookie_secure(),
+        state.jwt.ttl_secs(),
+    );
+    let jar = jar.add(session_cookie).add(csrf_cookie);
     Ok((
         jar,
         Json(serde_json::json!({ "active_org_id": req.org_id, "role": role })),

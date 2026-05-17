@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { AtSign, Code, Hash, Paperclip, Send, Smile } from "lucide-react";
-import { Spinner } from "../atoms/Spinner";
+import { Button } from "../atoms/Button";
 import { TipBar } from "../molecules/TipBar";
 import {
   MentionInput,
@@ -140,8 +140,11 @@ export function Composer({
                 tag an agent (e.g. @{tipExample}) to send
               </span>
             )}
-            <button
+            <Button
               type="submit"
+              variant="moss"
+              size="md"
+              loading={pending}
               disabled={
                 !trimmed ||
                 pending ||
@@ -149,18 +152,14 @@ export function Composer({
                 channelBlocked ||
                 (mode === "dm" && !dmAgent)
               }
-              className="ml-auto inline-flex h-8 items-center gap-1.5 bg-[var(--color-moss)] px-3 font-[var(--font-mono)] text-[12px] font-semibold text-white hover:bg-[var(--color-moss-deep)] disabled:cursor-not-allowed disabled:opacity-40 transition-colors"
+              className="ml-auto"
             >
-              {pending ? (
-                <>
-                  <Spinner size={11} className="text-white" /> sending
-                </>
-              ) : (
+              {pending ? "sending" : (
                 <>
                   Send <Send className="h-3 w-3" strokeWidth={2.5} />
                 </>
               )}
-            </button>
+            </Button>
           </div>
         </form>
       </div>
@@ -178,13 +177,15 @@ function ToolBtn({
   children: React.ReactNode;
 }) {
   return (
-    <button
+    <Button
       type="button"
+      variant="ghost"
+      size="sm"
+      iconOnly
       aria-label={label}
       onClick={onClick}
-      className="flex h-7 w-7 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)] hover:text-[var(--color-ink)]"
     >
       {children}
-    </button>
+    </Button>
   );
 }

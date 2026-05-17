@@ -1,5 +1,6 @@
 import { memo } from "react";
 import { Check, MoreHorizontal, Smile } from "lucide-react";
+import { Button } from "../atoms/Button";
 import { Monogram } from "../atoms/Monogram";
 import { Markdown } from "../molecules/Markdown";
 import { ReplyPill } from "../molecules/ReplyPill";
@@ -89,24 +90,15 @@ export const MessageBubble = memo(function MessageBubble({
       </div>
 
       <div className="absolute right-6 top-1.5 hidden items-center gap-0.5 border border-[var(--color-line)] bg-[var(--color-card)] p-0.5 shadow-[0_1px_3px_rgba(26,43,30,0.1)] group-hover:flex">
-        <button
-          aria-label="Smile"
-          className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)] hover:text-[var(--color-ink)]"
-        >
+        <Button variant="ghost" size="xs" iconOnly aria-label="Smile">
           <Smile className="h-3.5 w-3.5" />
-        </button>
-        <button
-          aria-label="Acknowledge"
-          className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)] hover:text-[var(--color-ink)]"
-        >
+        </Button>
+        <Button variant="ghost" size="xs" iconOnly aria-label="Acknowledge">
           <Check className="h-3.5 w-3.5" />
-        </button>
-        <button
-          aria-label="More"
-          className="flex h-6 w-6 items-center justify-center text-[var(--color-muted)] hover:bg-[var(--color-paper-2)] hover:text-[var(--color-ink)]"
-        >
+        </Button>
+        <Button variant="ghost" size="xs" iconOnly aria-label="More">
           <MoreHorizontal className="h-3.5 w-3.5" />
-        </button>
+        </Button>
       </div>
     </article>
   );

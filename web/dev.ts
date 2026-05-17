@@ -29,6 +29,11 @@ const server = Bun.serve({
     "/threads/*": proxy,
     "/mcp-servers": proxy,
     "/mcp-servers/*": proxy,
+    "/me": proxy,
+    "/auth/google/login": proxy,
+    "/auth/google/callback": proxy,
+    "/auth/switch-org": proxy,
+    "/auth/logout": proxy,
     "/*": index,
   },
 });

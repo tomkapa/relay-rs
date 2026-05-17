@@ -6,7 +6,11 @@ import { MessageList } from "../components/organisms/MessageList";
 import { Sidebar } from "../components/organisms/Sidebar";
 import { ThreadPanel } from "../components/organisms/ThreadPanel";
 import { MenuRail } from "../components/organisms/MenuRail";
+import { OrgSwitcher } from "../components/organisms/OrgSwitcher";
+import { UserMenu } from "../components/organisms/UserMenu";
 import { useAgents } from "../hooks/useAgents";
+import { useActiveOrg } from "../hooks/useMe";
+import { useAuthStore } from "../stores/authStore";
 import { useThreads } from "../hooks/useThreads";
 import { useThreadStream } from "../hooks/useThreadStream";
 import { useSubmitPrompt } from "../hooks/useSubmitPrompt";
@@ -46,6 +50,8 @@ export function ChatView() {
   const agentsQ = useAgents();
   const threadsQ = useThreads();
   const submit = useSubmitPrompt();
+  const me = useAuthStore((s) => s.me);
+  const activeOrg = useActiveOrg();
   const addPending = useThreadStore((s) => s.addPending);
   const attachRequestId = useThreadStore((s) => s.attachRequestId);
   const removePending = useThreadStore((s) => s.removePending);
@@ -139,6 +145,7 @@ export function ChatView() {
       rail={<MenuRail />}
       sidebar={
         <Sidebar
+          workspace={activeOrg?.name ?? "Relay"}
           threads={threads}
           agents={agents}
           selectedChannel={selectedAgentId ? "" : CHANNEL}
@@ -151,7 +158,9 @@ export function ChatView() {
             setSelectedAgentId(id);
             setSelectedRoot(null);
           }}
-          userName={DEMO_USER.name}
+          userName={me?.user.display_name ?? me?.user.email ?? DEMO_USER.name}
+          orgSwitcher={me ? <OrgSwitcher /> : undefined}
+          userMenu={me ? <UserMenu /> : undefined}
         />
       }
       main={
@@ -163,7 +172,7 @@ export function ChatView() {
           <MessageList
             threads={visibleThreads}
             channel={selectedAgent ? `dm/${selectedAgent.name}` : CHANNEL}
-            userName={DEMO_USER.name}
+            userName={me?.user.display_name ?? me?.user.email ?? DEMO_USER.name}
             humanPoster={isDemo ? DEMO_HUMAN_POSTER : undefined}
             onOpenThread={(rootId) => {
               setSelectedRoot(rootId);

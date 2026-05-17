@@ -35,7 +35,7 @@ export function useThreadStream(rootId: string | null) {
     setStatus(rootId, "connecting");
 
     const url = `/threads/${rootId}/stream`;
-    const es = new EventSource(url);
+    const es = new EventSource(url, { withCredentials: true });
     let closed = false;
 
     es.onopen = () => {
