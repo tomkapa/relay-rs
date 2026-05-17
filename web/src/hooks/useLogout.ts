@@ -7,11 +7,13 @@ export function useLogout() {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const clearMe = useAuthStore((s) => s.clearMe);
+  const clearError = useAuthStore((s) => s.clearError);
   return useMutation({
     mutationFn: api.logout,
     onSuccess: () => {
       qc.clear();
       clearMe();
+      clearError();
       navigate("/sign-in", { replace: true });
     },
   });

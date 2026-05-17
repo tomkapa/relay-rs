@@ -19,6 +19,7 @@ export function OrgSwitcher() {
   if (!me || !activeOrg) return null;
 
   const onPick = (orgId: string) => {
+    if (switchOrg.isPending) return;
     if (orgId === me.active_org_id) {
       setOpen(false);
       return;
@@ -67,7 +68,8 @@ export function OrgSwitcher() {
                   role="option"
                   aria-selected={isActive}
                   onClick={() => onPick(org.id)}
-                  className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-[var(--color-paper-2)]"
+                  disabled={switchOrg.isPending}
+                  className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-[var(--color-paper-2)] disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <Monogram name={org.name} id={org.id} size={24} />
                   <div className="min-w-0 flex-1">

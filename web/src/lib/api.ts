@@ -21,13 +21,13 @@ export async function request<T>(
   init?: RequestInit,
 ): Promise<T> {
   const method = (init?.method ?? "GET").toUpperCase();
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    ...((init?.headers as Record<string, string> | undefined) ?? {}),
-  };
+  const headers = new Headers(init?.headers);
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
   if (!SAFE_METHODS.has(method)) {
     const csrf = readCookie(CSRF_COOKIE);
-    if (csrf) headers[CSRF_HEADER] = csrf;
+    if (csrf) headers.set(CSRF_HEADER, csrf);
   }
   const res = await fetch(path, { ...init, credentials: "include", headers });
 

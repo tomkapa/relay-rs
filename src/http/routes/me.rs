@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{
     AuthError, OrgId, OrgMembership, Principal, Role, User,
-    limits::{COOKIE_NAME, CSRF_COOKIE_NAME},
+    limits::{COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_TOKEN_MAX_LEN},
 };
 
 use super::super::csrf::{build_csrf_cookie, build_expired_csrf_cookie, mint_csrf_token};
@@ -62,10 +62,17 @@ async fn me(
         .await?
         .ok_or(AuthError::Unauthenticated)?;
     let orgs = state.users.list_user_orgs(principal.user_id).await?;
-    // Only mint a CSRF cookie if the client doesn't already have one —
-    // /me is polled, and rotating the token every poll defeats the
-    // SPA's cached value and bloats every response with a Set-Cookie.
-    let response_jar = if jar.get(CSRF_COOKIE_NAME).is_none() {
+    // Only mint a CSRF cookie if the client doesn't already have a
+    // valid one — /me is polled, and rotating the token every poll
+    // defeats the SPA's cached value and bloats every response with a
+    // Set-Cookie. Mirror require_csrf's accept-band so a malformed
+    // cookie gets repaired instead of locking the session out of
+    // every POST.
+    let needs_csrf = jar.get(CSRF_COOKIE_NAME).is_none_or(|c| {
+        let bytes = c.value().as_bytes();
+        bytes.is_empty() || bytes.len() > CSRF_TOKEN_MAX_LEN
+    });
+    let response_jar = if needs_csrf {
         jar.add(build_csrf_cookie(
             mint_csrf_token(),
             state.cookie_secure(),

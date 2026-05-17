@@ -23,7 +23,7 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use cookie::time::Duration as CookieDuration;
 use oauth2::CsrfToken;
 use thiserror::Error;
-use tracing::warn;
+use tracing::error;
 
 use crate::auth::limits::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME, CSRF_TOKEN_MAX_LEN};
 
@@ -42,7 +42,7 @@ pub(super) enum CsrfError {
 
 impl IntoResponse for CsrfError {
     fn into_response(self) -> Response {
-        warn!(event = "http.csrf.rejected", error = %self);
+        error!(event = "http.csrf.rejected", error = ?self);
         (StatusCode::FORBIDDEN, self.to_string()).into_response()
     }
 }

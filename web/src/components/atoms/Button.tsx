@@ -59,6 +59,7 @@ export const Button = forwardRef<HTMLButtonElement, BaseProps>(function Button(
       ref={ref}
       type={type}
       disabled={disabled || loading}
+      aria-busy={loading || undefined}
       className={cn(
         "inline-flex items-center justify-center gap-1.5 font-[var(--font-mono)] uppercase tracking-[0.06em] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-ink)]",
         sizing,
@@ -67,7 +68,14 @@ export const Button = forwardRef<HTMLButtonElement, BaseProps>(function Button(
       )}
       {...rest}
     >
-      {loading ? <Spinner size={12} /> : children}
+      {loading ? (
+        <>
+          <Spinner size={12} />
+          <span className="sr-only">Loading</span>
+        </>
+      ) : (
+        children
+      )}
     </button>
   );
 });
