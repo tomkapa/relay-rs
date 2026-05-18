@@ -380,8 +380,24 @@ pub struct McpServerRecord {
     /// Non-optional because the column is `NOT NULL` (pre-launch: no
     /// nullable shim per `feedback_no_backcompat`).
     pub created_by_user_id: crate::auth::UserId,
+    /// Connection status surfaced to the UI. Defaults to `Ok` on insert;
+    /// flipped to `ReconnectRequired` by the OAuth refresher when a
+    /// refresh token is finally revoked, or to `Error` for sticky
+    /// connect failures the operator should fix.
+    pub connection_status: ConnectionStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+crate::str_enum! {
+    /// Surfaced state of an MCP server's upstream connection. Each variant
+    /// is wire-stable; the column `CHECK` constraint and JSON
+    /// serialisation key off the same labels.
+    pub enum ConnectionStatus {
+        Ok                  => "ok",
+        ReconnectRequired   => "reconnect_required",
+        Error               => "error",
+    }
 }
 
 /// Tool metadata cached on the row after a successful refresh, surfaced by the

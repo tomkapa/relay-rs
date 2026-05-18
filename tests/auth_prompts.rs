@@ -108,6 +108,19 @@ impl AuthPromptsHarness {
                 std::sync::Arc::new(relay_rs::crypto::OrgEncryptor::for_test([0u8; 32])),
             )),
             mcp_test_rate: relay_rs::mcp::TestConnectRateLimiter::new(clock.clone()),
+            mcp_oauth_clients: std::sync::Arc::new(
+                relay_rs::mcp::oauth::PgMcpOAuthClientStore::new(
+                    pool.clone(),
+                    clock.clone(),
+                    std::sync::Arc::new(relay_rs::crypto::OrgEncryptor::for_test([0u8; 32])),
+                ),
+            ),
+            mcp_oauth_pending: std::sync::Arc::new(
+                relay_rs::mcp::oauth::PgMcpOAuthPendingStore::new(pool.clone(), clock.clone()),
+            ),
+            mcp_oauth_flow: relay_rs::mcp::oauth::OAuthFlowClient::new(reqwest::Client::new())
+                .expect("oauth http"),
+            oauth_redirect_base: std::sync::Arc::from("http://localhost:8080"),
             thread_stream,
             pool,
             jwt,

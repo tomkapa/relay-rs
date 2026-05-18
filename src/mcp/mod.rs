@@ -9,6 +9,7 @@ mod client;
 mod credentials;
 mod error;
 mod limits;
+pub mod oauth;
 mod pg_credentials;
 mod pg_store;
 mod rate_limit;
@@ -42,6 +43,6 @@ pub use store::{
 };
 pub use tool::McpTool;
 pub use types::{
-    DiscoveredTool, McpDescription, McpHeaderName, McpHeaderValue, McpHttpUrl, McpServerAlias,
-    McpServerId, McpServerRecord, McpTransport,
+    ConnectionStatus, DiscoveredTool, McpDescription, McpHeaderName, McpHeaderValue, McpHttpUrl,
+    McpServerAlias, McpServerId, McpServerRecord, McpTransport,
 };

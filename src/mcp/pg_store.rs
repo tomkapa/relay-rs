@@ -29,7 +29,7 @@ const MCP_CREATE_LOCK_KEY: i64 = 0x006D_6370_5F63_7265;
 macro_rules! mcp_row_cols {
     () => {
         "id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
-         discovered_tools, created_by_user_id, created_at, updated_at"
+         discovered_tools, created_by_user_id, connection_status, created_at, updated_at"
     };
 }
 
@@ -138,6 +138,7 @@ impl McpServerStore for PgMcpServerStore {
             last_error: None,
             discovered_tools: None,
             created_by_user_id,
+            connection_status: super::types::ConnectionStatus::Ok,
             created_at: now,
             updated_at: now,
         })
@@ -331,6 +332,7 @@ struct McpServerRow {
     last_error: Option<String>,
     discovered_tools: Option<serde_json::Value>,
     created_by_user_id: crate::auth::UserId,
+    connection_status: super::types::ConnectionStatus,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -361,6 +363,7 @@ impl McpServerRow {
             last_error: self.last_error,
             discovered_tools,
             created_by_user_id: self.created_by_user_id,
+            connection_status: self.connection_status,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

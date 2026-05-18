@@ -6,6 +6,7 @@ use crate::agents::SharedAgentStore;
 use crate::auth::{GoogleOAuth, JwtSigner, SharedUserStore};
 use crate::clock::SharedClock;
 use crate::http::MembershipCache;
+use crate::mcp::oauth::{OAuthFlowClient, SharedMcpOAuthClientStore, SharedMcpOAuthPendingStore};
 use crate::mcp::{
     McpRefreshTrigger, SharedMcpCredentialStore, SharedMcpServerStore, TestConnectRateLimiter,
 };
@@ -44,6 +45,18 @@ pub struct AppState {
     /// Per-user rate limiter for `POST /mcp-servers/test-connect`. Process-wide
     /// singleton shared across all handlers.
     pub mcp_test_rate: TestConnectRateLimiter,
+    /// Per-(org, issuer) registered DCR clients store. Phase C (R3).
+    pub mcp_oauth_clients: SharedMcpOAuthClientStore,
+    /// Pending-authorization rows that bridge `POST /oauth/start` →
+    /// `GET /oauth/callback`. Phase C (R3).
+    pub mcp_oauth_pending: SharedMcpOAuthPendingStore,
+    /// HTTP client bundle that drives discovery / DCR / token exchange.
+    /// Phase C (R3).
+    pub mcp_oauth_flow: OAuthFlowClient,
+    /// Public-facing base URL Relay tells vendors to redirect back to.
+    /// E.g. `https://relay.example/mcp-oauth/callback` is built by
+    /// appending the canonical path to this base.
+    pub oauth_redirect_base: std::sync::Arc<str>,
     /// Fan-in DAG stream — `GET /threads/{id}/stream` subscribes here. The
     /// owning task is held by [`Server`]; this handle is cheap to clone.
     pub thread_stream: SharedThreadStream,

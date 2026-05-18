@@ -28,6 +28,10 @@ use crate::crypto::OrgEncryptor;
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
+use crate::mcp::oauth::{
+    OAuthFlowClient, PgMcpOAuthClientStore, PgMcpOAuthPendingStore, SharedMcpOAuthClientStore,
+    SharedMcpOAuthPendingStore,
+};
 use crate::mcp::{
     McpRefresher, McpRegistry, PgMcpCredentialStore, PgMcpServerStore, ScopedMcpSource,
     SharedMcpCredentialStore, SharedMcpServerStore,
@@ -301,6 +305,9 @@ struct Collaborators {
     responses: SharedResponseSource,
     mcp_store: SharedMcpServerStore,
     mcp_credentials: SharedMcpCredentialStore,
+    mcp_oauth_clients: SharedMcpOAuthClientStore,
+    mcp_oauth_pending: SharedMcpOAuthPendingStore,
+    mcp_oauth_flow: OAuthFlowClient,
     mcp_registry: McpRegistry,
     scheduled_tasks: SharedScheduledTaskStore,
 }
@@ -391,8 +398,17 @@ impl Collaborators {
         let mcp_credentials: SharedMcpCredentialStore = Arc::new(PgMcpCredentialStore::new(
             pool.clone(),
             clock.clone(),
-            encryptor,
+            encryptor.clone(),
         ));
+        let mcp_oauth_clients: SharedMcpOAuthClientStore = Arc::new(PgMcpOAuthClientStore::new(
+            pool.clone(),
+            clock.clone(),
+            encryptor.clone(),
+        ));
+        let mcp_oauth_pending: SharedMcpOAuthPendingStore =
+            Arc::new(PgMcpOAuthPendingStore::new(pool.clone(), clock.clone()));
+        let mcp_oauth_flow = OAuthFlowClient::new(http.clone())
+            .map_err(|e| AppError::Misconfigured(format!("mcp oauth flow http: {e}")))?;
         let mcp_registry = McpRegistry::with_credentials(
             mcp_store.clone(),
             Some(mcp_credentials.clone()),
@@ -467,6 +483,9 @@ impl Collaborators {
             responses,
             mcp_store,
             mcp_credentials,
+            mcp_oauth_clients,
+            mcp_oauth_pending,
+            mcp_oauth_flow,
             mcp_registry,
             scheduled_tasks,
         })
@@ -751,6 +770,10 @@ pub async fn build_server(
         mcp_credentials: pieces.mcp_credentials,
         mcp_refresh,
         mcp_test_rate,
+        mcp_oauth_clients: pieces.mcp_oauth_clients,
+        mcp_oauth_pending: pieces.mcp_oauth_pending,
+        mcp_oauth_flow: pieces.mcp_oauth_flow,
+        oauth_redirect_base: Arc::from(settings.auth.oauth_redirect_base.as_str()),
         thread_stream,
         pool: pieces.pool.clone(),
         jwt,

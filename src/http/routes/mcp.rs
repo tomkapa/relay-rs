@@ -22,9 +22,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{AuthError, Principal};
+use crate::mcp::oauth::{
+    NewOAuthClient, OAuthError, PendingAuthorization, build_authorize_url,
+    discover_authorization_server, exchange_code, register_dynamic_client,
+};
 use crate::mcp::{
     CredentialPayload, DiscoveredTool, McpClient, McpCredentialWrite, McpDescription, McpError,
     McpServerAlias, McpServerCreate, McpServerId, McpServerRecord, McpServerUpdate, McpTransport,
+    OAuth2Payload,
 };
 
 use super::super::error::HttpError;
@@ -49,6 +54,17 @@ pub(super) fn router() -> Router<AppState> {
             "/mcp-servers/{id}/credentials",
             put(put_mcp_credentials).merge(delete(delete_mcp_credentials)),
         )
+        .route("/mcp-servers/{id}/oauth/start", post(start_oauth))
+        .route("/mcp-servers/{id}/oauth/disconnect", post(disconnect_oauth))
+}
+
+/// Public router (no auth middleware) for the OAuth callback. The browser
+/// is returning from the vendor's consent screen with `?state=&code=`;
+/// CSRF protection comes from the PKCE `state` column being a one-shot
+/// row, not the session cookie. Merged into the public subtree alongside
+/// `auth::router()`.
+pub(super) fn oauth_callback_router() -> Router<AppState> {
+    Router::new().route("/mcp-oauth/callback", get(handle_oauth_callback))
 }
 
 /// What we hand back on every CRUD response. Mirrors `mcp_servers` plus a flag
@@ -77,6 +93,9 @@ struct McpServerResponse {
     /// `None` when `has_credentials = false`; otherwise the stable
     /// `kind` label (`"static_headers"` or `"oauth2"`).
     credentials_kind: Option<String>,
+    /// Surfaced connection state — defaults to `"ok"`; the OAuth refresher
+    /// (phase D) flips it when a refresh token is revoked.
+    connection_status: crate::mcp::ConnectionStatus,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -97,6 +116,7 @@ impl McpServerResponse {
             created_by_user_id: r.created_by_user_id,
             has_credentials: credentials_kind.is_some(),
             credentials_kind,
+            connection_status: r.connection_status,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -219,7 +239,7 @@ async fn list_mcp_servers(
     let rows = sqlx::query_as::<_, McpServerRowForList>(
         "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
                 s.last_seen_at, s.last_error, s.discovered_tools, \
-                s.created_by_user_id, s.created_at, s.updated_at, \
+                s.created_by_user_id, s.connection_status, s.created_at, s.updated_at, \
                 c.kind AS credentials_kind \
          FROM mcp_servers s \
          LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
@@ -246,7 +266,7 @@ async fn read_mcp_server(
     let row = sqlx::query_as::<_, McpServerRowForList>(
         "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
                 s.last_seen_at, s.last_error, s.discovered_tools, \
-                s.created_by_user_id, s.created_at, s.updated_at, \
+                s.created_by_user_id, s.connection_status, s.created_at, s.updated_at, \
                 c.kind AS credentials_kind \
          FROM mcp_servers s \
          LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
@@ -578,6 +598,7 @@ struct McpServerRowForList {
     last_error: Option<String>,
     discovered_tools: Option<serde_json::Value>,
     created_by_user_id: crate::auth::UserId,
+    connection_status: crate::mcp::ConnectionStatus,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     credentials_kind: Option<String>,
@@ -619,8 +640,293 @@ impl McpServerRowForList {
             created_by_user_id: self.created_by_user_id,
             has_credentials: self.credentials_kind.is_some(),
             credentials_kind: self.credentials_kind,
+            connection_status: self.connection_status,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Upstream OAuth (R3 — phase C)
+// ────────────────────────────────────────────────────────────────────────
+
+const OAUTH_CALLBACK_PATH: &str = "/mcp-oauth/callback";
+/// How long a pending OAuth row stays valid. Long enough for the user to
+/// complete the consent flow even with a slow network; short enough that
+/// an abandoned row is reaped on schedule. Matches the spec's typical
+/// "10 minutes" cap.
+const OAUTH_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[derive(Debug, Deserialize)]
+struct OAuthStartRequest {
+    /// Optional path the frontend wants us to redirect back to after the
+    /// callback completes. Length-capped by the DB CHECK constraint;
+    /// path-only by convention.
+    #[serde(default)]
+    redirect_to: Option<String>,
+    /// Optional scope override. When absent we use whatever the AS
+    /// advertises as default; vendor-specific scopes can be requested by
+    /// the frontend (e.g. Notion needs `read_content read_user`).
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OAuthStartResponse {
+    authorize_url: String,
+}
+
+/// `POST /mcp-servers/{id}/oauth/start` — kick off the browser flow.
+///
+/// Steps:
+///   1. Resolve server, ensure caller is authorized for it.
+///   2. Discover authorization-server metadata (RFC 9728 + RFC 8414).
+///   3. Look up the registered DCR client for `(org, issuer)`, or
+///      register one via RFC 7591 if first time.
+///   4. Mint PKCE + state, persist the pending row.
+///   5. Build the authorize URL and hand it back.
+#[allow(clippy::too_many_lines)] // composition path — branching is what each step is
+async fn start_oauth(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    Json(body): Json<OAuthStartRequest>,
+) -> Result<Json<OAuthStartResponse>, HttpError> {
+    let server_id = McpServerId::from(id);
+
+    // Step 1: tenant gate — look up the server and ensure the caller can
+    // see it. The store read goes through `run_privileged` but the
+    // explicit org_id filter pins the row to the principal's org.
+    let server = state
+        .mcp_store
+        .read(server_id, principal.active_org_id)
+        .await
+        .map_err(HttpError::Mcp)?;
+    let McpTransport::Http { url } = &server.config;
+
+    // Step 2: discovery. Bounded by internal timeouts in
+    // `discover_authorization_server`.
+    let as_metadata = discover_authorization_server(&state.mcp_oauth_flow.http, url.as_str())
+        .await
+        .map_err(map_oauth_err)?;
+
+    // Step 3: load-or-register DCR client.
+    let redirect_uri = format!("{}{}", state.oauth_redirect_base, OAUTH_CALLBACK_PATH);
+    let dcr = if let Some(existing) = state
+        .mcp_oauth_clients
+        .read(principal.active_org_id, &as_metadata.issuer)
+        .await
+        .map_err(map_oauth_err)?
+    {
+        existing
+    } else {
+        let new: NewOAuthClient = register_dynamic_client(
+            &state.mcp_oauth_flow,
+            &as_metadata,
+            principal.active_org_id,
+            &redirect_uri,
+            body.scope.as_deref(),
+        )
+        .await
+        .map_err(map_oauth_err)?;
+        state
+            .mcp_oauth_clients
+            .upsert(new)
+            .await
+            .map_err(map_oauth_err)?
+    };
+
+    // Step 4: PKCE + state, persist pending row.
+    let start =
+        build_authorize_url(&dcr, &redirect_uri, body.scope.as_deref()).map_err(map_oauth_err)?;
+    let now = state.clock.now_utc();
+    let expires_at = now
+        + chrono::Duration::from_std(OAUTH_PENDING_TTL)
+            .expect("invariant: OAUTH_PENDING_TTL fits in chrono::Duration");
+    state
+        .mcp_oauth_pending
+        .insert(crate::mcp::oauth::PendingAuthorizationWrite {
+            state: start.state.clone(),
+            server_id,
+            user_id: principal.user_id,
+            org_id: principal.active_org_id,
+            issuer: dcr.issuer.clone(),
+            pkce_verifier: start.pkce_verifier.clone(),
+            redirect_to: body.redirect_to.clone(),
+            expires_at,
+        })
+        .await
+        .map_err(map_oauth_err)?;
+
+    Ok(Json(OAuthStartResponse {
+        authorize_url: start.authorize_url.to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// `GET /mcp-oauth/callback?code=&state=`. Runs without a session
+/// cookie — the user is bouncing back from the vendor's consent screen.
+/// CSRF protection: `state` is a one-shot row that we `DELETE …
+/// RETURNING` so a replay can't reuse it.
+async fn handle_oauth_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<OAuthCallbackQuery>,
+) -> Result<axum::response::Response, HttpError> {
+    use axum::response::IntoResponse as _;
+
+    // Vendor signalled an error (user denied, scope rejected, etc.). The
+    // pending row is still consumed below so a follow-up flow can start
+    // fresh.
+    if let Some(err) = q.error.as_deref() {
+        tracing::warn!(
+            event = "mcp.oauth.callback.vendor_error",
+            error = %err,
+            description = q.error_description.as_deref().unwrap_or(""),
+        );
+    }
+    let state_val = q
+        .state
+        .ok_or(HttpError::BadRequest("state missing".into()))?;
+    let code = q.code.ok_or(HttpError::BadRequest("code missing".into()))?;
+
+    let now = state.clock.now_utc();
+    let pending: PendingAuthorization = state
+        .mcp_oauth_pending
+        .consume(&state_val, now)
+        .await
+        .map_err(map_oauth_err)?
+        .ok_or_else(|| HttpError::BadRequest("unknown or expired state".into()))?;
+
+    let dcr = state
+        .mcp_oauth_clients
+        .read(pending.org_id, &pending.issuer)
+        .await
+        .map_err(map_oauth_err)?
+        .ok_or_else(|| HttpError::BadRequest("oauth client missing".into()))?;
+
+    let redirect_uri = format!("{}{}", state.oauth_redirect_base, OAUTH_CALLBACK_PATH);
+    let token = exchange_code(
+        &state.mcp_oauth_flow,
+        &dcr,
+        &redirect_uri,
+        &code,
+        &pending.pkce_verifier,
+        now,
+    )
+    .await
+    .map_err(map_oauth_err)?;
+
+    // Persist the freshly-issued tokens via the credentials seam.
+    let payload = CredentialPayload::Oauth2(OAuth2Payload {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_at: token.expires_at,
+        scope: token.scope,
+        issuer: token.issuer,
+        token_endpoint: token.token_endpoint,
+    });
+    state
+        .mcp_credentials
+        .upsert(McpCredentialWrite {
+            server_id: pending.server_id,
+            org_id: pending.org_id,
+            payload,
+        })
+        .await
+        .map_err(HttpError::Mcp)?;
+
+    // Flip the connection_status back to `ok` (it might have been
+    // `reconnect_required` from a prior revocation) and signal a
+    // refresh so the new token is used immediately.
+    let _ = sqlx::query(
+        "UPDATE mcp_servers SET connection_status = 'ok', last_error = NULL, \
+                                updated_at = $3 \
+         WHERE id = $1 AND org_id = $2",
+    )
+    .bind(pending.server_id)
+    .bind(pending.org_id)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "mcp.oauth.callback.status_update_failed");
+        HttpError::Internal
+    })?;
+    state.mcp_refresh.request();
+
+    // Redirect the browser back to whatever the start request asked for.
+    // Validate against the same allow-list rules as `/sign-in?return_to`
+    // so a vendor that re-encodes our params can't redirect us elsewhere.
+    let dest = pending
+        .redirect_to
+        .as_deref()
+        .filter(|s| is_safe_internal_path(s))
+        .unwrap_or("/");
+    Ok(axum::response::Redirect::to(dest).into_response())
+}
+
+#[derive(Debug, Serialize)]
+struct OAuthDisconnectResponse {
+    ok: bool,
+}
+
+async fn disconnect_oauth(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+) -> Result<Json<OAuthDisconnectResponse>, HttpError> {
+    let server_id = McpServerId::from(id);
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::McpServers,
+        server_id.as_uuid(),
+    )
+    .await?
+    {
+        return Err(HttpError::NotFound);
+    }
+    state
+        .mcp_credentials
+        .delete(server_id, principal.active_org_id)
+        .await?;
+    state.mcp_refresh.request();
+    Ok(Json(OAuthDisconnectResponse { ok: true }))
+}
+
+/// `redirect_to` allow-list: absolute paths only, no schemes, no
+/// `//host` open-redirect. Mirrors the validator on `/sign-in?return_to`.
+fn is_safe_internal_path(s: &str) -> bool {
+    if !s.starts_with('/') {
+        return false;
+    }
+    if s.starts_with("//") {
+        return false;
+    }
+    !s.contains(':')
+}
+
+fn map_oauth_err(err: OAuthError) -> HttpError {
+    match err {
+        OAuthError::InvalidState | OAuthError::Expired => HttpError::BadRequest(err.to_string()),
+        OAuthError::Discovery(_) | OAuthError::Dcr(_) | OAuthError::TokenEndpoint(_) => {
+            tracing::warn!(error = %err, "mcp.oauth.upstream_error");
+            HttpError::BadRequest(err.to_string())
+        }
+        OAuthError::RefreshRevoked => HttpError::Conflict(err.to_string()),
+        OAuthError::Crypto(_) | OAuthError::Db(_) | OAuthError::Misconfigured(_) => {
+            tracing::error!(error = %err, "mcp.oauth.internal_error");
+            HttpError::Internal
+        }
+        OAuthError::Mcp(e) => HttpError::Mcp(e),
     }
 }

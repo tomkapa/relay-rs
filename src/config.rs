@@ -78,6 +78,11 @@ pub struct AuthSettings {
     /// envelope (R2 — phase B). Base64-encoded 32 bytes. Sourced from
     /// `RELAY_MASTER_KEK`; rejected at boundary if missing or wrong size.
     pub master_kek: SecretString,
+    /// Base URL Relay tells vendors to redirect back to after consent
+    /// (R3 — phase C). The OAuth callback path is appended to this; e.g.
+    /// `http://localhost:8080` → `http://localhost:8080/mcp-oauth/callback`.
+    /// Sourced from `RELAY_OAUTH_REDIRECT_BASE`.
+    pub oauth_redirect_base: String,
 }
 
 /// Embedding-provider settings — `EMBEDDING_API_KEY` /
@@ -168,6 +173,9 @@ struct RawSettings {
     relay_cookie_secure: bool,
     // R2 envelope encryption master key, base64-encoded 32 bytes.
     relay_master_kek: SecretString,
+    // R3 upstream-OAuth redirect base URL. The MCP OAuth callback path is
+    // appended at runtime; the AS sees `{this}/mcp-oauth/callback`.
+    relay_oauth_redirect_base: String,
 }
 
 const fn default_cookie_secure() -> bool {
@@ -235,6 +243,7 @@ impl TryFrom<RawSettings> for Settings {
             google_redirect_url: raw.google_redirect_url,
             cookie_secure: raw.relay_cookie_secure,
             master_kek: raw.relay_master_kek,
+            oauth_redirect_base: raw.relay_oauth_redirect_base,
         };
         Ok(Self {
             provider,
@@ -301,6 +310,7 @@ mod tests {
             // base64 of 32 bytes; never used in these tests since they only
             // exercise the Settings boundary, not crypto.
             relay_master_kek: secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            relay_oauth_redirect_base: "http://localhost:8080".to_string(),
         }
     }
 
