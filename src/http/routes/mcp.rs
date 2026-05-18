@@ -24,14 +24,16 @@ use uuid::Uuid;
 
 use crate::auth::{AuthError, Principal};
 use crate::mcp::oauth::{
-    NewOAuthClient, OAuthError, PendingAuthorization, build_authorize_url,
-    discover_authorization_server, exchange_code, register_dynamic_client,
+    ClientProvenance, NewOAuthClient, OAuthClientId, OAuthError, PendingAuthorization,
+    TokenAuthMethod, build_authorize_url, discover_authorization_server, exchange_code,
+    register_dynamic_client,
 };
 use crate::mcp::{
     CredentialPayload, DiscoveredTool, McpClient, McpCredentialWrite, McpDescription, McpError,
     McpServerAlias, McpServerCreate, McpServerId, McpServerRecord, McpServerUpdate, McpTransport,
     OAuth2Payload,
 };
+use crate::types::SecretString;
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
@@ -57,6 +59,7 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/mcp-servers/{id}/oauth/start", post(start_oauth))
         .route("/mcp-servers/{id}/oauth/disconnect", post(disconnect_oauth))
+        .route("/mcp-servers/{id}/oauth/client", put(put_oauth_client))
 }
 
 /// Public router (no auth middleware) for the OAuth callback. The browser
@@ -696,18 +699,8 @@ async fn start_oauth(
     // Step 1: tenant gate — look up the server and ensure the caller can
     // see it. The store read goes through `run_privileged` but the
     // explicit org_id filter pins the row to the principal's org.
-    let server = state
-        .mcp_store
-        .read(server_id, principal.active_org_id)
-        .await
-        .map_err(HttpError::Mcp)?;
-    let McpTransport::Http { url } = &server.config;
-
-    // Step 2: discovery. Bounded by internal timeouts in
-    // `discover_authorization_server`.
-    let as_metadata = discover_authorization_server(&state.mcp_oauth_flow.http, url.as_str())
-        .await
-        .map_err(map_oauth_err)?;
+    let as_metadata =
+        resolve_as_metadata_for_server(&state, principal.active_org_id, server_id).await?;
 
     // Step 3: load-or-register DCR client.
     let redirect_uri = format!("{}{}", state.oauth_redirect_base, OAUTH_CALLBACK_PATH);
@@ -781,17 +774,18 @@ async fn handle_oauth_callback(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<OAuthCallbackQuery>,
 ) -> axum::response::Response {
+    let web_base = state.web_base_url.as_deref();
     match callback_flow(&state, q).await {
         Ok(redirect_to) => {
             tracing::info!(event = "mcp.oauth.callback.ok");
-            redirect_ok(redirect_to.as_deref())
+            redirect_ok(web_base, redirect_to.as_deref())
         }
         Err(CallbackFail {
             redirect_to,
             reason,
         }) => {
             tracing::info!(event = "mcp.oauth.callback.failed", reason = %reason);
-            redirect_failed(redirect_to.as_deref(), reason)
+            redirect_failed(web_base, redirect_to.as_deref(), reason)
         }
     }
 }
@@ -843,14 +837,18 @@ async fn callback_flow(
     Ok(pending.redirect_to)
 }
 
-fn redirect_ok(redirect_to: Option<&str>) -> axum::response::Response {
+fn redirect_ok(web_base: Option<&str>, redirect_to: Option<&str>) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    Redirect::to(&ok_redirect(redirect_to)).into_response()
+    Redirect::to(&ok_redirect(web_base, redirect_to)).into_response()
 }
 
-fn redirect_failed(redirect_to: Option<&str>, reason: &str) -> axum::response::Response {
+fn redirect_failed(
+    web_base: Option<&str>,
+    redirect_to: Option<&str>,
+    reason: &str,
+) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    Redirect::to(&failed_redirect(redirect_to, reason)).into_response()
+    Redirect::to(&failed_redirect(web_base, redirect_to, reason)).into_response()
 }
 
 /// Convert a vendor `error` query token into our short reason key. Anything
@@ -1040,16 +1038,22 @@ async fn consume_pending_for_redirect(state: &AppState, raw_state: Option<&str>)
 /// caller-supplied `redirect_to` if it survives `sanitize_return_to`
 /// (relative path, ≤2048 bytes); otherwise `/`. A `status=ok` marker is
 /// appended so the FE polling loop terminates immediately on first nav.
-fn ok_redirect(redirect_to: Option<&str>) -> String {
-    let base = sanitized_base(redirect_to);
+///
+/// When `web_base` is `Some(origin)` (set via `RELAY_WEB_BASE_URL` for
+/// cross-origin dev where FE and BE live on different ports), the origin
+/// is prepended so the browser lands on the FE host. The path itself
+/// stays relative via `sanitize_return_to`, preserving open-redirect
+/// protection — only operator config can change the origin.
+fn ok_redirect(web_base: Option<&str>, redirect_to: Option<&str>) -> String {
+    let base = sanitized_base(web_base, redirect_to);
     append_query(&base, "status=ok")
 }
 
 /// Build the failed-callback redirect URL. Same allow-list as
 /// [`ok_redirect`]; appends `status=failed` plus a sanitized short
 /// `reason` token so the FE Failed frame can branch on it.
-fn failed_redirect(redirect_to: Option<&str>, reason: &str) -> String {
-    let base = sanitized_base(redirect_to);
+fn failed_redirect(web_base: Option<&str>, redirect_to: Option<&str>, reason: &str) -> String {
+    let base = sanitized_base(web_base, redirect_to);
     let safe_reason = sanitize_reason(reason);
     append_query(
         &base,
@@ -1057,10 +1061,14 @@ fn failed_redirect(redirect_to: Option<&str>, reason: &str) -> String {
     )
 }
 
-fn sanitized_base(redirect_to: Option<&str>) -> String {
-    redirect_to
+fn sanitized_base(web_base: Option<&str>, redirect_to: Option<&str>) -> String {
+    let path = redirect_to
         .and_then(super::auth::sanitize_return_to)
-        .unwrap_or_else(|| "/".to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+    match web_base {
+        Some(origin) => format!("{origin}{path}"),
+        None => path,
+    }
 }
 
 fn append_query(base: &str, kv: &str) -> String {
@@ -1137,6 +1145,159 @@ async fn disconnect_oauth(
     Ok(Json(OAuthDisconnectResponse { ok: true }))
 }
 
+/// Boundary input for `PUT /mcp-servers/{id}/oauth/client`. Length caps
+/// and the secret↔method cross-field invariant are enforced by the
+/// smart-constructor for [`OAuthClientCredentials`]; the handler does
+/// not branch on the relation after that point.
+#[derive(Debug, Deserialize)]
+struct OAuthClientRequest {
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    token_endpoint_auth_method: Option<TokenAuthMethod>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OAuthClientResponse {
+    issuer: String,
+    client_id: String,
+    token_endpoint_auth_method: TokenAuthMethod,
+    scope: Option<String>,
+}
+
+/// Parsed credentials. Constructing this is the only path that produces
+/// a coherent (secret, method) pair.
+#[derive(Debug)]
+enum OAuthClientCredentials {
+    Public,
+    Confidential {
+        secret: SecretString,
+        method: TokenAuthMethod,
+    },
+}
+
+impl OAuthClientCredentials {
+    const SECRET_MAX_BYTES: usize = 4 * 1024;
+
+    const fn method(&self) -> TokenAuthMethod {
+        match self {
+            Self::Public => TokenAuthMethod::None,
+            Self::Confidential { method, .. } => *method,
+        }
+    }
+
+    fn into_secret(self) -> Option<SecretString> {
+        match self {
+            Self::Public => None,
+            Self::Confidential { secret, .. } => Some(secret),
+        }
+    }
+
+    fn parse(
+        raw_secret: Option<String>,
+        raw_method: Option<TokenAuthMethod>,
+    ) -> Result<Self, &'static str> {
+        match (raw_secret, raw_method) {
+            (None, None | Some(TokenAuthMethod::None)) => Ok(Self::Public),
+            (None, Some(_)) => {
+                Err("client_secret required for the selected token_endpoint_auth_method")
+            }
+            (Some(_), Some(TokenAuthMethod::None)) => {
+                Err("token_endpoint_auth_method=none is incompatible with client_secret")
+            }
+            (Some(s), method) => {
+                if s.is_empty() || s.len() > Self::SECRET_MAX_BYTES {
+                    return Err("client_secret length out of range");
+                }
+                let secret = SecretString::try_from(s).map_err(|_| "client_secret rejected")?;
+                Ok(Self::Confidential {
+                    secret,
+                    method: method.unwrap_or(TokenAuthMethod::ClientSecretBasic),
+                })
+            }
+        }
+    }
+}
+
+const OAUTH_SCOPE_MAX_BYTES: usize = 2 * 1024;
+
+/// `PUT /mcp-servers/{id}/oauth/client` — register or replace an
+/// operator-supplied OAuth client for vendors that do not implement RFC
+/// 7591 Dynamic Client Registration. Runs discovery so the AS endpoints
+/// we store stay in lockstep with what `start_oauth` resolves at flow
+/// time.
+async fn put_oauth_client(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    Json(body): Json<OAuthClientRequest>,
+) -> Result<Json<OAuthClientResponse>, HttpError> {
+    let server_id = McpServerId::from(id);
+    let client_id = OAuthClientId::try_from(body.client_id).map_err(HttpError::Parse)?;
+    let credentials =
+        OAuthClientCredentials::parse(body.client_secret, body.token_endpoint_auth_method)
+            .map_err(|m| HttpError::BadRequest(m.to_owned()))?;
+    if let Some(s) = body.scope.as_deref()
+        && s.len() > OAUTH_SCOPE_MAX_BYTES
+    {
+        return Err(HttpError::BadRequest("scope too large".into()));
+    }
+
+    let as_metadata =
+        resolve_as_metadata_for_server(&state, principal.active_org_id, server_id).await?;
+    let method = credentials.method();
+    let new = NewOAuthClient {
+        org_id: principal.active_org_id,
+        issuer: as_metadata.issuer.clone(),
+        client_id: client_id.into_inner(),
+        client_secret: credentials.into_secret(),
+        authorization_endpoint: as_metadata.authorization_endpoint,
+        token_endpoint: as_metadata.token_endpoint,
+        token_endpoint_auth_method: method,
+        scope: body.scope,
+        provenance: ClientProvenance::Operator,
+    };
+    let stored = state
+        .mcp_oauth_clients
+        .upsert(new)
+        .await
+        .map_err(map_oauth_err)?;
+    tracing::info!(
+        relay.org.id = %principal.active_org_id,
+        relay.oauth.issuer = %stored.issuer,
+        relay.mcp.server.id = %server_id,
+        event = "mcp.oauth.client.operator_set",
+    );
+    Ok(Json(OAuthClientResponse {
+        issuer: stored.issuer,
+        client_id: stored.client_id,
+        token_endpoint_auth_method: stored.token_endpoint_auth_method,
+        scope: stored.scope,
+    }))
+}
+
+/// Tenant-gate a server, then run discovery against its HTTP URL.
+/// Shared by every OAuth handler that needs the same `AsMetadata`
+/// `start_oauth` would resolve.
+async fn resolve_as_metadata_for_server(
+    state: &AppState,
+    org_id: crate::auth::OrgId,
+    server_id: McpServerId,
+) -> Result<crate::mcp::oauth::AsMetadata, HttpError> {
+    let server = state
+        .mcp_store
+        .read(server_id, org_id)
+        .await
+        .map_err(HttpError::Mcp)?;
+    let url = server.config.http_url();
+    discover_authorization_server(&state.mcp_oauth_flow.http, url.as_str())
+        .await
+        .map_err(map_oauth_err)
+}
+
 fn map_oauth_err(err: OAuthError) -> HttpError {
     match err {
         OAuthError::InvalidState | OAuthError::Expired => HttpError::BadRequest(err.to_string()),
@@ -1159,13 +1320,13 @@ mod tests {
 
     #[test]
     fn ok_redirect_uses_root_when_caller_omitted_path() {
-        assert_eq!(ok_redirect(None), "/?status=ok");
+        assert_eq!(ok_redirect(None, None), "/?status=ok");
     }
 
     #[test]
     fn ok_redirect_appends_status_to_safe_path() {
         assert_eq!(
-            ok_redirect(Some("/connections/oauth-callback?server_id=abc")),
+            ok_redirect(None, Some("/connections/oauth-callback?server_id=abc")),
             "/connections/oauth-callback?server_id=abc&status=ok"
         );
     }
@@ -1174,27 +1335,66 @@ mod tests {
     #[test]
     fn ok_redirect_rejects_absolute_url() {
         assert_eq!(
-            ok_redirect(Some("https://attacker.example/steal")),
+            ok_redirect(None, Some("https://attacker.example/steal")),
             "/?status=ok"
         );
     }
 
     #[test]
     fn ok_redirect_rejects_protocol_relative_url() {
-        assert_eq!(ok_redirect(Some("//attacker.example")), "/?status=ok");
+        assert_eq!(ok_redirect(None, Some("//attacker.example")), "/?status=ok");
+    }
+
+    #[test]
+    fn ok_redirect_prepends_web_base_when_set() {
+        assert_eq!(
+            ok_redirect(
+                Some("http://localhost:5173"),
+                Some("/connections/oauth-callback?server_id=abc"),
+            ),
+            "http://localhost:5173/connections/oauth-callback?server_id=abc&status=ok"
+        );
+    }
+
+    #[test]
+    fn ok_redirect_with_web_base_still_clamps_user_supplied_origin() {
+        // The `redirect_to` is still constrained to a relative path, so
+        // only the operator-controlled `web_base` decides the origin.
+        assert_eq!(
+            ok_redirect(
+                Some("http://localhost:5173"),
+                Some("https://attacker.example/steal"),
+            ),
+            "http://localhost:5173/?status=ok"
+        );
     }
 
     #[test]
     fn failed_redirect_lowercases_and_escapes_reason() {
         assert_eq!(
-            failed_redirect(None, "Access Denied!"),
+            failed_redirect(None, None, "Access Denied!"),
             "/?status=failed&reason=access_denied_"
         );
     }
 
     #[test]
     fn failed_redirect_falls_back_when_reason_is_empty() {
-        assert_eq!(failed_redirect(None, ""), "/?status=failed&reason=unknown");
+        assert_eq!(
+            failed_redirect(None, None, ""),
+            "/?status=failed&reason=unknown"
+        );
+    }
+
+    #[test]
+    fn failed_redirect_prepends_web_base_when_set() {
+        assert_eq!(
+            failed_redirect(
+                Some("http://localhost:5173"),
+                Some("/connections/oauth-callback?server_id=abc"),
+                "access_denied",
+            ),
+            "http://localhost:5173/connections/oauth-callback?server_id=abc&status=failed&reason=access_denied"
+        );
     }
 
     #[test]

@@ -57,6 +57,10 @@ pub struct AppState {
     /// E.g. `https://relay.example/mcp-oauth/callback` is built by
     /// appending the canonical path to this base.
     pub oauth_redirect_base: std::sync::Arc<str>,
+    /// Origin of the SPA (e.g. `http://localhost:5173` in dev). When
+    /// `Some`, prepended to the post-OAuth-callback redirect so the
+    /// browser leaves the BE host. `None` for same-origin deployments.
+    pub web_base_url: Option<std::sync::Arc<str>>,
     /// Fan-in DAG stream — `GET /threads/{id}/stream` subscribes here. The
     /// owning task is held by [`Server`]; this handle is cheap to clone.
     pub thread_stream: SharedThreadStream,

@@ -29,6 +29,9 @@ pub enum SettingsError {
 
     #[error("auth: jwt secret too short — need at least 32 bytes")]
     AuthSecretTooShort,
+
+    #[error("auth: RELAY_WEB_BASE_URL is not a valid origin: {raw:?} ({reason})")]
+    InvalidWebBaseUrl { raw: String, reason: &'static str },
 }
 
 /// Process-wide configuration loaded once at startup. Secrets are wrapped in
@@ -83,6 +86,12 @@ pub struct AuthSettings {
     /// `http://localhost:8080` → `http://localhost:8080/mcp-oauth/callback`.
     /// Sourced from `RELAY_OAUTH_REDIRECT_BASE`.
     pub oauth_redirect_base: String,
+    /// Origin of the SPA (e.g. `http://localhost:5173` in dev). When set,
+    /// the BE prepends this to the post-OAuth-callback redirect so the
+    /// browser lands on the FE host instead of the BE host. Empty in
+    /// same-origin prod deployments where BE and FE share an origin.
+    /// Sourced from `RELAY_WEB_BASE_URL`.
+    pub web_base_url: Option<String>,
 }
 
 /// Embedding-provider settings — `EMBEDDING_API_KEY` /
@@ -176,10 +185,39 @@ struct RawSettings {
     // R3 upstream-OAuth redirect base URL. The MCP OAuth callback path is
     // appended at runtime; the AS sees `{this}/mcp-oauth/callback`.
     relay_oauth_redirect_base: String,
+    // Optional SPA origin. When set, the BE prepends this to the
+    // post-OAuth-callback redirect so the browser lands on the FE host
+    // instead of the BE host (dev: FE on Vite/Bun, BE on 8080).
+    #[serde(default)]
+    relay_web_base_url: Option<String>,
 }
 
 const fn default_cookie_secure() -> bool {
     true
+}
+
+/// Validate and normalize `RELAY_WEB_BASE_URL`: must be an absolute http(s)
+/// URL with no path component and no trailing slash so callers can
+/// prepend it directly to a `/`-anchored route.
+fn parse_web_base_url(raw: &str) -> Result<String, SettingsError> {
+    let parsed = url::Url::parse(raw).map_err(|_| SettingsError::InvalidWebBaseUrl {
+        raw: raw.to_owned(),
+        reason: "not a valid url",
+    })?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(SettingsError::InvalidWebBaseUrl {
+            raw: raw.to_owned(),
+            reason: "scheme must be http or https",
+        });
+    }
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return Err(SettingsError::InvalidWebBaseUrl {
+            raw: raw.to_owned(),
+            reason: "must be an origin with no path",
+        });
+    }
+    let trimmed = raw.trim_end_matches('/').to_owned();
+    Ok(trimmed)
 }
 
 fn default_timezone_raw() -> String {
@@ -236,6 +274,10 @@ impl TryFrom<RawSettings> for Settings {
         if raw.relay_jwt_secret.expose().len() < 32 {
             return Err(SettingsError::AuthSecretTooShort);
         }
+        let web_base_url = match raw.relay_web_base_url {
+            Some(raw_url) => Some(parse_web_base_url(&raw_url)?),
+            None => None,
+        };
         let auth = AuthSettings {
             jwt_secret: raw.relay_jwt_secret,
             google_client_id: raw.google_client_id,
@@ -244,6 +286,7 @@ impl TryFrom<RawSettings> for Settings {
             cookie_secure: raw.relay_cookie_secure,
             master_kek: raw.relay_master_kek,
             oauth_redirect_base: raw.relay_oauth_redirect_base,
+            web_base_url,
         };
         Ok(Self {
             provider,
@@ -311,6 +354,7 @@ mod tests {
             // exercise the Settings boundary, not crypto.
             relay_master_kek: secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
             relay_oauth_redirect_base: "http://localhost:8080".to_string(),
+            relay_web_base_url: None,
         }
     }
 

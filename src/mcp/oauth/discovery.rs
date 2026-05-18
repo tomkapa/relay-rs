@@ -14,6 +14,7 @@
 //! memory or stall the handler.
 
 use reqwest::Client;
+use reqwest::header::WWW_AUTHENTICATE;
 use serde::Deserialize;
 use tokio::time::timeout;
 use url::Url;
@@ -27,6 +28,10 @@ const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// usually < 2KB; we cap at 32KB to leave room for `scopes_supported`
 /// lists.
 const DISCOVERY_MAX_BYTES: usize = 32 * 1024;
+
+/// Max bytes we'll scan from a single `WWW-Authenticate` challenge header.
+/// Real challenges are < 512B; cap at 4KB to fend off header bombs.
+const DISCOVERY_HEADER_MAX_BYTES: usize = 4 * 1024;
 
 /// Output of [`discover_authorization_server`] — exactly what the OAuth
 /// flow + DCR need to proceed.
@@ -82,18 +87,28 @@ pub async fn discover_authorization_server(
     let server =
         Url::parse(server_url).map_err(|e| OAuthError::Discovery(format!("server url: {e}")))?;
     let resource_metadata_url = join_well_known(&server, ".well-known/oauth-protected-resource")?;
-    let issuer = fetch_protected_resource_issuer(http, &resource_metadata_url)
-        .await
-        .map_err(|first_err| {
-            // The 401-probe fallback (parse `WWW-Authenticate: Bearer
-            // resource_metadata=…`) is left as a follow-up; real upstream
-            // MCP vendors today (Notion, Linear) advertise the well-known.
+    let issuer = match fetch_protected_resource_issuer(http, &resource_metadata_url).await {
+        Ok(iss) => iss,
+        Err(first_err) => {
             tracing::debug!(
                 error = %first_err,
-                "mcp.oauth.discover.resource_metadata_failed"
+                "mcp.oauth.discover.resource_metadata_failed; trying 401 probe"
             );
-            first_err
-        })?;
+            // RFC 9728 §5.1 fallback: probe the resource URL unauthenticated,
+            // parse `WWW-Authenticate: Bearer resource_metadata=…`, retry hop 1
+            // against the URL the challenge points at. Exactly one extra hop.
+            let probed = match probe_resource_metadata_url(http, &server).await {
+                Ok(u) => u,
+                Err(probe_err) => {
+                    tracing::debug!(error = %probe_err, "mcp.oauth.discover.probe_failed");
+                    // Surface the original well-known error: it's the more
+                    // actionable signal for an operator reading logs.
+                    return Err(first_err);
+                }
+            };
+            fetch_protected_resource_issuer(http, &probed).await?
+        }
+    };
 
     // Hop 2: AS metadata.
     let issuer_url =
@@ -101,24 +116,58 @@ pub async fn discover_authorization_server(
     let as_metadata_url = join_well_known(&issuer_url, ".well-known/oauth-authorization-server")?;
     let raw = fetch_json::<AsMetadataJson>(http, &as_metadata_url).await?;
 
-    // The AS metadata must echo back the issuer it sits at; mismatch
-    // means the resource is pointing us at a server that isn't the
-    // issuer it claims to be (RFC 8414 §2.4 mitigation).
-    if raw.issuer != issuer {
-        return Err(OAuthError::Discovery(format!(
-            "issuer mismatch: resource says {issuer}, AS metadata says {}",
-            raw.issuer
-        )));
-    }
+    // RFC 8414 §2.4 says the AS metadata MUST echo back the URL it
+    // sits at. Some real-world ASes deliberately delegate, so we accept
+    // exactly one hop: if the first document self-claims a different
+    // issuer, re-fetch at that issuer's origin and require *that* one
+    // to self-identify. Anti-issuer-confusion is preserved by the
+    // second-hop self-check.
+    let raw = if raw.issuer == issuer {
+        raw
+    } else {
+        chase_delegated_issuer(http, &issuer, raw).await?
+    };
+    let final_issuer = raw.issuer.clone();
 
     Ok(AsMetadata {
-        issuer: raw.issuer,
+        issuer: final_issuer,
         authorization_endpoint: raw.authorization_endpoint,
         token_endpoint: raw.token_endpoint,
         registration_endpoint: raw.registration_endpoint,
         scopes_supported: raw.scopes_supported,
         token_endpoint_auth_methods_supported: raw.token_endpoint_auth_methods_supported,
     })
+}
+
+/// One-shot delegated-issuer chase. Given the first AS metadata document
+/// claims a different `issuer` than the URL we fetched it from, re-fetch
+/// the well-known at the claimed issuer's origin and require that one
+/// to self-identify with the claimed issuer. No looping — exactly one
+/// extra hop. Returns the re-fetched (self-consistent) metadata.
+async fn chase_delegated_issuer(
+    http: &Client,
+    original_issuer: &str,
+    first: AsMetadataJson,
+) -> Result<AsMetadataJson, OAuthError> {
+    let claimed = first.issuer.clone();
+    tracing::info!(
+        relay.oauth.discovered_issuer = %original_issuer,
+        relay.oauth.claimed_issuer = %claimed,
+        "mcp.oauth.discover.issuer_delegation_chase",
+    );
+    let claimed_url = Url::parse(&claimed)
+        .map_err(|e| OAuthError::Discovery(format!("delegated issuer url: {e}")))?;
+    let next_url = join_well_known(&claimed_url, ".well-known/oauth-authorization-server")?;
+    let raw2 = fetch_json::<AsMetadataJson>(http, &next_url).await?;
+    if raw2.issuer != claimed {
+        return Err(OAuthError::Discovery(format!(
+            "issuer mismatch after one delegation hop: \
+             resource says {original_issuer}, first AS says {claimed}, \
+             second AS says {}",
+            raw2.issuer
+        )));
+    }
+    Ok(raw2)
 }
 
 async fn fetch_protected_resource_issuer(http: &Client, url: &Url) -> Result<String, OAuthError> {
@@ -171,4 +220,244 @@ fn join_well_known(base: &Url, path: &str) -> Result<Url, OAuthError> {
     s.push('/');
     s.push_str(path);
     Url::parse(&s).map_err(|e| OAuthError::Discovery(format!("join {path}: {e}")))
+}
+
+/// Probe the MCP server with an unauthenticated GET and pull the
+/// `resource_metadata` URL out of the `WWW-Authenticate: Bearer` challenge
+/// (RFC 9728 §5.1). One request, one timeout, no retries — the caller is
+/// responsible for falling back exactly once.
+async fn probe_resource_metadata_url(http: &Client, server_url: &Url) -> Result<Url, OAuthError> {
+    let req = http.get(server_url.clone()).send();
+    let resp = timeout(DISCOVERY_TIMEOUT, req)
+        .await
+        .map_err(|_| OAuthError::Discovery("probe timed out".into()))?
+        .map_err(|e| OAuthError::Discovery(format!("probe http: {e}")))?;
+    for value in resp.headers().get_all(WWW_AUTHENTICATE) {
+        let Ok(raw) = value.to_str() else { continue };
+        // `get(..N)` returns `None` when `N` falls on a non-char boundary;
+        // fall back to the full string in that case rather than panicking
+        // from a `&raw[..N]` slice.
+        let bounded = raw.get(..DISCOVERY_HEADER_MAX_BYTES).unwrap_or(raw);
+        if let Some(extracted) = parse_resource_metadata_param(bounded) {
+            return Url::parse(&extracted)
+                .map_err(|e| OAuthError::Discovery(format!("probe: resource_metadata url: {e}")));
+        }
+    }
+    Err(OAuthError::Discovery(
+        "no WWW-Authenticate Bearer resource_metadata in challenge".into(),
+    ))
+}
+
+/// Scan one `WWW-Authenticate` header value for a `Bearer` challenge
+/// containing `resource_metadata=<url>` and return the URL string.
+///
+/// Hand-rolled single-pass scanner — no regex, no allocations beyond the
+/// returned `String`. Accepts quoted-string and token68 parameter forms
+/// (RFC 7235 §2.1) and is case-insensitive on the scheme name (RFC 9110
+/// §11.1). Multiple comma-separated challenges are handled by tracking
+/// which scheme is currently "in scope".
+fn parse_resource_metadata_param(header: &str) -> Option<String> {
+    let bytes = header.as_bytes();
+    let mut i = 0;
+    let mut in_bearer = false;
+
+    while i < bytes.len() {
+        // Skip whitespace and commas between params/challenges.
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Read a token (scheme name or param name).
+        let tok_start = i;
+        while i < bytes.len() && is_tchar(bytes[i]) {
+            i += 1;
+        }
+        if i == tok_start {
+            // Unexpected byte; skip it to make forward progress.
+            i += 1;
+            continue;
+        }
+        let tok = &header[tok_start..i];
+
+        // Skip linear whitespace after the token.
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+
+        if i < bytes.len() && bytes[i] == b'=' {
+            // It's a parameter: `name=value`.
+            i += 1;
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            let value = read_param_value(bytes, &mut i)?;
+            if in_bearer && tok.eq_ignore_ascii_case("resource_metadata") {
+                return Some(value);
+            }
+        } else {
+            // It's a scheme name introducing a new challenge.
+            in_bearer = tok.eq_ignore_ascii_case("Bearer");
+        }
+    }
+    None
+}
+
+/// Consume a `quoted-string` or `token` starting at `*i`. Returns the
+/// inner value (quotes stripped, backslash escapes resolved). Advances
+/// `*i` past the value. Returns `None` on malformed input.
+fn read_param_value(bytes: &[u8], i: &mut usize) -> Option<String> {
+    if *i >= bytes.len() {
+        return None;
+    }
+    if bytes[*i] == b'"' {
+        *i += 1;
+        let mut out = String::new();
+        while *i < bytes.len() {
+            let b = bytes[*i];
+            if b == b'\\' && *i + 1 < bytes.len() {
+                out.push(char::from(bytes[*i + 1]));
+                *i += 2;
+                continue;
+            }
+            if b == b'"' {
+                *i += 1;
+                return Some(out);
+            }
+            out.push(char::from(b));
+            *i += 1;
+        }
+        // Unterminated quote.
+        None
+    } else {
+        let start = *i;
+        while *i < bytes.len() && is_token68_char(bytes[*i]) {
+            *i += 1;
+        }
+        if *i == start {
+            return None;
+        }
+        // token68 chars are all ASCII; from_utf8 is total here.
+        core::str::from_utf8(&bytes[start..*i])
+            .ok()
+            .map(str::to_owned)
+    }
+}
+
+/// RFC 7230 `tchar`: printable ASCII minus separators.
+const fn is_tchar(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+        | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+}
+
+/// RFC 7235 token68: ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" /
+/// "=" with optional trailing "=" padding. We accept ":" too because real
+/// URLs in token form include it (e.g. `https://...`).
+const fn is_token68_char(b: u8) -> bool {
+    matches!(b,
+        b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b':'
+        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_resource_metadata_param;
+
+    #[test]
+    fn parses_bare_resource_metadata_quoted() {
+        let h = r#"Bearer resource_metadata="https://x.test/.well-known/oauth-protected-resource""#;
+        assert_eq!(
+            parse_resource_metadata_param(h).as_deref(),
+            Some("https://x.test/.well-known/oauth-protected-resource"),
+        );
+    }
+
+    #[test]
+    fn parses_with_realm_and_other_params() {
+        let h = r#"Bearer realm="x", error="invalid_token", resource_metadata="https://x.test/y""#;
+        assert_eq!(
+            parse_resource_metadata_param(h).as_deref(),
+            Some("https://x.test/y"),
+        );
+    }
+
+    #[test]
+    fn parses_when_basic_challenge_precedes_bearer() {
+        let h = r#"Basic realm="x", Bearer resource_metadata="https://x.test/y""#;
+        assert_eq!(
+            parse_resource_metadata_param(h).as_deref(),
+            Some("https://x.test/y"),
+        );
+    }
+
+    #[test]
+    fn parses_token68_unquoted_value() {
+        let h = "Bearer resource_metadata=https://x.test/y";
+        assert_eq!(
+            parse_resource_metadata_param(h).as_deref(),
+            Some("https://x.test/y"),
+        );
+    }
+
+    #[test]
+    fn scheme_name_is_case_insensitive() {
+        let h = r#"bearer resource_metadata="https://x.test/y""#;
+        assert_eq!(
+            parse_resource_metadata_param(h).as_deref(),
+            Some("https://x.test/y"),
+        );
+    }
+
+    #[test]
+    fn param_name_is_case_insensitive() {
+        let h = r#"Bearer Resource_Metadata="https://x.test/y""#;
+        assert_eq!(
+            parse_resource_metadata_param(h).as_deref(),
+            Some("https://x.test/y"),
+        );
+    }
+
+    #[test]
+    fn returns_none_when_param_missing() {
+        let h = r#"Bearer realm="x", error="invalid_token""#;
+        assert!(parse_resource_metadata_param(h).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_only_basic_challenge() {
+        let h = r#"Basic realm="x", charset="UTF-8""#;
+        assert!(parse_resource_metadata_param(h).is_none());
+    }
+
+    #[test]
+    fn ignores_resource_metadata_under_non_bearer_scheme() {
+        // Param attached to Basic should not satisfy a Bearer match.
+        let h = r#"Basic resource_metadata="https://nope.test/", Bearer realm="x""#;
+        assert!(parse_resource_metadata_param(h).is_none());
+    }
+
+    #[test]
+    fn returns_none_for_empty_and_garbage_input() {
+        assert!(parse_resource_metadata_param("").is_none());
+        assert!(parse_resource_metadata_param("   ").is_none());
+        assert!(parse_resource_metadata_param("not a challenge").is_none());
+    }
+
+    #[test]
+    fn handles_unterminated_quoted_value_without_panic() {
+        let h = r#"Bearer resource_metadata="https://x.test/y"#;
+        assert!(parse_resource_metadata_param(h).is_none());
+    }
+
+    #[test]
+    fn resolves_backslash_escape_in_quoted_value() {
+        let h = r#"Bearer resource_metadata="https://x.test/\"y\"""#;
+        assert_eq!(
+            parse_resource_metadata_param(h).as_deref(),
+            Some(r#"https://x.test/"y""#),
+        );
+    }
 }

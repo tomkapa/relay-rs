@@ -188,10 +188,12 @@ pub async fn register_dynamic_client(
         client_secret,
         authorization_endpoint: as_metadata.authorization_endpoint.clone(),
         token_endpoint: as_metadata.token_endpoint.clone(),
-        registration_client_uri: raw.registration_client_uri,
-        registration_access_token,
         token_endpoint_auth_method: auth_method,
         scope: scope.map(str::to_owned),
+        provenance: super::store::ClientProvenance::Dcr {
+            registration_client_uri: raw.registration_client_uri,
+            registration_access_token,
+        },
     })
 }
 

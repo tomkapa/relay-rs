@@ -13,7 +13,7 @@ use crate::types::SecretString;
 
 use super::errors::OAuthError;
 use super::store::{
-    DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
+    ClientProvenance, DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
     PendingAuthorization, PendingAuthorizationWrite, TokenAuthMethod,
 };
 
@@ -37,76 +37,80 @@ impl fmt::Debug for PgMcpOAuthClientStore {
     }
 }
 
+/// `ON CONFLICT` fragment selected by [`ClientProvenance`]. DCR rows are
+/// insert-or-return (no-op assignment forces RETURNING for the existing
+/// row); operator rows fully overwrite and force `registration_*` NULL.
+/// Kept as a `&'static str` so the SQL string is composed once at
+/// monomorphization time, not per call.
+const ON_CONFLICT_DCR_KEEP: &str =
+    "ON CONFLICT (org_id, issuer) DO UPDATE SET issuer = mcp_oauth_clients.issuer";
+const ON_CONFLICT_OPERATOR_OVERWRITE: &str = "ON CONFLICT (org_id, issuer) DO UPDATE SET \
+        client_id = EXCLUDED.client_id, \
+        authorization_endpoint = EXCLUDED.authorization_endpoint, \
+        token_endpoint = EXCLUDED.token_endpoint, \
+        registration_client_uri = NULL, \
+        registration_access_token_ciphertext = NULL, \
+        registration_access_token_nonce = NULL, \
+        client_secret_ciphertext = EXCLUDED.client_secret_ciphertext, \
+        client_secret_nonce = EXCLUDED.client_secret_nonce, \
+        key_version = EXCLUDED.key_version, \
+        token_endpoint_auth_method = EXCLUDED.token_endpoint_auth_method, \
+        scope = EXCLUDED.scope";
+
 #[async_trait]
 impl McpOAuthClientStore for PgMcpOAuthClientStore {
     async fn upsert(&self, new: NewOAuthClient) -> Result<DcrClientRecord, OAuthError> {
-        // Seal secret + registration access token under the org KEK.
-        let (secret_cipher, secret_nonce) = match new.client_secret.as_ref() {
-            Some(s) => {
-                let blob = self.enc.seal(new.org_id, s.expose().as_bytes())?;
-                (Some(blob.ciphertext), Some(blob.nonce.to_vec()))
-            }
-            None => (None, None),
+        let (rcu, rat, on_conflict) = match &new.provenance {
+            ClientProvenance::Dcr {
+                registration_client_uri,
+                registration_access_token,
+            } => (
+                registration_client_uri.as_deref(),
+                registration_access_token.as_ref(),
+                ON_CONFLICT_DCR_KEEP,
+            ),
+            ClientProvenance::Operator => (None, None, ON_CONFLICT_OPERATOR_OVERWRITE),
         };
-        let (rat_cipher, rat_nonce) = match new.registration_access_token.as_ref() {
-            Some(s) => {
-                let blob = self.enc.seal(new.org_id, s.expose().as_bytes())?;
-                (Some(blob.ciphertext), Some(blob.nonce.to_vec()))
-            }
-            None => (None, None),
-        };
+        let (secret_cipher, secret_nonce) =
+            seal_optional(&self.enc, new.org_id, new.client_secret.as_ref())?;
+        let (rat_cipher, rat_nonce) = seal_optional(&self.enc, new.org_id, rat)?;
         let now = self.clock.now_utc();
         let key_version = crate::crypto::CURRENT_KEY_VERSION;
-
-        // `ON CONFLICT … DO UPDATE SET issuer = issuer` is the canonical
-        // idiom for "insert or return existing"; the no-op assignment
-        // forces RETURNING to fire for the existing row too. This keeps
-        // DCR idempotent for the (org, issuer) tuple — re-registering
-        // for the same vendor returns the row that won.
+        let sql = format!(
+            "INSERT INTO mcp_oauth_clients \
+             (org_id, issuer, client_id, authorization_endpoint, token_endpoint, \
+              registration_client_uri, registration_access_token_ciphertext, \
+              registration_access_token_nonce, client_secret_ciphertext, \
+              client_secret_nonce, key_version, token_endpoint_auth_method, scope, \
+              created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             {on_conflict} \
+             RETURNING org_id, issuer, client_id, authorization_endpoint, \
+                       token_endpoint, client_secret_ciphertext, client_secret_nonce, \
+                       key_version, token_endpoint_auth_method, scope",
+        );
         let row =
             crate::auth::run_privileged::<OAuthClientRow, OAuthError>(&self.pool, async |tx| {
-                Ok(sqlx::query_as::<_, OAuthClientRow>(
-                    "INSERT INTO mcp_oauth_clients \
-                     (org_id, issuer, client_id, authorization_endpoint, token_endpoint, \
-                      registration_client_uri, registration_access_token_ciphertext, \
-                      registration_access_token_nonce, client_secret_ciphertext, \
-                      client_secret_nonce, key_version, token_endpoint_auth_method, scope, \
-                      created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-                     ON CONFLICT (org_id, issuer) DO UPDATE SET issuer = mcp_oauth_clients.issuer \
-                     RETURNING org_id, issuer, client_id, authorization_endpoint, \
-                               token_endpoint, client_secret_ciphertext, client_secret_nonce, \
-                               key_version, token_endpoint_auth_method, scope",
-                )
-                .bind(new.org_id)
-                .bind(&new.issuer)
-                .bind(&new.client_id)
-                .bind(&new.authorization_endpoint)
-                .bind(&new.token_endpoint)
-                .bind(new.registration_client_uri.as_deref())
-                .bind(rat_cipher.as_deref())
-                .bind(rat_nonce.as_deref())
-                .bind(secret_cipher.as_deref())
-                .bind(secret_nonce.as_deref())
-                .bind(key_version)
-                .bind(new.token_endpoint_auth_method)
-                .bind(new.scope.as_deref())
-                .bind(now)
-                .fetch_one(&mut **tx)
-                .await?)
+                Ok(sqlx::query_as::<_, OAuthClientRow>(&sql)
+                    .bind(new.org_id)
+                    .bind(&new.issuer)
+                    .bind(&new.client_id)
+                    .bind(&new.authorization_endpoint)
+                    .bind(&new.token_endpoint)
+                    .bind(rcu)
+                    .bind(rat_cipher.as_deref())
+                    .bind(rat_nonce.as_deref())
+                    .bind(secret_cipher.as_deref())
+                    .bind(secret_nonce.as_deref())
+                    .bind(key_version)
+                    .bind(new.token_endpoint_auth_method)
+                    .bind(new.scope.as_deref())
+                    .bind(now)
+                    .fetch_one(&mut **tx)
+                    .await?)
             })
             .await?;
-        let client_secret = row.decode_client_secret(&self.enc)?;
-        Ok(DcrClientRecord {
-            org_id: row.org_id,
-            issuer: row.issuer,
-            client_id: row.client_id,
-            client_secret,
-            authorization_endpoint: row.authorization_endpoint,
-            token_endpoint: row.token_endpoint,
-            token_endpoint_auth_method: row.token_endpoint_auth_method,
-            scope: row.scope,
-        })
+        row.into_record(&self.enc)
     }
 
     async fn read(
@@ -130,19 +134,26 @@ impl McpOAuthClientStore for PgMcpOAuthClientStore {
             },
         )
         .await?;
-        let Some(row) = row else { return Ok(None) };
-        let client_secret = row.decode_client_secret(&self.enc)?;
-        Ok(Some(DcrClientRecord {
-            org_id: row.org_id,
-            issuer: row.issuer,
-            client_id: row.client_id,
-            client_secret,
-            authorization_endpoint: row.authorization_endpoint,
-            token_endpoint: row.token_endpoint,
-            token_endpoint_auth_method: row.token_endpoint_auth_method,
-            scope: row.scope,
-        }))
+        row.map(|r| r.into_record(&self.enc)).transpose()
     }
+}
+
+/// Pair of (ciphertext, nonce) bytes for an optional `SecretString`
+/// column. Tuple is concrete so the call site stays readable; the
+/// inner `Option`s pair the column nullability invariant (both NULL or
+/// both set), enforced by the schema's CHECK clauses.
+type SealedColumn = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn seal_optional(
+    enc: &SharedOrgEncryptor,
+    org: OrgId,
+    plaintext: Option<&SecretString>,
+) -> Result<SealedColumn, OAuthError> {
+    let Some(s) = plaintext else {
+        return Ok((None, None));
+    };
+    let blob = enc.seal(org, s.expose().as_bytes())?;
+    Ok((Some(blob.ciphertext), Some(blob.nonce.to_vec())))
 }
 
 #[derive(sqlx::FromRow)]
@@ -160,6 +171,20 @@ struct OAuthClientRow {
 }
 
 impl OAuthClientRow {
+    fn into_record(self, enc: &SharedOrgEncryptor) -> Result<DcrClientRecord, OAuthError> {
+        let client_secret = self.decode_client_secret(enc)?;
+        Ok(DcrClientRecord {
+            org_id: self.org_id,
+            issuer: self.issuer,
+            client_id: self.client_id,
+            client_secret,
+            authorization_endpoint: self.authorization_endpoint,
+            token_endpoint: self.token_endpoint,
+            token_endpoint_auth_method: self.token_endpoint_auth_method,
+            scope: self.scope,
+        })
+    }
+
     fn decode_client_secret(
         &self,
         enc: &SharedOrgEncryptor,
