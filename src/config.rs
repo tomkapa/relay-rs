@@ -75,11 +75,11 @@ pub struct AuthSettings {
     /// else.
     pub cookie_secure: bool,
     /// Master KEK used to derive per-org KEKs for the MCP credentials
-    /// envelope (R2 — phase B). Base64-encoded 32 bytes. Sourced from
-    /// `RELAY_MASTER_KEK`; rejected at boundary if missing or wrong size.
+    /// envelope. Base64-encoded 32 bytes; rejected at the boundary if
+    /// missing or wrong size. Sourced from `RELAY_MASTER_KEK`.
     pub master_kek: SecretString,
-    /// Base URL Relay tells vendors to redirect back to after consent
-    /// (R3 — phase C). The OAuth callback path is appended to this; e.g.
+    /// Base URL Relay tells vendors to redirect back to after consent.
+    /// The OAuth callback path is appended to this; e.g.
     /// `http://localhost:8080` → `http://localhost:8080/mcp-oauth/callback`.
     /// Sourced from `RELAY_OAUTH_REDIRECT_BASE`.
     pub oauth_redirect_base: String,

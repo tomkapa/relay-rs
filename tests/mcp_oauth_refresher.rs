@@ -59,7 +59,7 @@ async fn refresh_failure_with_no_refresh_token_flips_status() {
             token_endpoint: "http://127.0.0.1:1/token".into(), // unreachable
             registration_client_uri: None,
             registration_access_token: None,
-            token_endpoint_auth_method: "none".into(),
+            token_endpoint_auth_method: relay_rs::mcp::oauth::TokenAuthMethod::None,
             scope: None,
         })
         .await

@@ -14,7 +14,7 @@ use crate::types::SecretString;
 use super::errors::OAuthError;
 use super::store::{
     DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
-    PendingAuthorization, PendingAuthorizationWrite,
+    PendingAuthorization, PendingAuthorizationWrite, TokenAuthMethod,
 };
 
 pub struct PgMcpOAuthClientStore {
@@ -58,44 +58,55 @@ impl McpOAuthClientStore for PgMcpOAuthClientStore {
         let now = self.clock.now_utc();
         let key_version = crate::crypto::CURRENT_KEY_VERSION;
 
-        // Try insert; if (org_id, issuer) already exists, return the
-        // existing row. This is the "idempotent DCR" stance the trait
-        // describes — re-registering for the same vendor is a no-op.
-        crate::auth::run_privileged::<(), OAuthError>(&self.pool, async |tx| {
-            sqlx::query(
-                "INSERT INTO mcp_oauth_clients \
-                 (org_id, issuer, client_id, authorization_endpoint, token_endpoint, \
-                  registration_client_uri, registration_access_token_ciphertext, \
-                  registration_access_token_nonce, client_secret_ciphertext, \
-                  client_secret_nonce, key_version, token_endpoint_auth_method, scope, \
-                  created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-                 ON CONFLICT (org_id, issuer) DO NOTHING",
-            )
-            .bind(new.org_id)
-            .bind(&new.issuer)
-            .bind(&new.client_id)
-            .bind(&new.authorization_endpoint)
-            .bind(&new.token_endpoint)
-            .bind(new.registration_client_uri.as_deref())
-            .bind(rat_cipher.as_deref())
-            .bind(rat_nonce.as_deref())
-            .bind(secret_cipher.as_deref())
-            .bind(secret_nonce.as_deref())
-            .bind(key_version)
-            .bind(&new.token_endpoint_auth_method)
-            .bind(new.scope.as_deref())
-            .bind(now)
-            .execute(&mut **tx)
+        // `ON CONFLICT … DO UPDATE SET issuer = issuer` is the canonical
+        // idiom for "insert or return existing"; the no-op assignment
+        // forces RETURNING to fire for the existing row too. This keeps
+        // DCR idempotent for the (org, issuer) tuple — re-registering
+        // for the same vendor returns the row that won.
+        let row =
+            crate::auth::run_privileged::<OAuthClientRow, OAuthError>(&self.pool, async |tx| {
+                Ok(sqlx::query_as::<_, OAuthClientRow>(
+                    "INSERT INTO mcp_oauth_clients \
+                     (org_id, issuer, client_id, authorization_endpoint, token_endpoint, \
+                      registration_client_uri, registration_access_token_ciphertext, \
+                      registration_access_token_nonce, client_secret_ciphertext, \
+                      client_secret_nonce, key_version, token_endpoint_auth_method, scope, \
+                      created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                     ON CONFLICT (org_id, issuer) DO UPDATE SET issuer = mcp_oauth_clients.issuer \
+                     RETURNING org_id, issuer, client_id, authorization_endpoint, \
+                               token_endpoint, client_secret_ciphertext, client_secret_nonce, \
+                               key_version, token_endpoint_auth_method, scope",
+                )
+                .bind(new.org_id)
+                .bind(&new.issuer)
+                .bind(&new.client_id)
+                .bind(&new.authorization_endpoint)
+                .bind(&new.token_endpoint)
+                .bind(new.registration_client_uri.as_deref())
+                .bind(rat_cipher.as_deref())
+                .bind(rat_nonce.as_deref())
+                .bind(secret_cipher.as_deref())
+                .bind(secret_nonce.as_deref())
+                .bind(key_version)
+                .bind(new.token_endpoint_auth_method)
+                .bind(new.scope.as_deref())
+                .bind(now)
+                .fetch_one(&mut **tx)
+                .await?)
+            })
             .await?;
-            Ok(())
+        let client_secret = row.decode_client_secret(&self.enc)?;
+        Ok(DcrClientRecord {
+            org_id: row.org_id,
+            issuer: row.issuer,
+            client_id: row.client_id,
+            client_secret,
+            authorization_endpoint: row.authorization_endpoint,
+            token_endpoint: row.token_endpoint,
+            token_endpoint_auth_method: row.token_endpoint_auth_method,
+            scope: row.scope,
         })
-        .await?;
-        // Always re-read so we surface the *winning* row when the insert
-        // raced with another caller.
-        self.read(new.org_id, &new.issuer)
-            .await?
-            .ok_or_else(|| OAuthError::Misconfigured("oauth client vanished after upsert".into()))
     }
 
     async fn read(
@@ -144,7 +155,7 @@ struct OAuthClientRow {
     client_secret_ciphertext: Option<Vec<u8>>,
     client_secret_nonce: Option<Vec<u8>>,
     key_version: i16,
-    token_endpoint_auth_method: String,
+    token_endpoint_auth_method: TokenAuthMethod,
     scope: Option<String>,
 }
 

@@ -1,4 +1,4 @@
-//! Upstream-vendor OAuth 2.0 plumbing for MCP servers (R3).
+//! Upstream-vendor OAuth 2.0 plumbing for MCP servers.
 //!
 //! Three concerns, one module:
 //!   1. **Discovery** — given an MCP server URL, find the authorization
@@ -33,4 +33,5 @@ pub use refresher::{OAUTH_REFRESH_SKEW, OAuthRefresher, RefresherDeps, SharedOAu
 pub use store::{
     DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
     PendingAuthorizationWrite, SharedMcpOAuthClientStore, SharedMcpOAuthPendingStore,
+    TokenAuthMethod,
 };

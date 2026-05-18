@@ -762,10 +762,6 @@ pub async fn build_server(
     let memberships = Arc::new(crate::http::MembershipCache::new(pieces.clock.clone()));
     let mcp_test_rate = crate::mcp::TestConnectRateLimiter::new(pieces.clock.clone());
 
-    // OAuth refresher: scans every minute for `oauth2` credentials whose
-    // access tokens expire within `OAUTH_REFRESH_SKEW` and refreshes
-    // them. On `invalid_grant` flips `connection_status =
-    // 'reconnect_required'` (R3).
     let oauth_redirect_uri = format!(
         "{}{}",
         settings.auth.oauth_redirect_base, "/mcp-oauth/callback"

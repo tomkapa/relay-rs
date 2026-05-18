@@ -1,4 +1,4 @@
-//! Sensitive credential payloads for MCP servers (R2).
+//! Sensitive credential payloads for MCP servers.
 //!
 //! Lives outside `McpTransport` so the seam between "URL/config (plaintext)"
 //! and "secret material (envelope-encrypted)" is enforced by construction.
@@ -94,9 +94,8 @@ pub struct McpCredentialRecord {
 #[async_trait]
 pub trait McpCredentialStore: fmt::Debug + Send + Sync {
     /// Insert or replace the credential row for `server_id`. The previous
-    /// ciphertext is overwritten in a single statement so the old plaintext
-    /// is never reconstructed in this code path (R2 — replacement must not
-    /// expose the old value).
+    /// ciphertext is overwritten in a single statement; replacement must
+    /// not expose the old value, so we never read it back first.
     async fn upsert(&self, write: McpCredentialWrite) -> Result<(), McpError>;
 
     /// Delete the credential row for `server_id`. Idempotent — deleting a

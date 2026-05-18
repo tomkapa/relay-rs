@@ -18,6 +18,17 @@ use crate::types::SecretString;
 
 use super::errors::OAuthError;
 
+crate::str_enum! {
+    /// Token-endpoint authentication method as defined by RFC 7591 §2.
+    /// The DB CHECK constraint and the wire format both key off these
+    /// labels; adding a method is a one-line edit.
+    pub enum TokenAuthMethod {
+        None              => "none",
+        ClientSecretBasic => "client_secret_basic",
+        ClientSecretPost  => "client_secret_post",
+    }
+}
+
 /// New OAuth-client record from a DCR response, ready to persist.
 /// Holds plaintext secrets briefly — the store seals them before INSERT.
 #[derive(Debug, Clone)]
@@ -30,7 +41,7 @@ pub struct NewOAuthClient {
     pub token_endpoint: String,
     pub registration_client_uri: Option<String>,
     pub registration_access_token: Option<SecretString>,
-    pub token_endpoint_auth_method: String,
+    pub token_endpoint_auth_method: TokenAuthMethod,
     pub scope: Option<String>,
 }
 
@@ -43,7 +54,7 @@ pub struct DcrClientRecord {
     pub client_secret: Option<SecretString>,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
-    pub token_endpoint_auth_method: String,
+    pub token_endpoint_auth_method: TokenAuthMethod,
     pub scope: Option<String>,
 }
 

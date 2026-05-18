@@ -44,7 +44,7 @@ async fn oauth_client_upsert_then_read_returns_decrypted_secret() {
             token_endpoint: "https://issuer.example/token".into(),
             registration_client_uri: None,
             registration_access_token: None,
-            token_endpoint_auth_method: "client_secret_basic".into(),
+            token_endpoint_auth_method: relay_rs::mcp::oauth::TokenAuthMethod::ClientSecretBasic,
             scope: Some("read write".into()),
         })
         .await
@@ -82,7 +82,7 @@ async fn oauth_client_upsert_is_idempotent_per_issuer() {
             token_endpoint: "https://issuer.example/token".into(),
             registration_client_uri: None,
             registration_access_token: None,
-            token_endpoint_auth_method: "client_secret_basic".into(),
+            token_endpoint_auth_method: relay_rs::mcp::oauth::TokenAuthMethod::ClientSecretBasic,
             scope: None,
         })
         .await
@@ -98,7 +98,7 @@ async fn oauth_client_upsert_is_idempotent_per_issuer() {
             token_endpoint: "https://issuer.example/token".into(),
             registration_client_uri: None,
             registration_access_token: None,
-            token_endpoint_auth_method: "client_secret_basic".into(),
+            token_endpoint_auth_method: relay_rs::mcp::oauth::TokenAuthMethod::ClientSecretBasic,
             scope: None,
         })
         .await

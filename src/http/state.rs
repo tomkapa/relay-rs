@@ -45,13 +45,12 @@ pub struct AppState {
     /// Per-user rate limiter for `POST /mcp-servers/test-connect`. Process-wide
     /// singleton shared across all handlers.
     pub mcp_test_rate: TestConnectRateLimiter,
-    /// Per-(org, issuer) registered DCR clients store. Phase C (R3).
+    /// Per-(org, issuer) registered DCR clients store.
     pub mcp_oauth_clients: SharedMcpOAuthClientStore,
     /// Pending-authorization rows that bridge `POST /oauth/start` →
-    /// `GET /oauth/callback`. Phase C (R3).
+    /// `GET /oauth/callback`.
     pub mcp_oauth_pending: SharedMcpOAuthPendingStore,
     /// HTTP client bundle that drives discovery / DCR / token exchange.
-    /// Phase C (R3).
     pub mcp_oauth_flow: OAuthFlowClient,
     /// Public-facing base URL Relay tells vendors to redirect back to.
     /// E.g. `https://relay.example/mcp-oauth/callback` is built by

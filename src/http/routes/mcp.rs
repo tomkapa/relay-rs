@@ -70,11 +70,10 @@ pub(super) fn oauth_callback_router() -> Router<AppState> {
 /// What we hand back on every CRUD response. Mirrors `mcp_servers` plus a flag
 /// telling the operator whether the row is currently exposed by the live registry.
 ///
-/// **Never carries credential plaintext.** Phase B (R2) moves all secret
-/// material into the encrypted `mcp_server_credentials` table; the wire
-/// shape surfaces only "are credentials set?" + "what kind?", so the UI can
-/// render a state badge without the backend ever echoing the secret value
-/// back to the caller (R2 — credentials must not appear in API responses).
+/// **Never carries credential plaintext.** Secrets live in the encrypted
+/// `mcp_server_credentials` table; the wire shape surfaces only "are
+/// credentials set?" + "what kind?", so the UI can render a state badge
+/// without the backend ever echoing the secret value back to the caller.
 #[derive(Debug, Serialize)]
 struct McpServerResponse {
     id: McpServerId,
@@ -356,9 +355,8 @@ async fn delete_mcp_server(
 }
 
 /// PUT `/mcp-servers/{id}/credentials` — replace (or insert) the credential
-/// row for `id`. The body shape matches [`CredentialInput`]. Always writes
-/// fresh ciphertext; the old plaintext is never reconstructed (R2 —
-/// replacement must not expose the old credential).
+/// row for `id`. Always writes fresh ciphertext without reading the old
+/// one back, so a replacement cannot expose the prior credential.
 async fn put_mcp_credentials(
     State(state): State<AppState>,
     principal: Principal,
@@ -523,10 +521,9 @@ async fn test_connect_mcp_server(
     };
 
     let McpTransport::Http { url, .. } = &payload.config;
-    let alias_prefix = "test"; // No alias on a test-connect; we still need a
-    // stable prefix for any rendered tool name. Frontends ignore the prefix —
-    // the names are only here so the UI can render "found N tools" alongside
-    // their remote names. Using a fixed prefix avoids leaking real aliases.
+    // Fixed prefix on test-connect: we have no alias yet, and using one of
+    // the user's real aliases would leak it through the rendered name.
+    let alias_prefix = "test";
 
     let listed = match client.list_tools().await {
         Ok(t) => t,
@@ -648,7 +645,7 @@ impl McpServerRowForList {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Upstream OAuth (R3 — phase C)
+// Upstream OAuth
 // ────────────────────────────────────────────────────────────────────────
 
 const OAUTH_CALLBACK_PATH: &str = "/mcp-oauth/callback";
@@ -863,15 +860,15 @@ async fn handle_oauth_callback(
     })?;
     state.mcp_refresh.request();
 
-    // Redirect the browser back to whatever the start request asked for.
-    // Validate against the same allow-list rules as `/sign-in?return_to`
-    // so a vendor that re-encodes our params can't redirect us elsewhere.
+    // A vendor that re-encodes our params can't turn this into an
+    // open-redirect: every candidate goes through the same allow-list
+    // as `/sign-in?return_to`.
     let dest = pending
         .redirect_to
         .as_deref()
-        .filter(|s| is_safe_internal_path(s))
-        .unwrap_or("/");
-    Ok(axum::response::Redirect::to(dest).into_response())
+        .and_then(super::auth::sanitize_return_to)
+        .unwrap_or_else(|| "/".to_owned());
+    Ok(axum::response::Redirect::to(&dest).into_response())
 }
 
 #[derive(Debug, Serialize)]
@@ -901,18 +898,6 @@ async fn disconnect_oauth(
         .await?;
     state.mcp_refresh.request();
     Ok(Json(OAuthDisconnectResponse { ok: true }))
-}
-
-/// `redirect_to` allow-list: absolute paths only, no schemes, no
-/// `//host` open-redirect. Mirrors the validator on `/sign-in?return_to`.
-fn is_safe_internal_path(s: &str) -> bool {
-    if !s.starts_with('/') {
-        return false;
-    }
-    if s.starts_with("//") {
-        return false;
-    }
-    !s.contains(':')
 }
 
 fn map_oauth_err(err: OAuthError) -> HttpError {

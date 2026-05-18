@@ -21,11 +21,10 @@ use crate::types::SecretString;
 
 use super::discovery::AsMetadata;
 use super::errors::OAuthError;
-use super::store::NewOAuthClient;
+use super::store::{NewOAuthClient, TokenAuthMethod};
 
 const FLOW_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const DCR_MAX_BYTES: usize = 32 * 1024;
-const TOKEN_MAX_BYTES: usize = 32 * 1024;
 
 /// Cheap-clone HTTP client wired with the oauth2 trait. Holds both a
 /// plain reqwest::Client (for DCR) and the oauth2-specific one (for the
@@ -77,9 +76,6 @@ pub struct TokenExchangeResult {
     pub token_endpoint: String,
 }
 
-/// Re-exported aliasing — keeps the `PendingAuthorization` symbol
-/// reachable from `super::oauth` without forcing every caller through
-/// the `store::` path.
 pub type PendingAuthorization = super::store::PendingAuthorization;
 
 /// RFC 7591 Dynamic Client Registration. POSTs the smallest viable
@@ -118,15 +114,17 @@ pub async fn register_dynamic_client(
         .token_endpoint_auth_methods_supported
         .as_deref()
         .unwrap_or(&[]);
-    let auth_method = if supported.iter().any(|m| m == "none") {
-        "none"
-    } else if supported.iter().any(|m| m == "client_secret_basic") {
-        "client_secret_basic"
-    } else if supported.iter().any(|m| m == "client_secret_post") {
-        "client_secret_post"
+    let pick = |method: TokenAuthMethod| supported.iter().any(|m| m == method.as_str());
+    // RFC 7591 default is `client_secret_basic`. Prefer `none` (public
+    // PKCE-only client) when the AS supports it.
+    let auth_method = if pick(TokenAuthMethod::None) {
+        TokenAuthMethod::None
+    } else if pick(TokenAuthMethod::ClientSecretBasic) {
+        TokenAuthMethod::ClientSecretBasic
+    } else if pick(TokenAuthMethod::ClientSecretPost) {
+        TokenAuthMethod::ClientSecretPost
     } else {
-        // RFC 7591 default
-        "client_secret_basic"
+        TokenAuthMethod::ClientSecretBasic
     };
 
     let body = DcrRequest {
@@ -134,7 +132,7 @@ pub async fn register_dynamic_client(
         redirect_uris: vec![redirect_uri.to_owned()],
         grant_types: vec!["authorization_code".into(), "refresh_token".into()],
         response_types: vec!["code".into()],
-        token_endpoint_auth_method: auth_method,
+        token_endpoint_auth_method: auth_method.as_str(),
         scope: scope.map(str::to_owned),
     };
 
@@ -184,7 +182,7 @@ pub async fn register_dynamic_client(
         token_endpoint: as_metadata.token_endpoint.clone(),
         registration_client_uri: raw.registration_client_uri,
         registration_access_token,
-        token_endpoint_auth_method: auth_method.to_owned(),
+        token_endpoint_auth_method: auth_method,
         scope: scope.map(str::to_owned),
     })
 }
@@ -278,7 +276,6 @@ pub async fn exchange_code(
             .collect::<Vec<&str>>()
             .join(" ")
     });
-    let _ = TOKEN_MAX_BYTES; // bounded transitively by oauth2's own checks
     Ok(TokenExchangeResult {
         access_token,
         refresh_token,
@@ -289,9 +286,9 @@ pub async fn exchange_code(
     })
 }
 
-/// Build the `oauth2` crate's `BasicClient` from our typed record + the
-/// fixed redirect URI. Pulled out so authorize + exchange paths share
-/// one source of truth (a drift between them would silently fail PKCE).
+/// Authorize + exchange paths must agree byte-for-byte on the client
+/// config, or PKCE silently fails the comparison; build the `oauth2`
+/// `BasicClient` here so both call sites see the same shape.
 fn build_basic_client(
     client: &super::store::DcrClientRecord,
     redirect_uri: &str,

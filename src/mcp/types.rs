@@ -127,11 +127,9 @@ impl TryFrom<String> for McpDescription {
 /// same invariants.
 ///
 /// **Non-sensitive only.** Sensitive material (bearer tokens, secret-bearing
-/// headers) lives in [`crate::mcp::CredentialPayload`] under `mcp_server_credentials`
-/// — never in this struct. The decision is enforced by construction: there is
-/// no `headers` field here at all. The earlier shape carried `headers: BTreeMap`
-/// in plaintext JSONB; phase B (R2) split that material out into the encrypted
-/// seam.
+/// headers) lives in [`crate::mcp::CredentialPayload`] under
+/// `mcp_server_credentials` — never in this struct. The absence of a `headers`
+/// field here is the enforcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "McpTransportInput", into = "McpTransportInput")]
 pub enum McpTransport {

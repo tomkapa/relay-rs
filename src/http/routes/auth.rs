@@ -172,7 +172,7 @@ fn now_utc(state: &AppState) -> DateTime<Utc> {
 
 /// Only allow relative-path return URLs (no scheme, no host) so the
 /// callback can't be turned into an open-redirect to attacker domains.
-fn sanitize_return_to(raw: &str) -> Option<String> {
+pub(super) fn sanitize_return_to(raw: &str) -> Option<String> {
     if raw.starts_with('/') && !raw.starts_with("//") && raw.len() <= 2048 {
         Some(raw.to_owned())
     } else {

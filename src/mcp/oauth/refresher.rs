@@ -1,4 +1,4 @@
-//! Background OAuth token refresher (R3 — phase D).
+//! Background OAuth token refresher.
 //!
 //! Single coordinator task, modelled on `src/mcp/refresher.rs`. Every
 //! tick:
@@ -11,9 +11,9 @@
 //!      and clear the cache entry.
 //!
 //! Concurrent-refresh dedup: the per-server `Arc<Mutex<()>>` cache is
-//! shared with the on-call refresh path (future phase D-2). Two requests
-//! for the same server token line up on the same mutex, so only one
-//! outbound POST to the token endpoint happens.
+//! shared with the on-call refresh path. Two requests for the same
+//! server token line up on the same mutex, so only one outbound POST to
+//! the token endpoint happens.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -28,8 +28,7 @@ use tracing::{instrument, warn};
 use crate::clock::SharedClock;
 use crate::mcp::credentials::open_payload;
 use crate::mcp::{
-    ConnectionStatus, CredentialPayload, McpCredentialWrite, McpServerId, OAuth2Payload,
-    SharedMcpCredentialStore,
+    CredentialPayload, McpCredentialWrite, McpServerId, OAuth2Payload, SharedMcpCredentialStore,
 };
 
 use super::errors::OAuthError;
@@ -53,9 +52,9 @@ const MAX_OAUTH_REFRESH_PER_TICK: usize = 200;
 /// endpoint; the cache is read+update under one lock acquisition.
 type OAuthTokenCache = RwLock<HashMap<McpServerId, Arc<Mutex<()>>>>;
 
-/// Cheap-clone handle to the cache. Threaded through `AppState` so the
-/// (future) on-call refresh-and-retry path can serialise on the same
-/// mutex as the background refresher.
+/// Cheap-clone handle to the cache. Cloning it into `AppState` lets the
+/// on-call refresh-and-retry path serialise on the same per-server mutex
+/// as the background refresher.
 #[derive(Clone, Default)]
 pub struct SharedOAuthTokenCache(Arc<OAuthTokenCache>);
 
@@ -117,9 +116,9 @@ impl std::fmt::Debug for OAuthRefresher {
 }
 
 impl OAuthRefresher {
-    /// Spawn the coordinator task. The returned cache handle should be
-    /// cloned into `AppState` so future on-call paths reuse the same
-    /// per-server mutex.
+    /// Spawn the coordinator task. The returned cache handle is the
+    /// shared per-server mutex map that the on-call refresh path
+    /// serialises against.
     #[must_use]
     pub fn spawn(deps: RefresherDeps) -> (Self, SharedOAuthTokenCache) {
         let cache = SharedOAuthTokenCache::new();
@@ -342,10 +341,6 @@ async fn mark_reconnect_required(
         reason,
         "mcp.oauth.refresh.reconnect_required",
     );
-    // Drop the stored credential row so subsequent registry refreshes
-    // connect without the dead OAuth payload (which would fail on every
-    // MCP request anyway).
-    let _ = ConnectionStatus::ReconnectRequired; // imported, keep
     Ok(())
 }
 

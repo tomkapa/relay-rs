@@ -1,6 +1,6 @@
 //! Envelope encryption for org-scoped credentials.
 //!
-//! Layered key model (R2):
+//! Layered key model:
 //!
 //! ```text
 //!   RELAY_MASTER_KEK (32 bytes, env)
