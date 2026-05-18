@@ -330,4 +330,91 @@ mod tests {
         // — proves the inner Arc state is shared.
         assert_eq!(v, 11u64);
     }
+
+    // The next two tests pin the epoch-fenced invalidation contract: an
+    // in-flight `get_or_load` whose loader is racing a `clear` /
+    // `invalidate` must drop its result rather than resurrect the value
+    // past the invalidation boundary. The next lookup must re-run the
+    // loader against the post-invalidation source of truth.
+    //
+    // Shape (both tests): start a loader that parks on a oneshot,
+    // observe it has started, invalidate while it's parked, release the
+    // loader, then prove the cache is empty by checking that a second
+    // `get_or_load` runs the loader a second time.
+
+    #[tokio::test]
+    async fn clear_drops_inflight_loader_insert() {
+        let (c, _clock) = cache(8, 60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let c2 = c.clone();
+        let calls2 = calls.clone();
+        let task = tokio::spawn(async move {
+            c2.get_or_load(42u64, || async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok::<_, Infallible>(7u64)
+            })
+            .await
+            .expect("ok")
+        });
+
+        started_rx.await.expect("loader started");
+        c.clear();
+        let _ = release_tx.send(());
+        task.await.expect("join ok");
+
+        let calls3 = calls.clone();
+        let _: u64 = c
+            .get_or_load(42u64, || async move {
+                calls3.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(9u64)
+            })
+            .await
+            .expect("ok");
+
+        // Loader fired twice (once across the clear, once for the
+        // post-clear lookup); the racing fill did not stick.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_inflight_loader_insert() {
+        let (c, _clock) = cache(8, 60);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let c2 = c.clone();
+        let calls2 = calls.clone();
+        let task = tokio::spawn(async move {
+            c2.get_or_load(42u64, || async move {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok::<_, Infallible>(7u64)
+            })
+            .await
+            .expect("ok")
+        });
+
+        started_rx.await.expect("loader started");
+        c.invalidate(42u64);
+        let _ = release_tx.send(());
+        task.await.expect("join ok");
+
+        let calls3 = calls.clone();
+        let _: u64 = c
+            .get_or_load(42u64, || async move {
+                calls3.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(9u64)
+            })
+            .await
+            .expect("ok");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }
