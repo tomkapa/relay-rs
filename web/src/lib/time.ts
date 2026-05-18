@@ -1,6 +1,17 @@
+import { useT } from "../i18n";
+
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
+
+export function useTimeAgo(): (iso: string | null) => string {
+  const { t } = useT();
+  return (iso) => {
+    if (!iso) return "—";
+    const r = relativeTime(iso);
+    return r === "now" ? t("time.justNow") : t("time.ago", { value: r });
+  };
+}
 
 export function relativeTime(iso: string, now = Date.now()): string {
   const t = new Date(iso).getTime();

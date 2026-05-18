@@ -161,6 +161,66 @@ const vi: TranslationTable = {
     "Máy chủ vẫn ở trong danh sách nhưng agent không thể gọi tới đến khi bạn kết nối lại.",
   "connections.confirm.cancel": "Hủy",
   "connections.confirm.confirm": "Xác nhận",
+
+  // ─── Connection Detail ──────────────────────────────────────────────
+  "connections.detail.header.subtitle":
+    "{auth} · Kết nối workspace · {count} công cụ khả dụng",
+  "connections.detail.header.disable": "Tắt",
+  "connections.detail.header.enable": "Bật",
+  "connections.detail.header.disconnect": "Ngắt kết nối",
+  "connections.detail.auth.oauth": "OAuth",
+  "connections.detail.auth.token": "API token",
+  "connections.detail.auth.none": "Không có thông tin xác thực",
+  "connections.detail.status.eyebrow": "01 · TRẠNG THÁI",
+  "connections.detail.status.updated": "Cập nhật {value}",
+  "connections.detail.status.lastCall": "CUỘC GỌI THÀNH CÔNG GẦN NHẤT",
+  "connections.detail.status.lastCallSub": "qua đường dispatch MCP",
+  "connections.detail.status.lastError": "LỖI GẦN NHẤT",
+  "connections.detail.status.noError": "Chưa ghi nhận lỗi",
+  "connections.detail.status.never": "Chưa có cuộc gọi thành công",
+  "connections.detail.status.createdBy": "Được thêm bởi {email}",
+  "connections.detail.status.noCreator": "Không rõ người tạo",
+  "connections.detail.status.tokenExpires":
+    "Token tự động làm mới · hết hạn {value}",
+  "connections.detail.status.tokenStandard": "Thông tin xác thực được mã hóa",
+  "connections.detail.status.manageOn": "Quản lý trên {name}",
+  "connections.detail.tools.eyebrow": "02 · CÔNG CỤ KHẢ DỤNG",
+  "connections.detail.tools.filterPlaceholder": "Lọc công cụ",
+  "connections.detail.tools.filterAria": "Lọc công cụ theo tên",
+  "connections.detail.tools.showMore": "Hiện thêm {count} công cụ",
+  "connections.detail.tools.showLess": "Ẩn bớt",
+  "connections.detail.tools.empty": "Không có công cụ khớp.",
+  "connections.detail.activity.eyebrow": "03 · HOẠT ĐỘNG GẦN ĐÂY",
+  "connections.detail.activity.last50": "50 cuộc gọi gần nhất",
+  "connections.detail.activity.audit": "Xem trong nhật ký",
+  "connections.detail.activity.col.time": "Thời gian",
+  "connections.detail.activity.col.tool": "Công cụ",
+  "connections.detail.activity.col.agent": "Agent",
+  "connections.detail.activity.col.latency": "Độ trễ",
+  "connections.detail.activity.col.outcome": "Kết quả",
+  "connections.detail.activity.comingSoon": "Sắp ra mắt",
+  "connections.detail.usedBy.eyebrow": "04 · ĐANG ĐƯỢC DÙNG",
+  "connections.detail.usedBy.count": "{count} agent",
+  "connections.detail.usedBy.empty":
+    "Chưa có agent nào được cấp quyền dùng kết nối này.",
+  "connections.detail.danger.eyebrow": "05 · KHU VỰC NGUY HIỂM",
+  "connections.detail.danger.disable.title": "Tắt kết nối",
+  "connections.detail.danger.disable.body":
+    "Các agent đang dùng sẽ không thể gọi tới công cụ cho đến khi bạn bật lại.",
+  "connections.detail.danger.disable.cta": "Tắt",
+  "connections.detail.danger.enable.title": "Bật kết nối",
+  "connections.detail.danger.enable.body":
+    "Cho phép agent gọi lại các công cụ của kết nối này.",
+  "connections.detail.danger.enable.cta": "Bật",
+  "connections.detail.danger.disconnect.title": "Ngắt kết nối",
+  "connections.detail.danger.disconnect.body":
+    "Agent mất quyền dùng công cụ của kết nối này. Thông tin xác thực của Relay cũng được thu hồi.",
+  "connections.detail.danger.disconnect.ack": "Tôi hiểu hậu quả",
+  "connections.detail.danger.disconnect.cta": "Ngắt kết nối",
+  "connections.detail.notFound.title": "Không tìm thấy kết nối",
+  "connections.detail.notFound.body":
+    "Kết nối đã bị xóa, hoặc bạn không có quyền truy cập.",
+  "connections.detail.notFound.cta": "Quay lại danh sách",
 };
 
 export default vi;

@@ -39,6 +39,9 @@ export type Agent = {
   id: string;
   name: string;
   is_default: boolean;
+  /** MCP server ids this agent is allowed to call tools on. Mirrors
+   *  `src/http/routes/agents.rs::AgentResponse.allowed_mcp_servers`. */
+  allowed_mcp_servers?: string[];
 };
 
 export type RequestStatus = "pending" | "processing" | "done" | "failed";
@@ -159,6 +162,13 @@ export type DiscoveredTool = {
   description: string | null;
 };
 
+export type CredentialsKind = "static_headers" | "oauth2";
+
+export const CREDENTIALS_KIND = {
+  OAUTH2: "oauth2",
+  STATIC_HEADERS: "static_headers",
+} as const satisfies Record<string, CredentialsKind>;
+
 export type McpServer = {
   id: string;
   alias: string;
@@ -170,8 +180,15 @@ export type McpServer = {
   discovered_tools: DiscoveredTool[] | null;
   created_by_user_id: string;
   has_credentials: boolean;
-  credentials_kind: "static_headers" | "oauth2" | null;
+  credentials_kind: CredentialsKind | null;
   connection_status: ConnectionStatus;
+  /** Email of the user who created the connection (joined from `users`).
+   *  Surfaced on every read path. May be `null` if the FK is null. */
+  creator_email: string | null;
+  /** OAuth access-token expiry (ISO-8601). Surfaced only on the single-
+   *  server read path; `null` for non-OAuth credentials, no credentials,
+   *  or any list/create/update response. */
+  token_expires_at: string | null;
   created_at: string;
   updated_at: string;
 };

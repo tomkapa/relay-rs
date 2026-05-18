@@ -45,6 +45,11 @@ pub const MCP_LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 /// the agent's outer `tool_timeout`.
 pub const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on the single-server credential decrypt performed by the HTTP read
+/// handler to surface `token_expires_at`. AEAD open is in-memory today; the
+/// timeout is headroom for a future KMS-backed encryptor.
+pub const MCP_CREDENTIAL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How many bytes of an MCP tool's stringified result we'll keep before truncating.
 /// Independent of (and always less than or equal to) `tools::TOOL_RESULT_MAX_BYTES`,
 /// which is the agent-side cap.

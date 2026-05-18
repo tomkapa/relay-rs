@@ -1,5 +1,6 @@
 import { Route, Routes } from "react-router-dom";
 import { ChatView } from "./pages/ChatView";
+import { ConnectionDetail } from "./pages/ConnectionDetail";
 import { ConnectionsCatalog } from "./pages/ConnectionsCatalog";
 import { ConnectionsList } from "./pages/ConnectionsList";
 import { OAuthCallback } from "./pages/OAuthCallback";
@@ -37,6 +38,14 @@ export function App() {
         element={
           <Protected>
             <OAuthCallback />
+          </Protected>
+        }
+      />
+      <Route
+        path="/connections/:id"
+        element={
+          <Protected>
+            <ConnectionDetail />
           </Protected>
         }
       />

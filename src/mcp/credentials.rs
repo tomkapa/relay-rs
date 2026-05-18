@@ -77,13 +77,18 @@ impl fmt::Debug for OAuth2Payload {
     }
 }
 
+/// Stable label for the `static_headers` variant in the `kind` column.
+pub const STATIC_HEADERS_KIND_LABEL: &str = "static_headers";
+/// Stable label for the `oauth2` variant in the `kind` column.
+pub const OAUTH2_KIND_LABEL: &str = "oauth2";
+
 impl CredentialPayload {
     /// Stable kind label for the `mcp_server_credentials.kind` column.
     #[must_use]
     pub const fn kind_label(&self) -> &'static str {
         match self {
-            Self::StaticHeaders { .. } => "static_headers",
-            Self::Oauth2(_) => "oauth2",
+            Self::StaticHeaders { .. } => STATIC_HEADERS_KIND_LABEL,
+            Self::Oauth2(_) => OAUTH2_KIND_LABEL,
         }
     }
 }

@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { ArrowUpRight, ListFilter, Plus, RefreshCw } from "lucide-react";
-import { useNavigate } from "react-router-dom";
+import { ListFilter, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
 import {
   ConnectionsBreadcrumb,
   ConnectionsLayout,
@@ -18,41 +18,17 @@ import {
   useUpdateMcpServer,
 } from "../hooks/useMcpServers";
 import { entryForServer } from "../data/mcpCatalog";
-import { statusToneOf, type StatusTone } from "../data/connectionStatus";
+import {
+  STATUS_COLOR,
+  STATUS_KEY,
+  STATUS_SQUARE,
+  statusToneOf,
+  type StatusTone,
+} from "../data/connectionStatus";
 import type { McpServer } from "../types/api";
 import { cn } from "../lib/utils";
-import { relativeTime } from "../lib/time";
+import { useTimeAgo } from "../lib/time";
 import { useAuthStore } from "../stores/authStore";
-
-const STATUS_SQUARE: Record<StatusTone, "live" | "idle" | "error" | "muted"> = {
-  ok: "live",
-  reconnect: "idle",
-  error: "error",
-  pending: "muted",
-};
-
-const STATUS_COLOR: Record<StatusTone, string> = {
-  ok: "var(--color-moss)",
-  reconnect: "var(--color-amber)",
-  error: "var(--color-rose)",
-  pending: "var(--color-muted-2)",
-};
-
-const STATUS_KEY: Record<StatusTone, Parameters<ReturnType<typeof useT>["t"]>[0]> = {
-  ok: "connections.status.ok",
-  reconnect: "connections.status.reconnect",
-  error: "connections.status.error",
-  pending: "connections.status.pending",
-};
-
-function useTimeAgo(): (iso: string | null) => string {
-  const { t } = useT();
-  return (iso) => {
-    if (!iso) return "—";
-    const r = relativeTime(iso);
-    return r === "now" ? t("time.justNow") : t("time.ago", { value: r });
-  };
-}
 
 export function ConnectionsList() {
   const { t } = useT();
@@ -265,7 +241,10 @@ function ConnectionRow({
       }}
     >
       <StatusCell tone={tone} />
-      <div className="flex min-w-0 items-center gap-3.5">
+      <Link
+        to={`/connections/${server.id}`}
+        className="flex min-w-0 items-center gap-3.5 outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-moss)]"
+      >
         <Monogram
           name={entry?.name ?? server.alias}
           size={36}
@@ -275,14 +254,14 @@ function ConnectionRow({
           iconSlug={entry?.iconSlug}
         />
         <div className="flex min-w-0 flex-col gap-0.5">
-          <div className="truncate font-semibold text-[var(--color-ink)]">
+          <div className="truncate font-semibold text-[var(--color-ink)] hover:text-[var(--color-moss-deep)] hover:underline">
             {entry?.name ?? server.alias}
           </div>
           <div className="truncate font-[var(--font-mono)] text-[11px] text-[var(--color-muted)]">
             {hostFromConfig}
           </div>
         </div>
-      </div>
+      </Link>
       <OwnerCell userId={server.created_by_user_id} createdAt={server.created_at} />
       <div className="text-right font-[var(--font-mono)] text-[14px] font-semibold text-[var(--color-ink)]">
         {toolsCount}
@@ -335,9 +314,9 @@ function ConnectionRow({
           onClick={onRemove}
           aria-label={`${t("connections.row.remove")} ${server.alias}`}
           title={t("connections.row.remove")}
-          className="flex h-[30px] w-[30px] items-center justify-center border border-[var(--color-line)] text-[var(--color-muted)] hover:text-[var(--color-rose)]"
+          className="flex h-[30px] w-[30px] items-center justify-center border border-[var(--color-line)] text-[var(--color-muted)] hover:border-[var(--color-rose)] hover:text-[var(--color-rose)]"
         >
-          <ArrowUpRight className="h-3.5 w-3.5" strokeWidth={1.75} />
+          <Trash2 className="h-3.5 w-3.5" strokeWidth={1.75} />
         </button>
       </div>
     </div>

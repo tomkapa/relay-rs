@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import { ApiError } from "../lib/errors";
 import type {
   CreateMcpServerRequest,
   CredentialInput,
@@ -19,10 +20,6 @@ export function useMcpServers() {
   });
 }
 
-/** Polls a single server. Used by the OAuth callback page to flip from
- *  Connecting → Authorized as soon as the BE callback handler writes
- *  the credentials and `connection_status` resets to `ok`. Caller
- *  passes `refetchInterval` to opt in to polling. */
 export function useMcpServer(
   id: string | null,
   options?: { refetchInterval?: number | false; enabled?: boolean },
@@ -33,6 +30,14 @@ export function useMcpServer(
     enabled: Boolean(id) && options?.enabled !== false,
     refetchInterval: options?.refetchInterval,
     staleTime: 0,
+    // 404 / 403 are terminal — render the not-found state immediately
+    // instead of spinning through three exponential-backoff retries.
+    retry: (count, err) => {
+      if (err instanceof ApiError && (err.status === 404 || err.status === 403)) {
+        return false;
+      }
+      return count < 3;
+    },
   });
 }
 
