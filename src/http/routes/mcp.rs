@@ -28,9 +28,9 @@ use crate::mcp::oauth::{
     discover_authorization_server, exchange_code, register_dynamic_client,
 };
 use crate::mcp::{
-    CredentialPayload, DiscoveredTool, McpClient, McpCredentialWrite, McpDescription, McpError,
-    McpServerAlias, McpServerCreate, McpServerId, McpServerRecord, McpServerUpdate, McpTransport,
-    OAuth2Payload,
+    CredentialPayload, DiscoveredTool, MCP_CREDENTIAL_READ_TIMEOUT, McpClient, McpCredentialWrite,
+    McpDescription, McpError, McpServerAlias, McpServerCreate, McpServerId, McpServerRecord,
+    McpServerUpdate, McpTransport, OAUTH2_KIND_LABEL, OAuth2Payload,
 };
 
 use super::super::error::HttpError;
@@ -96,13 +96,18 @@ struct McpServerResponse {
     /// Surfaced connection state — defaults to `"ok"`; the OAuth refresher
     /// (phase D) flips it when a refresh token is revoked.
     connection_status: crate::mcp::ConnectionStatus,
+    /// Email of the user who created this connection (joined from `users`).
+    /// `None` only if the row was created before tenancy enforcement and the
+    /// FK is null — never the case for newly-created rows.
+    creator_email: Option<String>,
+    /// `None` on the list / create / update paths; only the single-server read
+    /// path decrypts the credential blob to surface this.
+    token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl McpServerResponse {
-    /// Construct from a server record plus the per-server credential summary
-    /// (kind label or absence) that the SELECT already produced.
     fn from_record(r: McpServerRecord, credentials_kind: Option<String>) -> Self {
         Self {
             id: r.id,
@@ -117,6 +122,8 @@ impl McpServerResponse {
             has_credentials: credentials_kind.is_some(),
             credentials_kind,
             connection_status: r.connection_status,
+            creator_email: None,
+            token_expires_at: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -240,9 +247,10 @@ async fn list_mcp_servers(
         "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
                 s.last_seen_at, s.last_error, s.discovered_tools, \
                 s.created_by_user_id, s.connection_status, s.created_at, s.updated_at, \
-                c.kind AS credentials_kind \
+                c.kind AS credentials_kind, u.email AS creator_email \
          FROM mcp_servers s \
          LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
+         LEFT JOIN users u ON u.id = s.created_by_user_id \
          ORDER BY s.alias ASC",
     )
     .fetch_all(&mut *tx)
@@ -267,9 +275,10 @@ async fn read_mcp_server(
         "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
                 s.last_seen_at, s.last_error, s.discovered_tools, \
                 s.created_by_user_id, s.connection_status, s.created_at, s.updated_at, \
-                c.kind AS credentials_kind \
+                c.kind AS credentials_kind, u.email AS creator_email \
          FROM mcp_servers s \
          LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
+         LEFT JOIN users u ON u.id = s.created_by_user_id \
          WHERE s.id = $1",
     )
     .bind(id)
@@ -277,7 +286,23 @@ async fn read_mcp_server(
     .await
     .map_err(AuthError::from)?;
     tx.commit().await.map_err(AuthError::from)?;
-    let row = row.ok_or(HttpError::NotFound)?;
+    let mut row = row.ok_or(HttpError::NotFound)?;
+    if row.credentials_kind.as_deref() == Some(OAUTH2_KIND_LABEL) {
+        let cred = tokio::time::timeout(
+            MCP_CREDENTIAL_READ_TIMEOUT,
+            state.mcp_credentials.read(id, principal.active_org_id),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(event = "mcp.read.credential_read_timeout");
+            HttpError::Internal
+        })??;
+        if let Some(record) = cred
+            && let CredentialPayload::Oauth2(oauth) = &record.payload
+        {
+            row.token_expires_at = Some(oauth.expires_at);
+        }
+    }
     Ok(Json(row.try_into_response()?))
 }
 
@@ -600,6 +625,9 @@ struct McpServerRowForList {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     credentials_kind: Option<String>,
+    creator_email: Option<String>,
+    #[sqlx(default)]
+    token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl McpServerRowForList {
@@ -639,6 +667,8 @@ impl McpServerRowForList {
             has_credentials: self.credentials_kind.is_some(),
             credentials_kind: self.credentials_kind,
             connection_status: self.connection_status,
+            creator_email: self.creator_email,
+            token_expires_at: self.token_expires_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

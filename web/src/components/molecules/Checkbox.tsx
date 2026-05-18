@@ -1,0 +1,62 @@
+import type { InputHTMLAttributes, ReactNode } from "react";
+import { Check } from "lucide-react";
+import { cn } from "../../lib/utils";
+
+type Props = {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label?: ReactNode;
+  className?: string;
+} & Omit<InputHTMLAttributes<HTMLInputElement>, "checked" | "onChange" | "type" | "className">;
+
+export function Checkbox({
+  checked,
+  onChange,
+  label,
+  className,
+  id,
+  disabled,
+  ...rest
+}: Props) {
+  const boxId =
+    id ?? `cb-${Math.random().toString(36).slice(2, 9)}`;
+  return (
+    <label
+      htmlFor={boxId}
+      className={cn(
+        "inline-flex items-center gap-2",
+        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+        className,
+      )}
+    >
+      <span
+        className={cn(
+          "flex h-[14px] w-[14px] shrink-0 items-center justify-center border transition-colors",
+          checked
+            ? "border-[var(--color-moss)] bg-[var(--color-moss)]"
+            : "border-[var(--color-line)] bg-[var(--color-card)]",
+        )}
+      >
+        <input
+          id={boxId}
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          disabled={disabled}
+          className="absolute h-0 w-0 opacity-0"
+          {...rest}
+        />
+        {checked ? (
+          <Check
+            className="h-2.5 w-2.5 text-white"
+            strokeWidth={3}
+            aria-hidden
+          />
+        ) : null}
+      </span>
+      {label ? (
+        <span className="text-[12px] text-[var(--color-ink)]">{label}</span>
+      ) : null}
+    </label>
+  );
+}
