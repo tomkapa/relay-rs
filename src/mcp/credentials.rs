@@ -143,10 +143,11 @@ pub(super) fn seal_payload(
 }
 
 /// Open a stored credential blob and decode it back into a typed payload.
+///
 /// Variant-mismatch (`kind` column claims `oauth2` but the JSON decodes as
 /// `static_headers`) trips a typed `Backend` error so the boundary can map
 /// it onto a 500 / log site rather than a silent fall-through.
-pub(super) fn open_payload(
+pub fn open_payload(
     enc: &SharedOrgEncryptor,
     org: OrgId,
     kind: &str,

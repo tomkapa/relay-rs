@@ -9,7 +9,7 @@ use oauth2::basic::BasicClient;
 use oauth2::reqwest::Client as OAuthHttpClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -310,4 +310,78 @@ fn build_basic_client(
         b = b.set_client_secret(ClientSecret::new(secret.expose().to_owned()));
     }
     Ok(b.set_token_uri(token_url).set_redirect_uri(redirect))
+}
+
+/// Result of [`refresh_oauth_token`]. The caller decides what to do on
+/// each variant — typically: `Refreshed` → seal + persist the new token;
+/// `Revoked` → flip `connection_status = 'reconnect_required'`.
+#[derive(Debug)]
+pub enum RefreshOutcome {
+    Refreshed(TokenExchangeResult),
+    Revoked,
+}
+
+/// Exchange `refresh_token` for a fresh access token. The redirect_uri
+/// isn't strictly required for the refresh grant by RFC 6749 §6, but
+/// some ASes echo back redirect-URI checks; pass the same one the
+/// authorization step used.
+#[tracing::instrument(
+    name = "mcp.oauth.refresh",
+    skip_all,
+    fields(
+        relay.mcp.oauth.issuer = %client.issuer,
+    ),
+)]
+pub async fn refresh_oauth_token(
+    flow: &OAuthFlowClient,
+    client: &super::store::DcrClientRecord,
+    refresh_token: &str,
+    redirect_uri: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<RefreshOutcome, OAuthError> {
+    let oauth_client = build_basic_client(client, redirect_uri)?;
+    let resp = oauth_client
+        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_owned()))
+        .request_async(&flow.http_oauth)
+        .await;
+    let token = match resp {
+        Ok(t) => t,
+        Err(e) => {
+            // The oauth2 crate buries the AS's `error` field inside a
+            // crate-specific enum. Match on the textual form so we
+            // don't tie this code to a `oauth2::RequestTokenError`
+            // private layout. `invalid_grant` is the standard signal
+            // for "refresh token revoked / expired" per RFC 6749
+            // §5.2.
+            let s = e.to_string();
+            if s.contains("invalid_grant") {
+                tracing::warn!(error = %e, "mcp.oauth.refresh.revoked");
+                return Ok(RefreshOutcome::Revoked);
+            }
+            return Err(OAuthError::TokenEndpoint(format!("refresh: {e}")));
+        }
+    };
+    let access_token = token.access_token().secret().clone();
+    // Some ASes rotate the refresh token on each use; if so we take the
+    // new one. Otherwise we keep the existing one — the caller carries
+    // the prior value over when we return `None` here.
+    let new_refresh = token.refresh_token().map(|t| t.secret().clone());
+    let default_expiry = chrono::Duration::seconds(600);
+    let expires_in = token.expires_in().map_or(default_expiry, |d| {
+        chrono::Duration::from_std(d).unwrap_or(default_expiry)
+    });
+    let scope = token.scopes().map(|ss| {
+        ss.iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect::<Vec<&str>>()
+            .join(" ")
+    });
+    Ok(RefreshOutcome::Refreshed(TokenExchangeResult {
+        access_token,
+        refresh_token: new_refresh,
+        expires_at: now + expires_in,
+        scope,
+        issuer: client.issuer.clone(),
+        token_endpoint: client.token_endpoint.clone(),
+    }))
 }

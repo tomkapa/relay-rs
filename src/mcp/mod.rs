@@ -6,7 +6,7 @@
 //! [`McpTool`] instances. The agent sees them through [`crate::tools::ToolBox`].
 
 mod client;
-mod credentials;
+pub mod credentials;
 mod error;
 mod limits;
 pub mod oauth;

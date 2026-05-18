@@ -19,15 +19,17 @@ mod discovery;
 mod errors;
 mod flow;
 mod pg_store;
+mod refresher;
 mod store;
 
 pub use discovery::{AsMetadata, discover_authorization_server};
 pub use errors::OAuthError;
 pub use flow::{
-    AuthorizeStart, OAuthFlowClient, PendingAuthorization, TokenExchangeResult,
-    build_authorize_url, exchange_code, register_dynamic_client,
+    AuthorizeStart, OAuthFlowClient, PendingAuthorization, RefreshOutcome, TokenExchangeResult,
+    build_authorize_url, exchange_code, refresh_oauth_token, register_dynamic_client,
 };
 pub use pg_store::{PgMcpOAuthClientStore, PgMcpOAuthPendingStore};
+pub use refresher::{OAUTH_REFRESH_SKEW, OAuthRefresher, RefresherDeps, SharedOAuthTokenCache};
 pub use store::{
     DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
     PendingAuthorizationWrite, SharedMcpOAuthClientStore, SharedMcpOAuthPendingStore,
