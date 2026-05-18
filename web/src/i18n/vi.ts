@@ -164,7 +164,7 @@ const vi: TranslationTable = {
 
   // ─── Connection Detail ──────────────────────────────────────────────
   "connections.detail.header.subtitle":
-    "{auth} · Kết nối workspace · {count} công cụ",
+    "{auth} · Kết nối workspace · {count} công cụ khả dụng",
   "connections.detail.header.disable": "Tắt",
   "connections.detail.header.enable": "Bật",
   "connections.detail.header.disconnect": "Ngắt kết nối",

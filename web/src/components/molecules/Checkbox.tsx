@@ -1,4 +1,4 @@
-import type { InputHTMLAttributes, ReactNode } from "react";
+import { useId, type InputHTMLAttributes, type ReactNode } from "react";
 import { Check } from "lucide-react";
 import { cn } from "../../lib/utils";
 
@@ -18,8 +18,8 @@ export function Checkbox({
   disabled,
   ...rest
 }: Props) {
-  const boxId =
-    id ?? `cb-${Math.random().toString(36).slice(2, 9)}`;
+  const generatedId = useId();
+  const boxId = id ?? generatedId;
   return (
     <label
       htmlFor={boxId}
@@ -50,7 +50,7 @@ export function Checkbox({
           <Check
             className="h-2.5 w-2.5 text-white"
             strokeWidth={3}
-            aria-hidden
+            aria-hidden="true"
           />
         ) : null}
       </span>

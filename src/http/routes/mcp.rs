@@ -293,8 +293,8 @@ async fn read_mcp_server(
             state.mcp_credentials.read(id, principal.active_org_id),
         )
         .await
-        .map_err(|_| {
-            tracing::warn!(event = "mcp.read.credential_read_timeout");
+        .map_err(|e| {
+            tracing::error!(event = "mcp.read.credential_read_timeout", error = ?e);
             HttpError::Internal
         })??;
         if let Some(record) = cred
