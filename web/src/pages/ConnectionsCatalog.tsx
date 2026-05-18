@@ -227,6 +227,7 @@ function CatalogTile({
           bg={entry.tileBg}
           fg={entry.tileFg}
           glyph={entry.monogram}
+          iconSlug={entry.iconSlug}
         />
         <span
           className={cn(

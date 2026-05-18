@@ -24,12 +24,16 @@ export type CatalogEntry = {
   name: string;
   blurb: string;
   category: CatalogCategory;
-  /** Single character or short string rendered inside the colored tile. */
+  /** Single character or short string rendered when no brand icon is available. */
   monogram: string;
   /** Background hex for the tile + table monogram. */
   tileBg: string;
   /** Foreground hex for the tile glyph. */
   tileFg: string;
+  /** simple-icons slug for the brand icon. When present, the icon image
+   *  is shown instead of the monogram character. Slug must match a key in
+   *  `src/data/brandIcons.ts` (all lowercase, no spaces). */
+  iconSlug?: string;
   /** Canonical hosted MCP URL. The user can override it before submit. */
   defaultUrl: string;
   auth: "oauth" | "apiToken";
@@ -48,8 +52,9 @@ export const MCP_CATALOG: CatalogEntry[] = [
     blurb: "Read & write pages, databases, comments.",
     category: "productivity",
     monogram: "N",
-    tileBg: "#1A1A1A",
+    tileBg: "#000000",
     tileFg: "#FFFFFF",
+    iconSlug: "notion",
     defaultUrl: "https://mcp.notion.com/mcp",
     auth: "oauth",
     toolCount: 12,
@@ -62,6 +67,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     monogram: "L",
     tileBg: "#5E6AD2",
     tileFg: "#FFFFFF",
+    iconSlug: "linear",
     defaultUrl: "https://mcp.linear.app/sse",
     auth: "oauth",
     toolCount: 14,
@@ -72,8 +78,9 @@ export const MCP_CATALOG: CatalogEntry[] = [
     blurb: "Repos, issues, pull requests, actions.",
     category: "dev",
     monogram: "G",
-    tileBg: "#24292F",
+    tileBg: "#181717",
     tileFg: "#FFFFFF",
+    iconSlug: "github",
     defaultUrl: "https://api.githubcopilot.com/mcp/",
     auth: "apiToken",
     apiTokenHeader: "Authorization",
@@ -88,8 +95,9 @@ export const MCP_CATALOG: CatalogEntry[] = [
     blurb: "Post messages, search channels, read threads.",
     category: "comms",
     monogram: "S",
-    tileBg: "#611F69",
+    tileBg: "#4A154B",
     tileFg: "#FFFFFF",
+    iconSlug: "slack",
     defaultUrl: "https://mcp.slack.com/v1",
     auth: "oauth",
     toolCount: 9,
@@ -100,8 +108,9 @@ export const MCP_CATALOG: CatalogEntry[] = [
     blurb: "Read, write, and share docs and sheets.",
     category: "productivity",
     monogram: "D",
-    tileBg: "#1A73E8",
+    tileBg: "#4285F4",
     tileFg: "#FFFFFF",
+    iconSlug: "googledrive",
     defaultUrl: "https://mcp.googleapis.com/drive",
     auth: "oauth",
     toolCount: 8,
@@ -112,8 +121,9 @@ export const MCP_CATALOG: CatalogEntry[] = [
     blurb: "Pull files, comments, and component metadata.",
     category: "productivity",
     monogram: "F",
-    tileBg: "#0D0D0D",
+    tileBg: "#F24E1E",
     tileFg: "#FFFFFF",
+    iconSlug: "figma",
     defaultUrl: "https://api.figma.com/v1/mcp",
     auth: "apiToken",
     apiTokenHeader: "X-Figma-Token",
@@ -130,6 +140,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     monogram: "J",
     tileBg: "#0052CC",
     tileFg: "#FFFFFF",
+    iconSlug: "jira",
     defaultUrl: "https://api.atlassian.com/ex/jira/mcp",
     auth: "apiToken",
     apiTokenHeader: "Authorization",
@@ -146,6 +157,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     monogram: "S",
     tileBg: "#362D59",
     tileFg: "#FFFFFF",
+    iconSlug: "sentry",
     defaultUrl: "https://mcp.sentry.dev/v1",
     auth: "apiToken",
     apiTokenHeader: "Authorization",
@@ -162,6 +174,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     monogram: "S",
     tileBg: "#635BFF",
     tileFg: "#FFFFFF",
+    iconSlug: "stripe",
     defaultUrl: "https://api.stripe.com/v1/mcp",
     auth: "apiToken",
     apiTokenHeader: "Authorization",
@@ -175,8 +188,9 @@ export const MCP_CATALOG: CatalogEntry[] = [
     blurb: "Query, insert, and inspect schemas.",
     category: "data",
     monogram: "P",
-    tileBg: "#336791",
+    tileBg: "#4169E1",
     tileFg: "#FFFFFF",
+    iconSlug: "postgresql",
     defaultUrl: "https://mcp.example.com/postgres",
     auth: "apiToken",
     apiTokenHeader: "Authorization",
@@ -191,6 +205,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     monogram: "H",
     tileBg: "#FF7A59",
     tileFg: "#FFFFFF",
+    iconSlug: "hubspot",
     defaultUrl: "https://api.hubapi.com/mcp/v1",
     auth: "oauth",
     toolCount: 10,
@@ -206,7 +221,7 @@ export function entryById(id: string): CatalogEntry | undefined {
  *  authoritative tie because that's what the FE seeded at create time. */
 export function entryForServer(server: {
   alias: string;
-  config: { kind: "http"; url: string };
+  config: { type: "http"; url: string };
 }): CatalogEntry | undefined {
   const byAlias = entryById(server.alias);
   if (byAlias) return byAlias;

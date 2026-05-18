@@ -16,7 +16,7 @@ type Server = {
   id: string;
   alias: string;
   enabled: boolean;
-  config: { kind: "http"; url: string };
+  config: { type: "http"; url: string };
   description: string | null;
   last_seen_at: string | null;
   last_error: string | null;
@@ -43,7 +43,7 @@ const seed: Server[] = [
     id: "11111111-1111-7111-8111-111111111111",
     alias: "notion",
     enabled: true,
-    config: { kind: "http", url: "https://mcp.notion.com/mcp" },
+    config: { type: "http", url: "https://mcp.notion.com/mcp" },
     description: "Notion",
     last_seen_at: MIN_2_AGO,
     last_error: null,
@@ -63,7 +63,7 @@ const seed: Server[] = [
     id: "22222222-2222-7222-8222-222222222222",
     alias: "linear",
     enabled: true,
-    config: { kind: "http", url: "https://mcp.linear.app/sse" },
+    config: { type: "http", url: "https://mcp.linear.app/sse" },
     description: "Linear",
     last_seen_at: MIN_14_AGO,
     last_error: "401 unauthorized",
@@ -83,7 +83,7 @@ const seed: Server[] = [
     id: "33333333-3333-7333-8333-333333333333",
     alias: "slack",
     enabled: false,
-    config: { kind: "http", url: "https://mcp.slack.com/v1" },
+    config: { type: "http", url: "https://mcp.slack.com/v1" },
     description: "Slack",
     last_seen_at: DAY_3_AGO,
     last_error: null,
@@ -103,7 +103,7 @@ const seed: Server[] = [
     id: "44444444-4444-7444-8444-444444444444",
     alias: "github",
     enabled: true,
-    config: { kind: "http", url: "https://api.githubcopilot.com/mcp/" },
+    config: { type: "http", url: "https://api.githubcopilot.com/mcp/" },
     description: "GitHub",
     last_seen_at: null,
     last_error: "ECONNRESET",
@@ -119,7 +119,7 @@ const seed: Server[] = [
     id: "55555555-5555-7555-8555-555555555555",
     alias: "internal-search",
     enabled: false,
-    config: { kind: "http", url: "https://search.acme.internal/mcp" },
+    config: { type: "http", url: "https://search.acme.internal/mcp" },
     description: "Internal search",
     last_seen_at: null,
     last_error: null,
@@ -169,15 +169,14 @@ function maybeOAuthStart(id: string): Response {
   // real backend's post-callback state mutation: flip the server's
   // connection_status to `ok` and mark credentials as present.
   const s = servers.get(id);
-  if (s) {
-    servers.set(id, {
-      ...s,
-      connection_status: "ok",
-      has_credentials: true,
-      credentials_kind: s.credentials_kind ?? "oauth2",
-      last_error: null,
-    });
-  }
+  if (!s) return empty(404);
+  servers.set(id, {
+    ...s,
+    connection_status: "ok",
+    has_credentials: true,
+    credentials_kind: s.credentials_kind ?? "oauth2",
+    last_error: null,
+  });
   const base = process.env.MOCK_FRONTEND_BASE ?? "http://localhost:5173";
   const callback = `${base}/connections/oauth-callback?server_id=${id}&status=ok`;
   return json({ authorize_url: callback });
@@ -199,7 +198,7 @@ const server = Bun.serve({
     if (path === "/mcp-servers" && method === "POST") {
       const body = (await req.json()) as {
         alias: string;
-        config: { kind: "http"; url: string };
+        config: { type: "http"; url: string };
         description?: string | null;
         enabled?: boolean;
         credentials?: { kind: "static_headers"; headers: Record<string, string> };

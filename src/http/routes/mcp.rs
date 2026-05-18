@@ -776,16 +776,23 @@ struct OAuthCallbackQuery {
 /// Always returns a 303 redirect to the FE callback page with
 /// `?status=ok` or `?status=failed&reason=…` so the user lands on a
 /// rendered page either way.
+#[tracing::instrument(name = "mcp.oauth.callback", skip_all)]
 async fn handle_oauth_callback(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<OAuthCallbackQuery>,
 ) -> axum::response::Response {
     match callback_flow(&state, q).await {
-        Ok(redirect_to) => redirect_ok(redirect_to.as_deref()),
+        Ok(redirect_to) => {
+            tracing::info!(event = "mcp.oauth.callback.ok");
+            redirect_ok(redirect_to.as_deref())
+        }
         Err(CallbackFail {
             redirect_to,
             reason,
-        }) => redirect_failed(redirect_to.as_deref(), reason),
+        }) => {
+            tracing::info!(event = "mcp.oauth.callback.failed", reason = %reason);
+            redirect_failed(redirect_to.as_deref(), reason)
+        }
     }
 }
 
@@ -871,7 +878,10 @@ async fn consume_pending(
             reason: "unknown_or_expired_state",
         }),
         Err(e) => {
-            tracing::error!(error = %e, "mcp.oauth.callback.consume_failed");
+            tracing::error!(
+                event = "mcp.oauth.callback.consume_failed",
+                error = ?e,
+            );
             Err(CallbackFail {
                 redirect_to: None,
                 reason: "internal_error",
@@ -895,7 +905,10 @@ async fn load_dcr(
             reason: "oauth_client_missing",
         }),
         Err(e) => {
-            tracing::error!(error = %e, "mcp.oauth.callback.client_lookup_failed");
+            tracing::error!(
+                event = "mcp.oauth.callback.client_lookup_failed",
+                error = ?e,
+            );
             Err(CallbackFail {
                 redirect_to: pending.redirect_to.clone(),
                 reason: "internal_error",
@@ -922,7 +935,13 @@ async fn exchange_token(
     )
     .await
     .map_err(|e| {
-        tracing::warn!(error = %e, "mcp.oauth.callback.exchange_failed");
+        // Upstream/vendor failure — not our error, so `warn`. CLAUDE.md
+        // §2: "ERROR = user-visible failure"; vendor refusing the
+        // exchange is an operating error from our side.
+        tracing::warn!(
+            event = "mcp.oauth.callback.exchange_failed",
+            error = ?e,
+        );
         CallbackFail {
             redirect_to: pending.redirect_to.clone(),
             reason: "token_exchange_failed",
@@ -953,13 +972,19 @@ async fn persist_oauth_success(
         })
         .await
     {
-        tracing::error!(error = %e, "mcp.oauth.callback.credentials_write_failed");
+        tracing::error!(
+            event = "mcp.oauth.callback.credentials_write_failed",
+            error = ?e,
+        );
         return Err("credentials_write_failed");
     }
     mark_connected(state, pending.server_id, pending.org_id, now)
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "mcp.oauth.callback.status_update_failed");
+            tracing::error!(
+                event = "mcp.oauth.callback.status_update_failed",
+                error = ?e,
+            );
             "internal_error"
         })?;
     state.mcp_refresh.request();
@@ -1002,7 +1027,10 @@ async fn consume_pending_for_redirect(state: &AppState, raw_state: Option<&str>)
         Ok(Some(p)) => p.redirect_to,
         Ok(None) => None,
         Err(e) => {
-            tracing::warn!(error = %e, "mcp.oauth.callback.consume_for_redirect_failed");
+            tracing::warn!(
+                event = "mcp.oauth.callback.consume_for_redirect_failed",
+                error = ?e,
+            );
             None
         }
     }

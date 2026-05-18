@@ -90,6 +90,7 @@ function EntryTile({ entry }: { entry: CatalogEntry }) {
       bg={entry.tileBg}
       fg={entry.tileFg}
       glyph={entry.monogram}
+      iconSlug={entry.iconSlug}
     />
   );
 }
@@ -130,7 +131,7 @@ function OAuthBody({
     run(async () => {
       const server = await create.mutateAsync({
         alias: entry.id,
-        config: { kind: "http", url: entry.defaultUrl },
+        config: { type: "http", url: entry.defaultUrl },
         description: entry.blurb,
         enabled: true,
       });
@@ -203,7 +204,7 @@ function ApiTokenBody({
         headers: { [headerName]: `${entry.apiTokenPrefix ?? ""}${token}` },
       };
       const result = await test.mutateAsync({
-        config: { kind: "http", url: entry.defaultUrl },
+        config: { type: "http", url: entry.defaultUrl },
         credentials,
       });
       if (result.outcome === "failed") {
@@ -212,7 +213,7 @@ function ApiTokenBody({
       }
       await create.mutateAsync({
         alias: entry.id,
-        config: { kind: "http", url: entry.defaultUrl },
+        config: { type: "http", url: entry.defaultUrl },
         description: entry.blurb,
         enabled: true,
         credentials,
@@ -443,7 +444,7 @@ function CustomUrlBody({ onClose }: { onClose: () => void }) {
       }
       await create.mutateAsync({
         alias,
-        config: { kind: "http", url },
+        config: { type: "http", url },
         enabled: true,
         credentials:
           auth === "apiToken" && token.trim()

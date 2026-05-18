@@ -1,9 +1,10 @@
 // English string table.
 //
-// Keep keys flat and namespaced (`area.subarea.role`). The translation
-// values are render-only — no formatting placeholders today; if/when one
-// grows them, switch to a tiny `format(t('x'), {…})` helper rather than
-// reaching for a runtime dep prematurely (CLAUDE.md §8 spirit).
+// Keep keys flat and namespaced (`area.subarea.role`). `{name}`-style
+// placeholders are supported via the lightweight in-tree interpolator
+// in `index.ts::t()` — pass values via `t("key", { name: "…" })`. No
+// runtime i18n dep (CLAUDE.md §8); promote only when ICU plurals are
+// actually needed.
 //
 // Every key in this file MUST exist in `vi.ts`. The startup-time check in
 // `index.ts` panics if they drift.
@@ -30,6 +31,8 @@ const en = {
   "usermenu.language.error": "Could not change language. Please try again.",
 
   "button.loading": "Loading",
+  "time.justNow": "just now",
+  "time.ago": "{value} ago",
 
   // ─── Connections ─────────────────────────────────────────────────
   "menu.connections": "Connections",

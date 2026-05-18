@@ -35,8 +35,11 @@ export function OAuthCallback() {
   const serverId = params.get("server_id");
   const initialStatus = params.get("status");
   const reason = params.get("reason");
+  // No `server_id` means the backend redirect didn't include one — we
+  // can't poll our way to "authorized", so render Failed immediately
+  // rather than spinning until the 30s watchdog.
   const [view, setView] = useState<View>(
-    initialStatus === "failed" ? "failed" : "connecting",
+    !serverId || initialStatus === "failed" ? "failed" : "connecting",
   );
 
   const polling = useMcpServer(serverId, {

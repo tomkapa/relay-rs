@@ -145,7 +145,9 @@ export type SubmitPromptResponse = {
 // Mirrors src/http/routes/mcp.rs and src/mcp/types.rs. Adding a transport
 // kind or credential kind requires a paired backend change.
 
-export type McpTransport = { kind: "http"; url: string };
+// Wire tag matches Rust `McpTransportInput` (`#[serde(tag = "type")]` in
+// src/mcp/types.rs). Don't switch this to `kind` — the BE will reject it.
+export type McpTransport = { type: "http"; url: string };
 
 /** Mirrors `src/mcp/types.rs::ConnectionStatus`. */
 export type ConnectionStatus = "ok" | "reconnect_required" | "error";

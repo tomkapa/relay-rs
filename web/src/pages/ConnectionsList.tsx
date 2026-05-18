@@ -45,10 +45,13 @@ const STATUS_KEY: Record<StatusTone, Parameters<ReturnType<typeof useT>["t"]>[0]
   pending: "connections.status.pending",
 };
 
-function timeAgo(iso: string | null): string {
-  if (!iso) return "—";
-  const r = relativeTime(iso);
-  return r === "now" ? "just now" : `${r} ago`;
+function useTimeAgo(): (iso: string | null) => string {
+  const { t } = useT();
+  return (iso) => {
+    if (!iso) return "—";
+    const r = relativeTime(iso);
+    return r === "now" ? t("time.justNow") : t("time.ago", { value: r });
+  };
 }
 
 export function ConnectionsList() {
@@ -238,6 +241,7 @@ function ConnectionRow({
   onRemove: () => void;
 }) {
   const { t } = useT();
+  const timeAgo = useTimeAgo();
   const tone = statusToneOf(server);
   const entry = entryForServer(server);
   const toolsCount = server.discovered_tools?.length ?? 0;
@@ -268,6 +272,7 @@ function ConnectionRow({
           bg={entry?.tileBg ?? "var(--color-rail)"}
           fg={entry?.tileFg ?? "#ffffff"}
           glyph={entry?.monogram ?? (server.alias[0] ?? "?").toUpperCase()}
+          iconSlug={entry?.iconSlug}
         />
         <div className="flex min-w-0 flex-col gap-0.5">
           <div className="truncate font-semibold text-[var(--color-ink)]">
@@ -354,6 +359,7 @@ function StatusCell({ tone }: { tone: StatusTone }) {
 
 function OwnerCell({ userId, createdAt }: { userId: string; createdAt: string }) {
   const me = useAuthStore((s) => s.me);
+  const timeAgo = useTimeAgo();
   const isSelf = me?.user.id === userId;
   const name = isSelf ? (me?.user.display_name ?? me?.user.email ?? "you") : userId.slice(0, 8);
   return (

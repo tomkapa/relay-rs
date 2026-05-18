@@ -29,6 +29,8 @@ const vi: TranslationTable = {
   "usermenu.language.error": "Không thể đổi ngôn ngữ. Vui lòng thử lại.",
 
   "button.loading": "Đang tải",
+  "time.justNow": "vừa xong",
+  "time.ago": "{value} trước",
 
   // ─── Connections ─────────────────────────────────────────────────
   "menu.connections": "Kết nối",
