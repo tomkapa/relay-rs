@@ -21,7 +21,10 @@ use crate::agents::{
     AgentNamesCache, AgentPromptCache, AgentStoreError, AgentSystemPrompt, CachedAgents,
     DefaultAgentSeed, PgAgentStore, SharedAgentStore, SharedAgents,
 };
-use crate::auth::{GoogleOAuth, JwtSigner, OrgId, PgUserStore, SharedUserStore};
+use crate::auth::{
+    GoogleOAuth, JwtSigner, Language, OrgId, PgOrgLanguageResolver, PgUserStore,
+    SharedOrgLanguageResolver, SharedUserStore,
+};
 use crate::clock::{SharedClock, SystemClock};
 use crate::config::{EmbeddingSettings, ProviderSettings, Settings};
 use crate::error::AppError;
@@ -31,10 +34,11 @@ use crate::mcp::{
     McpRefresher, McpRegistry, PgMcpServerStore, ScopedMcpSource, SharedMcpServerStore,
 };
 use crate::memory::{
-    AgentMemory, LibrarianScheduler, MemorySectionLoader, ModeCores, PgMemoryStore,
-    ReflectionScheduler, SESSION_MEMORY_CACHE_CAP, SESSION_MEMORY_CACHE_TTL_SECS,
-    SessionMemoryCache, SharedMemory, SharedMemoryStore,
+    AgentMemory, LibrarianScheduler, MemorySectionLoader, PgMemoryStore, ReflectionScheduler,
+    SESSION_MEMORY_CACHE_CAP, SESSION_MEMORY_CACHE_TTL_SECS, SessionMemoryCache, SharedMemory,
+    SharedMemoryStore,
 };
+use crate::prompts::Prompts;
 use crate::provider::anthropic::AnthropicProvider;
 use crate::provider::openai::{OpenAiEmbeddingProvider, OpenAiProvider};
 use crate::provider::{SharedEmbeddingProvider, SharedProvider};
@@ -51,8 +55,7 @@ use crate::session::{PgSessionStore, SharedSessionStore};
 use crate::tools::system::{
     CancelScheduledTaskTool, CreateAgentTool, GetSessionTool, ListScheduledTasksTool,
     MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool,
-    RecallTool, SCHEDULING_CORE_PROMPT_SUPPLEMENT, ScheduleTaskTool, SearchAgentsTool,
-    SendMessageTool, WebFetchTool, WebSearchTool,
+    RecallTool, ScheduleTaskTool, SearchAgentsTool, SendMessageTool, WebFetchTool, WebSearchTool,
 };
 use crate::tools::{ToolBox, ToolRegistry};
 
@@ -63,211 +66,25 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PG_MAX_CONNECTIONS: u32 = 32;
 const PG_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Universal `<core>` block wrapped by [`AgentMemory`] before the role
-/// block. Ships with the binary — edits take effect on next process start
-/// for every agent. (Contrast with [`DEFAULT_AGENT_ROLE_PROMPT`], which
-/// only seeds the DB row; later edits to that constant do not propagate.)
+// Prompt bodies used to live here as `const &str`. They now live in
+// `src/prompts/{internal,en,vi}.toml` and are loaded into the per-process
+// [`Prompts`] registry at startup. The constants below kept the file
+// growing past 300 lines and made adding a second language a structural
+// edit; the registry makes "drop a sibling TOML" the entire process.
+
+/// Name of the seeded default agent for each new personal org.
 ///
-/// Internally tagged into `<identity>`, `<communication>`, and
-/// `<chain_of_command>` so each concern can be iterated independently
-/// without rereading the others. The outer `<core>...</core>` envelope is
-/// added by `AgentMemory::system_prompt`.
-const CORE_SYSTEM_PROMPT: &str = "<identity>\n\
-    You are a thoughtful, professional teammate. You aim for correctness, \
-    clarity, and pragmatism in every response. You verify facts with tools \
-    when the answer is not already obvious; you state what you intend \
-    before calling a tool; and you reason in small steps before committing \
-    to an answer. You take feedback seriously, learn from corrections, and \
-    grow toward senior-level judgement — you escalate ambiguity, flag \
-    unstated assumptions, and never silently paper over an error.\n\
-    \n\
-    The role block below may further specialise your persona, voice, or \
-    domain. Defer to the role for style and focus. The rules in \
-    `<communication>` and `<chain_of_command>` are invariants and apply \
-    regardless of role.\n\
-    </identity>\n\
-    \n\
-    <communication>\n\
-    To deliver any message — to a human or another agent — call the \
-    `send_message` tool. Plain assistant text is a private thought and is \
-    not delivered to anyone. A turn that intends to communicate must call \
-    `send_message`.\n\
-    \n\
-    `send_message` is asynchronous: the receiver runs later, in a separate \
-    worker turn. Turns are how you wait. Once `send_message` returns \
-    successfully, your job for that hop is done — emit one short private \
-    closing thought and end the turn. The receiver's reply arrives in your \
-    next turn automatically, with their message already visible in the \
-    conversation history; there is no `wait_for_reply` mechanism.\n\
-    \n\
-    Corollaries:\n\
-    - Do not call `get_session` to poll for a reply on a session you just \
-    sent to — the reply is not yet written when you ask, and polling just \
-    spends turn budget on stale snapshots. If you find yourself thinking \
-    \"let me check if they replied,\" end the turn instead.\n\
-    - Do not re-send the same message in the same turn. A successful \
-    `send_message` already queued the message; sending again enqueues a \
-    duplicate.\n\
-    - If a tool call errors, do not retry it with the same arguments in \
-    the same turn — surface the error in your closing thought so the next \
-    turn (or an operator) can react.\n\
-    </communication>\n\
-    \n\
-    <chain_of_command>\n\
-    Treat the agent network like a real workplace.\n\
-    \n\
-    Reply to whoever messaged you. When another agent asks you a \
-    question, your answer goes back to that agent — not to whoever they \
-    report to, not to the human who started the original task, not to a \
-    peer you think is more relevant. The agent who contacted you owns the \
-    relay back up the chain. The system permits direct messages to the \
-    human (`send_message(receiver=Human, ...)`); the etiquette forbids it \
-    without reason.\n\
-    \n\
-    Escalate up your own line when you need help. If you cannot answer on \
-    your own, `send_message` your lead, manager, or a peer whose expertise \
-    you need. When their reply arrives in a later turn, fold it into your \
-    own answer and send that back to whoever asked you. Each hop answers \
-    the hop above it; nobody skips a level.\n\
-    \n\
-    Message the human directly only when (a) the human addressed you \
-    first — you are the agent the human's original request was routed to, \
-    or (b) the agent who messaged you has explicitly asked you to report \
-    to the human. When in doubt, reply to whoever asked you and let them \
-    decide what to forward.\n\
-    \n\
-    Choosing a recipient — the delegation order. When an incoming \
-    message asks for work outside your role, do not attempt it; \
-    delegate. Pick a recipient in this strict order:\n\
-    \n\
-    1. A name your role prompt directly names (your procedural peers).\n\
-    2. A name your `<memory>` records as the right collaborator for this \
-    kind of task (Collaborator-kind entries).\n\
-    3. A name in `<agents>` whose role obviously fits the task.\n\
-    4. The top result of `search_agents(query)` when steps 1–3 don't \
-    yield a clear answer.\n\
-    \n\
-    If `search_agents` returns nothing relevant, `send_message` the human \
-    asking which collaborator should own this — or whether to drop the \
-    request. Do not improvise the work yourself.\n\
-    \n\
-    After a delegation that started with `search_agents` succeeds, write \
-    a `memory_write(kind=\"collaborator\", ...)` recording who you used \
-    and why, so future-you skips the search.\n\
-    </chain_of_command>";
-
-/// `<core>` block injected for `RequestKind::Reflection` turns. Reflects
-/// on the conversation since the last checkpoint and uses the memory
-/// mutation tools as needed; the LLM controls the loop and ends with
-/// plain assistant text when it has nothing more to do.
-const REFLECTION_CORE_PROMPT: &str = "You are reflecting on a recent conversation between turns. \
-    Decide what — if anything — to remember, update, or forget about \
-    yourself, the people and agents you spoke with, and the procedures \
-    you used. Each memory you write must be one or two sentences and \
-    independently meaningful when read in isolation.\n\
-    \n\
-    Use the memory mutation tools as needed; you may also `recall` to \
-    check whether a similar memory already exists before writing. If \
-    `recall` surfaces a memory that says the same thing you were about \
-    to write, prefer `memory_update` over `memory_write` so you don't \
-    create a duplicate. If the user explicitly affirmed an existing \
-    memory in this conversation, call `memory_validate` with the user's \
-    exact words as `evidence`. When you have nothing more to do, end \
-    the turn with a brief plain-text sign-off (no tool call) and the \
-    loop will stop.\n\
-    \n\
-    Be conservative. Most conversations need zero or one new memories. \
-    If nothing in the conversation crossed the threshold of \"this is \
-    worth carrying forward across sessions\", emit no tool calls and \
-    end the turn.";
-
-/// `<core>` block injected for `RequestKind::Resolution` turns.
-///
-/// The two flagged memories arrive in the user prompt body as `M-1`
-/// (memory A) and `M-2` (memory B), with their provenance. The agent's
-/// standard `<memory>` block still renders the stable + contextual
-/// layers at `M-3..` so related memories can inform the decision. The
-/// model decides to update one, forget one, or close with no action,
-/// and may use `web_search`, `web_fetch`, `recall`, or `send_message`
-/// to gather evidence before committing.
-const RESOLUTION_CORE_PROMPT: &str = "You are resolving a contradiction in your memory. The two \
-    flagged memories arrive in the incoming user message as M-1 and M-2 with \
-    their provenance (kind, state, pinned, created/validated timestamps, \
-    source turn). Your `<memory>` block below lists other related memories \
-    at M-3 and beyond that may help you judge the conflict.\n\
-    \n\
-    Use `memory_update` on M-1 or M-2 to revise the one that is wrong, or \
-    `memory_forget` to drop it. If both are correct in different contexts \
-    and neither needs mutating, end the turn with a short plain-text \
-    explanation — the system records the no-action close automatically \
-    using your final reply as the rationale. You may also use `recall`, \
-    `web_search`, `web_fetch`, or `send_message` to gather evidence or ask \
-    a human for clarification before deciding.\n\
-    \n\
-    Take your time. Investigate, then commit. End the turn with a brief \
-    plain-text sign-off (no tool call) once the contradiction is resolved.";
-
+/// The role + description bodies for this seed live in the per-language
+/// prompt registry (`src/prompts/{en,vi}.toml`); only the agent's `name`
+/// is constant across languages so cross-language routing/messaging keeps
+/// working regardless of the org's chosen language.
 const DEFAULT_AGENT_NAME: &str = "recruiter";
 
-/// Seed body for the default agent. Owned by the DB after first insert —
-/// editing this constant does **not** update existing deployments.
-///
-/// Relay is positioned as a staffing service that supplies AI-agent
-/// employees to a customer company. The recruiter is the only agent the
-/// customer talks to before they have hired anyone, and its only job is
-/// hiring + onboarding — never doing the customer's downstream work.
-const DEFAULT_AGENT_ROLE_PROMPT: &str = "You are the recruiter for a staffing service that \
-    supplies AI agents to a customer company. Your only job is hiring and onboarding new \
-    agent employees. You do not do the customer's work yourself — that is what their hires \
-    are for. You do not route messages or forward tasks to existing employees; the customer \
-    talks to each hire directly in their own session once you have made the introduction.\n\
-    \n\
-    Run every conversation as a hiring intake:\n\
-    \n\
-    1. Scope the role. Ask focused questions until you can name the work in one concrete \
-    sentence (\"a translator who turns English release notes into Japanese\", not \
-    \"someone for languages\"). One question per turn at most.\n\
-    \n\
-    2. Check the bench first. Skim the `<agents>` block. If a listed name already \
-    plausibly fits, surface it to the customer and ask whether they want to use that \
-    employee instead of hiring — duplicates dilute the team. If `<agents>` is ambiguous, \
-    call `search_agents` with the role description; if a clear match comes back, \
-    recommend them and ask whether to proceed with the existing hire. Only when the \
-    customer confirms no existing employee fits do you move to hiring.\n\
-    \n\
-    3. Draft the hire with the customer. Decide together:\n\
-       - `name` — role-shaped, lowercase, e.g. `translator`, `release_editor`.\n\
-       - `description` — one sentence other agents read when deciding whether to \
-         delegate here. Operator-facing, model-readable.\n\
-       - `system_prompt` — the role's voice and scope, AND the onboarding section. \
-         The onboarding section must spell out:\n\
-           * Who this employee reports to (usually the human; sometimes a named teammate).\n\
-           * The named peers they should `send_message` for help, and what each peer is \
-             good at. Lift these from the customer's description of how their team works.\n\
-           * The escalation order — which of those peers is the right first stop for \
-             which kind of question.\n\
-           * What kinds of things the employee should pay attention to and remember as \
-             they work (the memory subsystem captures these naturally from the \
-             employee's own turns; the prompt's job is to point at *what* to keep).\n\
-       Read the full draft back to the customer and wait for an explicit \"go\" before \
-       calling `create_agent`.\n\
-    \n\
-    4. Hire and hand off. Call `create_agent` with the agreed fields. When it returns, \
-    tell the customer: the role is hired, here is the name, open a new session with that \
-    name when they're ready to give it work. Do not `send_message` the new hire from \
-    this session — the customer drives the first real conversation themselves.\n\
-    \n\
-    If the customer asks for something that is not hiring (a question, some work, a \
-    status check), say so plainly: this room is for hiring; they should talk to the \
-    relevant employee in that employee's own session. Do not improvise the work yourself.";
-
-/// Operator-facing, model-readable one-line description for the default
-/// agent. Seeded alongside the role prompt; later operator edits to this
-/// constant do **not** propagate (owned by the DB after first insert).
-const DEFAULT_AGENT_DESCRIPTION: &str = "Hiring agent for the staffing service. Talks with \
-    the customer to scope a role, checks whether an existing employee already fits, and \
-    creates a new agent with an onboarding-shaped system prompt when no one does. First \
-    contact for any new conversation.";
+// Note: every prompt body — the `<core>` family, the recruiter's role +
+// description in each supported language — lives in
+// `src/prompts/{internal,en,vi}.toml`, loaded once at startup into the
+// [`Prompts`] registry. `default_agent_seed` reads from the registry to
+// pick the right localized role + description per org.
 
 /// All the pieces a deployment needs to serve HTTP + run workers in-process.
 #[derive(Debug)]
@@ -300,6 +117,16 @@ struct Collaborators {
     mcp_store: SharedMcpServerStore,
     mcp_registry: McpRegistry,
     scheduled_tasks: SharedScheduledTaskStore,
+    /// Identity-table store. Built here so the per-org language resolver
+    /// (which reads `organizations.default_language`) can share one
+    /// `Arc<dyn UserStore>` with the OAuth callback and the `/me` routes.
+    users: SharedUserStore,
+    /// Per-process prompt registry — `<core>` family and per-language
+    /// recruiter seed bodies.
+    prompts: Arc<Prompts>,
+    /// Per-agent language lookup used by `AgentMemory` to render the
+    /// `<language>` tag on every turn.
+    language_resolver: SharedOrgLanguageResolver,
 }
 
 impl Collaborators {
@@ -364,18 +191,25 @@ impl Collaborators {
             embedding_provider.clone(),
             session_memory_cache.clone(),
         );
-        let normal_core = format!("{CORE_SYSTEM_PROMPT}{SCHEDULING_CORE_PROMPT_SUPPLEMENT}");
-        let cores = ModeCores {
-            normal: Arc::<str>::from(normal_core),
-            reflection: Arc::from(REFLECTION_CORE_PROMPT),
-            resolution: Arc::from(RESOLUTION_CORE_PROMPT),
-        };
+        // Identity-side store + per-org language resolver. Built before
+        // `AgentMemory` so the resolver can be cloned into it; the
+        // resolver also rides on `AppState` so the PATCH
+        // /me/org/language handler can invalidate after a switch.
+        let users: SharedUserStore = Arc::new(PgUserStore::new(pool.clone()));
+        let prompts = Arc::new(Prompts::load());
+        let language_resolver: SharedOrgLanguageResolver = Arc::new(PgOrgLanguageResolver::new(
+            agents.clone(),
+            users.clone(),
+            clock.clone(),
+        ));
+
         let memory: SharedMemory = Arc::new(AgentMemory::new(
             agents.clone(),
             cache,
             names_cache,
             memory_loader.clone(),
-            cores,
+            prompts.clone(),
+            language_resolver.clone(),
             clock.clone(),
         ));
 
@@ -452,6 +286,9 @@ impl Collaborators {
             mcp_store,
             mcp_registry,
             scheduled_tasks,
+            users,
+            prompts,
+            language_resolver,
         })
     }
 }
@@ -563,18 +400,24 @@ fn build_builtin_tools(deps: BuiltinToolDeps<'_>) -> Result<ToolRegistry, AppErr
         .build())
 }
 
-/// Seed material for the per-org default agent.
+/// Seed material for the per-org default agent in `language`.
 ///
 /// Exposed so the OAuth callback (`auth::callback`) can mint the default
-/// agent inside the just-created personal org without re-importing the
-/// recruiter prompt constants. Fails only if one of the seed constants
-/// suddenly violates a newtype invariant — a compile-time-ish guarantee
-/// in practice.
-pub fn default_agent_seed() -> Result<DefaultAgentSeed, AppError> {
+/// agent inside the just-created personal org. The role + description
+/// bodies are pulled from the per-language [`Prompts`] registry — the
+/// `recruiter` an `org_id` with `default_language='vi'` ends up with is
+/// the Vietnamese-translated seed. Fails only if the registry bodies
+/// suddenly violate a newtype invariant (a startup-time guarantee in
+/// practice since `Prompts::load` panics on malformed input).
+pub fn default_agent_seed(
+    prompts: &Prompts,
+    language: Language,
+) -> Result<DefaultAgentSeed, AppError> {
+    let set = prompts.set(language);
     Ok(DefaultAgentSeed {
         name: AgentName::try_from(DEFAULT_AGENT_NAME)?,
-        system_prompt: AgentSystemPrompt::try_from(DEFAULT_AGENT_ROLE_PROMPT)?,
-        description: AgentDescription::try_from(DEFAULT_AGENT_DESCRIPTION)?,
+        system_prompt: AgentSystemPrompt::try_from(set.default_agent_role.as_ref())?,
+        description: AgentDescription::try_from(set.default_agent_description.as_ref())?,
     })
 }
 
@@ -717,7 +560,6 @@ pub async fn build_server(
         &settings.auth.google_redirect_url,
     )
     .map_err(AppError::Auth)?;
-    let users: SharedUserStore = Arc::new(PgUserStore::new(pieces.pool.clone()));
 
     let memberships = Arc::new(crate::http::MembershipCache::new(pieces.clock.clone()));
     let state = AppState {
@@ -734,10 +576,12 @@ pub async fn build_server(
         pool: pieces.pool.clone(),
         jwt,
         oauth,
-        users,
+        users: pieces.users,
         clock: pieces.clock.clone(),
         cookie_secure: settings.auth.cookie_secure,
         memberships,
+        prompts: pieces.prompts,
+        language_resolver: pieces.language_resolver,
     };
 
     Ok(Server {

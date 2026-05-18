@@ -175,6 +175,7 @@ impl GoogleOAuth {
             email_verified: true,
             display_name: raw.name,
             avatar_url: raw.picture,
+            locale: raw.locale,
         })
     }
 }
@@ -215,6 +216,12 @@ struct GoogleUserinfo {
     email_verified: Option<bool>,
     name: Option<String>,
     picture: Option<String>,
+    /// BCP-47 locale tag (e.g. `"vi"`, `"en-US"`). Optional — Google
+    /// returns it for most accounts but not all. Propagated raw into
+    /// `GoogleProfile.locale` and normalized later via
+    /// `Language::from_locale_hint`.
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 #[cfg(test)]

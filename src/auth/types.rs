@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use crate::types::ParseError;
 
+use super::language::Language;
+
 crate::uuid_newtype! {
     /// Opaque identifier for a user row in `users`.
     pub UserId
@@ -349,6 +351,12 @@ pub struct GoogleProfile {
     pub email_verified: bool,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
+    /// BCP-47 locale tag (e.g. `"vi"`, `"en-US"`). Treated as a hint
+    /// only — normalized into [`Language`] at the OAuth-callback boundary
+    /// via [`Language::from_locale_hint`]. Stays untyped here because
+    /// Google occasionally returns tags we don't recognize and the raw
+    /// value is still useful for diagnostics.
+    pub locale: Option<String>,
 }
 
 /// Materialised user row.
@@ -367,6 +375,7 @@ pub struct OrgMembership {
     pub org_name: String,
     pub org_slug: OrgSlug,
     pub role: Role,
+    pub default_language: Language,
 }
 
 /// What every authed HTTP request hands to its handler. Built by the

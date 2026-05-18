@@ -100,6 +100,8 @@ impl AuthMcpHarness {
             clock: clock.clone(),
             cookie_secure: false,
             memberships: std::sync::Arc::new(relay_rs::http::MembershipCache::new(clock.clone())),
+            prompts: common::lang::prompts(),
+            language_resolver: common::lang::english_resolver(),
         };
 
         Self {

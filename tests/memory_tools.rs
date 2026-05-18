@@ -12,12 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use relay_rs::agents::{AgentNamesCache, AgentPromptCache, SharedAgentStore};
+use relay_rs::auth::{Language, SharedOrgLanguageResolver};
 use relay_rs::clock::{SharedClock, SystemClock};
 use relay_rs::memory::{
     AgentMemory, MAX_MEMORY_MUTATIONS_PER_TURN, MemoryContent, MemoryHandle, MemoryKind,
     MemoryMutation, MemorySectionLoader, MemoryState, MutationSource, PgMemoryStore,
     SessionMemoryCache, SharedMemoryStore,
 };
+use relay_rs::prompts::Prompts;
 use relay_rs::runtime::PromptRequestId;
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::tools::system::{
@@ -28,6 +30,7 @@ use relay_rs::types::Participant;
 use serde_json::json;
 
 mod common;
+use common::lang::StaticOrgLanguageResolver;
 use common::pg::{TestDb, human_to_agent_session, seed_prompt_request};
 
 struct Fixture {
@@ -55,16 +58,16 @@ async fn fixture(db: &TestDb) -> Fixture {
     let session_cache = SessionMemoryCache::new(8, Duration::from_secs(60), clock.clone());
     let loader =
         MemorySectionLoader::new(store.clone(), sessions.clone(), embeddings, session_cache);
+    let prompts = Arc::new(Prompts::load());
+    let language_resolver: SharedOrgLanguageResolver =
+        Arc::new(StaticOrgLanguageResolver::new(Language::En));
     let _memory = AgentMemory::new(
         agents,
         prompt_cache,
         names_cache,
         loader.clone(),
-        relay_rs::memory::ModeCores {
-            normal: std::sync::Arc::from("core"),
-            reflection: std::sync::Arc::from("core"),
-            resolution: std::sync::Arc::from("core"),
-        },
+        prompts,
+        language_resolver,
         clock,
     );
     let session = human_to_agent_session(
@@ -382,11 +385,8 @@ async fn handle_round_trips_through_session_cache() {
         AgentPromptCache::new(2, Duration::from_secs(60), SystemClock::shared()),
         AgentNamesCache::new(16, Duration::from_secs(60), SystemClock::shared()),
         f.loader.clone(),
-        relay_rs::memory::ModeCores {
-            normal: std::sync::Arc::from("core"),
-            reflection: std::sync::Arc::from("core"),
-            resolution: std::sync::Arc::from("core"),
-        },
+        Arc::new(Prompts::load()),
+        Arc::new(StaticOrgLanguageResolver::new(Language::En)),
         SystemClock::shared(),
     );
     let resolved = memory

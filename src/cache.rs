@@ -140,6 +140,19 @@ where
             .unwrap_or_else(|_| panic!("invariant: {} mutex never poisoned", self.inner.label))
     }
 
+    /// Drop every entry. Used when an external event invalidates the
+    /// entire keyspace (e.g. an org-wide config change that affects every
+    /// agent that org owns). Cheaper than scanning to find the matching
+    /// keys and acceptable for the rare invalidation paths.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
+    /// Drop the entry for `key` if present. No-op when absent.
+    pub fn invalidate(&self, key: K) {
+        self.lock().remove(&key);
+    }
+
     /// Test/inspection: number of entries currently held.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::error::AuthError;
+use super::language::Language;
 use super::types::{
     GoogleProfile, OAuthState, OrgId, OrgMembership, PkceVerifier, Role, User, UserId,
 };
@@ -20,6 +21,12 @@ pub struct OAuthStateRow {
     pub state: OAuthState,
     pub pkce_verifier: PkceVerifier,
     pub redirect_to: Option<String>,
+    /// Inbound `Accept-Language` primary tag captured at
+    /// `/auth/google/login`. Replayed in the callback as a fallback when
+    /// Google's userinfo `locale` is missing. Length-capped to
+    /// [`super::limits::DETECTED_LOCALE_MAX_LEN`] before insert; the
+    /// column CHECK is the defence-in-depth backstop.
+    pub detected_locale: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -29,6 +36,10 @@ pub struct OAuthStateRow {
 pub struct ConsumedOAuthState {
     pub pkce_verifier: PkceVerifier,
     pub redirect_to: Option<String>,
+    /// The same `Accept-Language` primary tag the login round-trip
+    /// stashed; consumed by the callback to derive the personal org's
+    /// `default_language` via [`Language::from_locale_hint`].
+    pub detected_locale: Option<String>,
 }
 
 /// Result of an OAuth upsert. `is_new_user` lets the caller branch on
@@ -45,6 +56,7 @@ pub struct NewOrg {
     pub id: OrgId,
     pub slug: String,
     pub name: String,
+    pub default_language: Language,
 }
 
 #[async_trait]
@@ -58,12 +70,16 @@ pub trait UserStore: std::fmt::Debug + Send + Sync + 'static {
     ) -> Result<UpsertedUser, AuthError>;
 
     /// Create a personal organisation for a user. Returns the new org;
-    /// also inserts an `org_members` row with role = Owner.
+    /// also inserts an `org_members` row with role = Owner. The
+    /// `default_language` is the per-org language picked by the OAuth
+    /// callback from the user's locale hints — see
+    /// [`Language::from_locale_hint`].
     async fn create_personal_org(
         &self,
         user_id: UserId,
         suggested_slug: &str,
         display_name: &str,
+        language: Language,
         now: DateTime<Utc>,
     ) -> Result<NewOrg, AuthError>;
 
@@ -76,6 +92,21 @@ pub trait UserStore: std::fmt::Debug + Send + Sync + 'static {
 
     /// Look up a user by id (for `/me`).
     async fn read_user(&self, user_id: UserId) -> Result<Option<User>, AuthError>;
+
+    /// Read the org's `default_language`. Called by the language
+    /// resolver on cache miss; the column is NOT NULL, so a missing row
+    /// surfaces as an `AuthError`.
+    async fn read_org_language(&self, org_id: OrgId) -> Result<Language, AuthError>;
+
+    /// Set the org's `default_language`. Returns the persisted value
+    /// (always equal to `language` on success) so the handler can echo
+    /// it back without a re-read.
+    async fn set_org_language(
+        &self,
+        org_id: OrgId,
+        language: Language,
+        now: DateTime<Utc>,
+    ) -> Result<Language, AuthError>;
 
     /// Insert a `oauth_login_states` row. Caller has minted the random
     /// `state` + PKCE verifier.

@@ -3,11 +3,20 @@
 
 export type Role = "owner" | "admin" | "member";
 
+/** Mirrors `src/auth/language.rs` — kept narrow so the i18n layer can
+ *  exhaustive-match on it. Adding a language here requires a paired
+ *  backend change (new TOML + migration CHECK update). */
+export type Language = "en" | "vi";
+
 export type Org = {
   id: string;
   name: string;
   slug: string;
   role: Role;
+  /** Org-wide language driving the agent's `<language>` directive and
+   *  the web app's i18n. Mutated via `PATCH /me/org/language` for
+   *  owner/admin members. */
+  default_language: Language;
 };
 
 export type User = {

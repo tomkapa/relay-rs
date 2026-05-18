@@ -12,6 +12,7 @@ use sqlx::PgPool;
 use sqlx::Row;
 
 use super::error::AuthError;
+use super::language::Language;
 use super::limits::MAX_SLUG_RETRIES;
 use super::store::{ConsumedOAuthState, NewOrg, OAuthStateRow, UpsertedUser, UserStore};
 use super::types::{
@@ -133,6 +134,7 @@ impl UserStore for PgUserStore {
         user_id: UserId,
         suggested_slug: &str,
         display_name: &str,
+        language: Language,
         now: DateTime<Utc>,
     ) -> Result<NewOrg, AuthError> {
         let base = sanitize_slug(suggested_slug);
@@ -154,7 +156,7 @@ impl UserStore for PgUserStore {
                 Err(e) => return Err(AuthError::Parse(e)),
             };
             match self
-                .try_insert_org(user_id, slug.as_str(), display_name, now)
+                .try_insert_org(user_id, slug.as_str(), display_name, language, now)
                 .await
             {
                 Ok(new_org) => return Ok(new_org),
@@ -174,7 +176,7 @@ impl UserStore for PgUserStore {
     async fn list_user_orgs(&self, user_id: UserId) -> Result<Vec<OrgMembership>, AuthError> {
         let mut tx = super::begin_privileged(&self.pool).await?;
         let rows = sqlx::query(
-            "SELECT o.id, o.name, o.slug::text AS slug, m.role
+            "SELECT o.id, o.name, o.slug::text AS slug, o.default_language, m.role
              FROM org_members m
              JOIN organizations o ON o.id = m.org_id
              WHERE m.user_id = $1
@@ -192,6 +194,7 @@ impl UserStore for PgUserStore {
                     org_slug: OrgSlug::try_from(r.get::<String, _>("slug"))?,
                     role: Role::parse(r.get::<&str, _>("role"))
                         .ok_or(AuthError::Internal("unknown role in db"))?,
+                    default_language: r.get::<Language, _>("default_language"),
                 })
             })
             .collect()
@@ -226,15 +229,57 @@ impl UserStore for PgUserStore {
         }))
     }
 
+    async fn read_org_language(&self, org_id: OrgId) -> Result<Language, AuthError> {
+        let mut tx = super::begin_privileged(&self.pool).await?;
+        let value: Option<Language> =
+            sqlx::query_scalar("SELECT default_language FROM organizations WHERE id = $1")
+                .bind(org_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        // §6: the language column is NOT NULL and `id` is the primary
+        // key; a missing row reachable from `Principal.active_org_id`
+        // means the membership row out-lived the org, which is itself a
+        // wiring bug we want surfaced.
+        value.ok_or(AuthError::Internal(
+            "org not found for default_language read",
+        ))
+    }
+
+    async fn set_org_language(
+        &self,
+        org_id: OrgId,
+        language: Language,
+        now: DateTime<Utc>,
+    ) -> Result<Language, AuthError> {
+        let mut tx = super::begin_privileged(&self.pool).await?;
+        let updated: Option<Language> = sqlx::query_scalar(
+            "UPDATE organizations
+             SET default_language = $2, updated_at = $3
+             WHERE id = $1
+             RETURNING default_language",
+        )
+        .bind(org_id)
+        .bind(language)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        updated.ok_or(AuthError::Internal(
+            "org not found for default_language write",
+        ))
+    }
+
     async fn insert_oauth_state(&self, row: &OAuthStateRow) -> Result<(), AuthError> {
         let mut tx = super::begin_privileged(&self.pool).await?;
         sqlx::query(
-            "INSERT INTO oauth_login_states (state, pkce_verifier, redirect_to, created_at, expires_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO oauth_login_states (state, pkce_verifier, redirect_to, detected_locale, created_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(row.state.as_str())
         .bind(row.pkce_verifier.as_str())
         .bind(row.redirect_to.as_deref())
+        .bind(row.detected_locale.as_deref())
         .bind(row.created_at)
         .bind(row.expires_at)
         .execute(&mut *tx)
@@ -252,7 +297,7 @@ impl UserStore for PgUserStore {
         let row = sqlx::query(
             "DELETE FROM oauth_login_states
              WHERE state = $1 AND expires_at > $2
-             RETURNING pkce_verifier, redirect_to",
+             RETURNING pkce_verifier, redirect_to, detected_locale",
         )
         .bind(state.as_str())
         .bind(now)
@@ -269,6 +314,7 @@ impl UserStore for PgUserStore {
         Ok(ConsumedOAuthState {
             pkce_verifier: PkceVerifier::try_from(row.get::<String, _>("pkce_verifier"))?,
             redirect_to: row.get("redirect_to"),
+            detected_locale: row.get("detected_locale"),
         })
     }
 }
@@ -279,17 +325,19 @@ impl PgUserStore {
         user_id: UserId,
         slug: &str,
         display_name: &str,
+        language: Language,
         now: DateTime<Utc>,
     ) -> Result<NewOrg, AuthError> {
         let mut tx = super::begin_privileged(&self.pool).await?;
         let id = OrgId::new();
         sqlx::query(
-            "INSERT INTO organizations (id, name, slug, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $4)",
+            "INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $5)",
         )
         .bind(id)
         .bind(display_name)
         .bind(slug)
+        .bind(language)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -307,6 +355,7 @@ impl PgUserStore {
             id,
             slug: slug.to_owned(),
             name: display_name.to_owned(),
+            default_language: language,
         })
     }
 }

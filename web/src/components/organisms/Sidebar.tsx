@@ -6,6 +6,7 @@ import { Kbd } from "../atoms/Kbd";
 import { Monogram } from "../atoms/Monogram";
 import { StatusSquare } from "../atoms/StatusSquare";
 import { cn } from "../../lib/utils";
+import { useT } from "../../i18n";
 import type { Agent, ThreadSummary } from "../../types/api";
 
 export function Sidebar({
@@ -31,6 +32,7 @@ export function Sidebar({
   orgSwitcher?: ReactNode;
   userMenu?: ReactNode;
 }) {
+  const { t } = useT();
   const channels = [{ name: "general", icon: Hash, count: threads.length }];
   const threadCountByAgent = useMemo(() => {
     const m = new Map<string, number>();
@@ -51,7 +53,7 @@ export function Sidebar({
           <>
             <div className="min-w-0">
               <div className="font-[var(--font-mono)] text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
-                Relay
+                {t("sidebar.brand")}
               </div>
               <div className="mt-0.5 truncate font-[var(--font-display)] text-[18px] font-bold tracking-tight text-[var(--color-ink)]">
                 {workspace}
@@ -77,7 +79,7 @@ export function Sidebar({
       <div className="flex-1 overflow-y-auto scroll-thin px-2 py-2">
         {/* CHANNELS */}
         <Section
-          title="Channels"
+          title={t("sidebar.channels")}
           expandable
           action={<AddBtn label="Add channel" />}
         />
@@ -104,7 +106,7 @@ export function Sidebar({
 
         {/* DIRECT MESSAGES — agents list, opens agent-scoped feed on click. */}
         <Section
-          title="Direct Messages"
+          title={t("sidebar.dms")}
           expandable
           action={<AddBtn label="New DM" />}
         />
@@ -136,7 +138,7 @@ export function Sidebar({
           })}
           {agents.length === 0 && (
             <p className="px-2 py-1 font-[var(--font-mono)] text-[11px] text-[var(--color-muted-2)]">
-              No agents registered.
+              {t("sidebar.empty_agents")}
             </p>
           )}
         </div>

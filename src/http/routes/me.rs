@@ -4,14 +4,14 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use cookie::time::Duration as CookieDuration;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{
-    AuthError, OrgId, OrgMembership, Principal, Role, User,
+    AuthError, Language, OrgId, OrgMembership, Principal, Role, User,
     limits::{COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_TOKEN_MAX_LEN},
 };
 
@@ -25,6 +25,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/me", get(me))
         .route("/auth/logout", post(logout))
         .route("/auth/switch-org", post(switch_org))
+        .route("/me/org/language", patch(set_org_language))
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +50,10 @@ struct OrgView {
     name: String,
     slug: String,
     role: Role,
+    /// Per-org language driving both the agent's `<language>` directive
+    /// and the web app's i18n. The FE switches its locale on every
+    /// change of this value for the active org.
+    default_language: Language,
 }
 
 async fn me(
@@ -105,6 +110,7 @@ fn view_org(m: &OrgMembership) -> OrgView {
         name: m.org_name.clone(),
         slug: m.org_slug.as_str().to_owned(),
         role: m.role,
+        default_language: m.default_language,
     }
 }
 
@@ -148,6 +154,47 @@ async fn switch_org(
     Ok((
         jar,
         Json(serde_json::json!({ "active_org_id": req.org_id, "role": role })),
+    )
+        .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct SetOrgLanguageRequest {
+    /// `"en"` or `"vi"`. `Language` is a `str_enum!` so deserialize
+    /// rejects anything outside the supported set at the boundary
+    /// (CLAUDE.md §1: parse, don't validate).
+    language: Language,
+}
+
+/// `PATCH /me/org/language` — switch the active org's `default_language`.
+///
+/// Authorization: owner or admin only. Members get 403 — language is an
+/// org-wide setting, not a per-user preference. The backend is the
+/// authority; the FE only hides the switcher as a UX nicety.
+///
+/// Side effect: invalidates the in-process [`OrgLanguageResolver`] cache
+/// so the agent worker picks up the new value on the next turn rather
+/// than waiting for natural TTL expiry. Cache invalidation is whole-keyset
+/// today (see `PgOrgLanguageResolver::invalidate_all`); cheap because the
+/// cache is small and language changes are rare.
+async fn set_org_language(
+    State(state): State<AppState>,
+    principal: Principal,
+    Json(req): Json<SetOrgLanguageRequest>,
+) -> Result<Response, HttpError> {
+    match principal.role {
+        Role::Owner | Role::Admin => {}
+        Role::Member => return Err(HttpError::Forbidden("owner or admin role required")),
+    }
+    let now = state.clock.now_utc();
+    let updated = state
+        .users
+        .set_org_language(principal.active_org_id, req.language, now)
+        .await?;
+    state.language_resolver.invalidate_all();
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "default_language": updated })),
     )
         .into_response())
 }

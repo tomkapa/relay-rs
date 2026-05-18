@@ -117,7 +117,7 @@ pub async fn seed_principal(pool: &PgPool, jwt: &JwtSigner) -> SeededPrincipal {
         .execute(pool)
         .await
         .expect("seed user");
-    sqlx::query("INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)")
+    sqlx::query("INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at) VALUES ($1, $2, $3, 'en', $4, $4)")
         .bind(org_id)
         .bind("Test Org")
         .bind(&slug)
