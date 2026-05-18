@@ -1,6 +1,6 @@
 # PLAN
 ## Governance
-- [ ] Organization and user
+- [x] Organization and user
 ## Agent core
 - [x] Each agent has a subset of tools
 - [x] Each agent has its own memory
@@ -14,7 +14,7 @@
 - [ ] Tool call permission using hook
 - [x] Tool call parallel execution
 ### MCP
-- [ ] OAuth
+- [x] OAuth
 ## Interface
 - [x] Web UI
 - [ ] Integrate with Slack
