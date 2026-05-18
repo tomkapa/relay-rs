@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::auth::UserId;
+use crate::auth::{OrgId, UserId};
 use crate::runtime::{PromptRequestId, RequestKindPayload};
 use crate::session::SessionId;
 use crate::types::{Participant, ToolName};
@@ -84,6 +84,12 @@ pub struct ToolCallContext {
     /// right principal — a worker that tried to write into a foreign
     /// org's tables would be rejected at the boundary.
     pub acting_user_id: UserId,
+    /// Organization that owns the claimed session. Threaded from the
+    /// worker pool (`ClaimedSession.org_id`); used by the dispatcher's
+    /// `tool_calls` recorder to denormalise org on the audit row
+    /// (matches the parent session's org — the BEFORE INSERT trigger
+    /// in migration 25 enforces equality as defence in depth).
+    pub org_id: OrgId,
 }
 
 /// A side-effecting capability the model can request.

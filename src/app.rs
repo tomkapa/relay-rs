@@ -344,6 +344,7 @@ struct AgentFactoryPieces {
     builtin_tools: ToolRegistry,
     mcp_registry: McpRegistry,
     model: crate::types::ModelId,
+    tool_call_store: crate::tools::SharedToolCallStore,
 }
 
 impl AgentFactoryPieces {
@@ -363,6 +364,7 @@ impl AgentFactoryPieces {
         .with_tools(toolbox)
         .with_hooks(HookChain::new())
         .with_clock(self.clock.clone())
+        .with_tool_call_store(self.tool_call_store.clone())
         .build()
     }
 }
@@ -488,6 +490,9 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
         pieces.builtin_tools.clone(),
         pieces.mcp_registry.as_dynamic_source(),
     );
+    let tool_call_store: crate::tools::SharedToolCallStore = Arc::new(
+        crate::tools::PgToolCallStore::new(pieces.pool.clone(), pieces.clock.clone()),
+    );
     AgentBuilder::new(
         pieces.provider.clone(),
         pieces.sessions.clone(),
@@ -498,6 +503,7 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
     .with_tools(toolbox)
     .with_hooks(HookChain::new())
     .with_clock(pieces.clock.clone())
+    .with_tool_call_store(tool_call_store)
     .build()
 }
 
@@ -513,6 +519,9 @@ pub async fn build_server(
     // and builds a `ScopedMcpSource` so the agent's `ToolBox` only sees the
     // permitted servers' tools. Everything else (provider, sessions, memory,
     // builtins, hooks) is cheap-clone shared across agents.
+    let tool_call_store: crate::tools::SharedToolCallStore = Arc::new(
+        crate::tools::PgToolCallStore::new(pieces.pool.clone(), pieces.clock.clone()),
+    );
     let factory_pieces = AgentFactoryPieces {
         provider: pieces.provider.clone(),
         sessions: pieces.sessions.clone(),
@@ -521,6 +530,7 @@ pub async fn build_server(
         builtin_tools: pieces.builtin_tools.clone(),
         mcp_registry: pieces.mcp_registry.clone(),
         model: settings.model.clone(),
+        tool_call_store,
     };
     let factory: AgentFactory = Arc::new(move |record| factory_pieces.build(record));
     let agents_registry: SharedAgents = Arc::new(CachedAgents::new(
