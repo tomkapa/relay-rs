@@ -140,3 +140,76 @@ export type SubmitPromptResponse = {
   session_id: string;
   status: RequestStatus;
 };
+
+// ─── MCP server wire shapes ─────────────────────────────────────────────
+// Mirrors src/http/routes/mcp.rs and src/mcp/types.rs. Adding a transport
+// kind or credential kind requires a paired backend change.
+
+// Wire tag matches Rust `McpTransportInput` (`#[serde(tag = "type")]` in
+// src/mcp/types.rs). Don't switch this to `kind` — the BE will reject it.
+export type McpTransport = { type: "http"; url: string };
+
+/** Mirrors `src/mcp/types.rs::ConnectionStatus`. */
+export type ConnectionStatus = "ok" | "reconnect_required" | "error";
+
+/** Per-tool discovery summary surfaced in McpServer.discovered_tools. */
+export type DiscoveredTool = {
+  prefixed_name: string;
+  remote_name: string;
+  description: string | null;
+};
+
+export type McpServer = {
+  id: string;
+  alias: string;
+  enabled: boolean;
+  config: McpTransport;
+  description: string | null;
+  last_seen_at: string | null;
+  last_error: string | null;
+  discovered_tools: DiscoveredTool[] | null;
+  created_by_user_id: string;
+  has_credentials: boolean;
+  credentials_kind: "static_headers" | "oauth2" | null;
+  connection_status: ConnectionStatus;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Only `static_headers` is accepted on the create/replace path today;
+ *  OAuth tokens are written by the callback handler. */
+export type CredentialInput = {
+  kind: "static_headers";
+  headers: Record<string, string>;
+};
+
+export type CreateMcpServerRequest = {
+  alias: string;
+  config: McpTransport;
+  description?: string | null;
+  enabled?: boolean;
+  credentials?: CredentialInput;
+};
+
+export type UpdateMcpServerRequest = {
+  alias?: string;
+  config?: McpTransport;
+  description?: string | null;
+  enabled?: boolean;
+};
+
+export type TestConnectRequest = {
+  config: McpTransport;
+  credentials?: CredentialInput;
+};
+
+export type TestConnectResponse =
+  | { outcome: "ok"; discovered_tools: DiscoveredTool[] }
+  | { outcome: "failed"; error: string };
+
+export type OAuthStartRequest = {
+  redirect_to?: string;
+  scope?: string;
+};
+
+export type OAuthStartResponse = { authorize_url: string };

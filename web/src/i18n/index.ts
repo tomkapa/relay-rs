@@ -61,16 +61,29 @@ export function getLanguage(): Language {
 }
 
 /** Translate a key. Falls back to the English value on a miss (every
- *  table has the same keys by construction, so a miss means a typo). */
-export function t(key: TranslationKey): string {
-  return tables[currentLanguage][key] ?? en[key];
+ *  table has the same keys by construction, so a miss means a typo).
+ *  When `vars` is supplied, `{name}`-style placeholders inside the
+ *  template are replaced with the matching value. Unknown placeholders
+ *  are left in place so a typo doesn't silently swallow content. */
+export function t(
+  key: TranslationKey,
+  vars?: Record<string, string | number>,
+): string {
+  const raw = tables[currentLanguage][key] ?? en[key];
+  if (!vars) return raw;
+  return raw.replace(/\{(\w+)\}/g, (m, name: string) =>
+    name in vars ? String(vars[name]) : m,
+  );
 }
 
 /** React hook: returns a `t` bound to the current language that
  *  re-renders the calling component on every `setLanguage` call. The
  *  hook deliberately returns an object so a future swap to
  *  `react-i18next` is a one-line `const { t } = useTranslation()`. */
-export function useT(): { t: (key: TranslationKey) => string; language: Language } {
+export function useT(): {
+  t: (key: TranslationKey, vars?: Record<string, string | number>) => string;
+  language: Language;
+} {
   // Bare counter forces a re-render on every notification; no need to
   // store the actual language because every render reads through `t()`.
   const subscribe = (cb: () => void) => {

@@ -1,19 +1,46 @@
-import { Bot, House } from "lucide-react";
+import { Bot, House, Plug } from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { cn } from "../../lib/utils";
+import { useT } from "../../i18n";
 
 type MenuItem = {
   id: string;
   label: string;
   icon: typeof House;
-  active?: boolean;
+  /** Match against the current pathname prefix to highlight as active. */
+  match: (pathname: string) => boolean;
+  to: string;
 };
 
-const items: MenuItem[] = [
-  { id: "home", label: "Home", icon: House, active: true },
-  { id: "agent", label: "Agent", icon: Bot },
-];
-
 export function MenuRail() {
+  const nav = useNavigate();
+  const { pathname } = useLocation();
+  const { t } = useT();
+
+  const items: MenuItem[] = [
+    {
+      id: "home",
+      label: "Home",
+      icon: House,
+      match: (p) => p === "/" || p.startsWith("/threads") || p.startsWith("/c/"),
+      to: "/",
+    },
+    {
+      id: "agent",
+      label: "Agent",
+      icon: Bot,
+      match: (p) => p.startsWith("/agents"),
+      to: "/agents",
+    },
+    {
+      id: "connections",
+      label: t("menu.connections"),
+      icon: Plug,
+      match: (p) => p.startsWith("/connections"),
+      to: "/connections",
+    },
+  ];
+
   return (
     <aside
       className="flex h-full w-[72px] shrink-0 flex-col items-center gap-1.5 bg-[#1E3322] p-2"
@@ -32,13 +59,16 @@ export function MenuRail() {
 
       {items.map((item) => {
         const Icon = item.icon;
+        const active = item.match(pathname);
         return (
           <button
             key={item.id}
-            aria-current={item.active ? "page" : undefined}
+            type="button"
+            onClick={() => nav(item.to)}
+            aria-current={active ? "page" : undefined}
             className={cn(
               "flex w-full flex-col items-center gap-1 px-2 py-1 transition-colors",
-              item.active
+              active
                 ? "bg-white/10 text-white"
                 : "text-white/80 hover:bg-white/5 hover:text-white",
             )}

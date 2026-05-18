@@ -17,6 +17,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::Redirect;
 use axum::routing::{delete, get, post, put};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -771,58 +772,189 @@ struct OAuthCallbackQuery {
 }
 
 /// `GET /mcp-oauth/callback?code=&state=`. Runs without a session
-/// cookie — the user is bouncing back from the vendor's consent screen.
-/// CSRF protection: `state` is a one-shot row that we `DELETE …
-/// RETURNING` so a replay can't reuse it.
+/// cookie — CSRF protection comes from `state` being a one-shot row.
+/// Always returns a 303 redirect to the FE callback page with
+/// `?status=ok` or `?status=failed&reason=…` so the user lands on a
+/// rendered page either way.
+#[tracing::instrument(name = "mcp.oauth.callback", skip_all)]
 async fn handle_oauth_callback(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<OAuthCallbackQuery>,
-) -> Result<axum::response::Response, HttpError> {
-    use axum::response::IntoResponse as _;
+) -> axum::response::Response {
+    match callback_flow(&state, q).await {
+        Ok(redirect_to) => {
+            tracing::info!(event = "mcp.oauth.callback.ok");
+            redirect_ok(redirect_to.as_deref())
+        }
+        Err(CallbackFail {
+            redirect_to,
+            reason,
+        }) => {
+            tracing::info!(event = "mcp.oauth.callback.failed", reason = %reason);
+            redirect_failed(redirect_to.as_deref(), reason)
+        }
+    }
+}
 
-    // Vendor signalled an error (user denied, scope rejected, etc.). The
-    // pending row is still consumed below so a follow-up flow can start
-    // fresh.
+struct CallbackFail {
+    redirect_to: Option<String>,
+    reason: &'static str,
+}
+
+async fn callback_flow(
+    state: &AppState,
+    q: OAuthCallbackQuery,
+) -> Result<Option<String>, CallbackFail> {
     if let Some(err) = q.error.as_deref() {
         tracing::warn!(
             event = "mcp.oauth.callback.vendor_error",
             error = %err,
             description = q.error_description.as_deref().unwrap_or(""),
         );
+        let redirect_to = consume_pending_for_redirect(state, q.state.as_deref()).await;
+        // The vendor's `error` token already passes through `sanitize_reason`
+        // in `failed_redirect`, so a raw value here is safe.
+        return Err(CallbackFail {
+            redirect_to,
+            reason: vendor_error_to_reason(err),
+        });
     }
-    let state_val = q
-        .state
-        .ok_or(HttpError::BadRequest("state missing".into()))?;
-    let code = q.code.ok_or(HttpError::BadRequest("code missing".into()))?;
-
+    let state_val = q.state.as_deref().ok_or(CallbackFail {
+        redirect_to: None,
+        reason: "state_missing",
+    })?;
+    let Some(code) = q.code.as_deref() else {
+        let redirect_to = consume_pending_for_redirect(state, Some(state_val)).await;
+        return Err(CallbackFail {
+            redirect_to,
+            reason: "code_missing",
+        });
+    };
     let now = state.clock.now_utc();
-    let pending: PendingAuthorization = state
-        .mcp_oauth_pending
-        .consume(&state_val, now)
+    let pending = consume_pending(state, state_val, now).await?;
+    let dcr = load_dcr(state, &pending).await?;
+    let token = exchange_token(state, &dcr, &pending, code, now).await?;
+    persist_oauth_success(state, &pending, token, now)
         .await
-        .map_err(map_oauth_err)?
-        .ok_or_else(|| HttpError::BadRequest("unknown or expired state".into()))?;
+        .map_err(|reason| CallbackFail {
+            redirect_to: pending.redirect_to.clone(),
+            reason,
+        })?;
+    Ok(pending.redirect_to)
+}
 
-    let dcr = state
+fn redirect_ok(redirect_to: Option<&str>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    Redirect::to(&ok_redirect(redirect_to)).into_response()
+}
+
+fn redirect_failed(redirect_to: Option<&str>, reason: &str) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    Redirect::to(&failed_redirect(redirect_to, reason)).into_response()
+}
+
+/// Convert a vendor `error` query token into our short reason key. Anything
+/// other than the standard set falls through to a generic `vendor_error`
+/// so we never leak unbounded vendor text into the FE URL.
+fn vendor_error_to_reason(raw: &str) -> &'static str {
+    match raw {
+        "access_denied" => "access_denied",
+        "invalid_scope" => "invalid_scope",
+        "server_error" => "vendor_server_error",
+        "temporarily_unavailable" => "vendor_unavailable",
+        _ => "vendor_error",
+    }
+}
+
+async fn consume_pending(
+    state: &AppState,
+    state_val: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PendingAuthorization, CallbackFail> {
+    match state.mcp_oauth_pending.consume(state_val, now).await {
+        Ok(Some(p)) => Ok(p),
+        Ok(None) => Err(CallbackFail {
+            redirect_to: None,
+            reason: "unknown_or_expired_state",
+        }),
+        Err(e) => {
+            tracing::error!(
+                event = "mcp.oauth.callback.consume_failed",
+                error = ?e,
+            );
+            Err(CallbackFail {
+                redirect_to: None,
+                reason: "internal_error",
+            })
+        }
+    }
+}
+
+async fn load_dcr(
+    state: &AppState,
+    pending: &PendingAuthorization,
+) -> Result<crate::mcp::oauth::DcrClientRecord, CallbackFail> {
+    match state
         .mcp_oauth_clients
         .read(pending.org_id, &pending.issuer)
         .await
-        .map_err(map_oauth_err)?
-        .ok_or_else(|| HttpError::BadRequest("oauth client missing".into()))?;
+    {
+        Ok(Some(dcr)) => Ok(dcr),
+        Ok(None) => Err(CallbackFail {
+            redirect_to: pending.redirect_to.clone(),
+            reason: "oauth_client_missing",
+        }),
+        Err(e) => {
+            tracing::error!(
+                event = "mcp.oauth.callback.client_lookup_failed",
+                error = ?e,
+            );
+            Err(CallbackFail {
+                redirect_to: pending.redirect_to.clone(),
+                reason: "internal_error",
+            })
+        }
+    }
+}
 
+async fn exchange_token(
+    state: &AppState,
+    dcr: &crate::mcp::oauth::DcrClientRecord,
+    pending: &PendingAuthorization,
+    code: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::mcp::oauth::TokenExchangeResult, CallbackFail> {
     let redirect_uri = format!("{}{}", state.oauth_redirect_base, OAUTH_CALLBACK_PATH);
-    let token = exchange_code(
+    exchange_code(
         &state.mcp_oauth_flow,
-        &dcr,
+        dcr,
         &redirect_uri,
-        &code,
+        code,
         &pending.pkce_verifier,
         now,
     )
     .await
-    .map_err(map_oauth_err)?;
+    .map_err(|e| {
+        // Upstream/vendor failure — not our error, so `warn`. CLAUDE.md
+        // §2: "ERROR = user-visible failure"; vendor refusing the
+        // exchange is an operating error from our side.
+        tracing::warn!(
+            event = "mcp.oauth.callback.exchange_failed",
+            error = ?e,
+        );
+        CallbackFail {
+            redirect_to: pending.redirect_to.clone(),
+            reason: "token_exchange_failed",
+        }
+    })
+}
 
-    // Persist the freshly-issued tokens via the credentials seam.
+async fn persist_oauth_success(
+    state: &AppState,
+    pending: &PendingAuthorization,
+    token: crate::mcp::oauth::TokenExchangeResult,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), &'static str> {
     let payload = CredentialPayload::Oauth2(OAuth2Payload {
         access_token: token.access_token,
         refresh_token: token.refresh_token,
@@ -831,7 +963,7 @@ async fn handle_oauth_callback(
         issuer: token.issuer,
         token_endpoint: token.token_endpoint,
     });
-    state
+    if let Err(e) = state
         .mcp_credentials
         .upsert(McpCredentialWrite {
             server_id: pending.server_id,
@@ -839,42 +971,141 @@ async fn handle_oauth_callback(
             payload,
         })
         .await
-        .map_err(HttpError::Mcp)?;
+    {
+        tracing::error!(
+            event = "mcp.oauth.callback.credentials_write_failed",
+            error = ?e,
+        );
+        return Err("credentials_write_failed");
+    }
+    mark_connected(state, pending.server_id, pending.org_id, now)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                event = "mcp.oauth.callback.status_update_failed",
+                error = ?e,
+            );
+            "internal_error"
+        })?;
+    state.mcp_refresh.request();
+    Ok(())
+}
 
-    // Flip the connection_status back to `ok` (it might have been
-    // `reconnect_required` from a prior revocation) and signal a refresh
-    // so the new token is used immediately. The callback runs without a
-    // session cookie, so we drop into `run_privileged` rather than
-    // `begin_as`; the explicit `org_id = $2` filter pins the row.
+// Privileged write: the callback runs without a session cookie, so we
+// can't go through `begin_as`. `org_id = $2` pins the row to the tenant
+// the pending row was issued for.
+async fn mark_connected(
+    state: &AppState,
+    server_id: McpServerId,
+    org_id: crate::auth::OrgId,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::auth::AuthError> {
     crate::auth::run_privileged::<(), crate::auth::AuthError>(&state.pool, async |tx| {
         sqlx::query(
             "UPDATE mcp_servers SET connection_status = 'ok', last_error = NULL, \
                                     updated_at = $3 \
              WHERE id = $1 AND org_id = $2",
         )
-        .bind(pending.server_id)
-        .bind(pending.org_id)
+        .bind(server_id)
+        .bind(org_id)
         .bind(now)
         .execute(&mut **tx)
         .await?;
         Ok(())
     })
     .await
-    .map_err(|e| {
-        tracing::error!(error = %e, "mcp.oauth.callback.status_update_failed");
-        HttpError::Internal
-    })?;
-    state.mcp_refresh.request();
+}
 
-    // A vendor that re-encodes our params can't turn this into an
-    // open-redirect: every candidate goes through the same allow-list
-    // as `/sign-in?return_to`.
-    let dest = pending
-        .redirect_to
-        .as_deref()
+/// Best-effort consumption of the pending row when we already know the
+/// flow has failed and just want to extract the `redirect_to` so the FE
+/// lands on the right page. Swallows errors and absence — the failure
+/// redirect falls back to `/` either way.
+async fn consume_pending_for_redirect(state: &AppState, raw_state: Option<&str>) -> Option<String> {
+    let raw = raw_state?;
+    let now = state.clock.now_utc();
+    match state.mcp_oauth_pending.consume(raw, now).await {
+        Ok(Some(p)) => p.redirect_to,
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                event = "mcp.oauth.callback.consume_for_redirect_failed",
+                error = ?e,
+            );
+            None
+        }
+    }
+}
+
+/// Build the successful-callback redirect URL. The base path is the
+/// caller-supplied `redirect_to` if it survives `sanitize_return_to`
+/// (relative path, ≤2048 bytes); otherwise `/`. A `status=ok` marker is
+/// appended so the FE polling loop terminates immediately on first nav.
+fn ok_redirect(redirect_to: Option<&str>) -> String {
+    let base = sanitized_base(redirect_to);
+    append_query(&base, "status=ok")
+}
+
+/// Build the failed-callback redirect URL. Same allow-list as
+/// [`ok_redirect`]; appends `status=failed` plus a sanitized short
+/// `reason` token so the FE Failed frame can branch on it.
+fn failed_redirect(redirect_to: Option<&str>, reason: &str) -> String {
+    let base = sanitized_base(redirect_to);
+    let safe_reason = sanitize_reason(reason);
+    append_query(
+        &base,
+        &format!("status=failed&reason={}", encode_query_value(&safe_reason)),
+    )
+}
+
+fn sanitized_base(redirect_to: Option<&str>) -> String {
+    redirect_to
         .and_then(super::auth::sanitize_return_to)
-        .unwrap_or_else(|| "/".to_owned());
-    Ok(axum::response::Redirect::to(&dest).into_response())
+        .unwrap_or_else(|| "/".to_owned())
+}
+
+fn append_query(base: &str, kv: &str) -> String {
+    if base.contains('?') {
+        format!("{base}&{kv}")
+    } else {
+        format!("{base}?{kv}")
+    }
+}
+
+/// Clamp the failure reason to an ASCII-safe short token so a vendor
+/// can't smuggle markup or unbounded text into our FE via the query
+/// string. We keep `[a-z0-9_-]`, lowercase the rest into `_`, and cap
+/// the length.
+fn sanitize_reason(raw: &str) -> String {
+    const MAX: usize = 64;
+    let mut out = String::with_capacity(raw.len().min(MAX));
+    for ch in raw.chars().take(MAX) {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_owned()
+    } else {
+        out
+    }
+}
+
+/// Minimal percent-encoder for a query value. Our reasons are already
+/// `[a-z0-9_-]` after `sanitize_reason`, so this is a belt-and-braces
+/// pass that escapes any stragglers without pulling in a new dep.
+fn encode_query_value(raw: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 #[derive(Debug, Serialize)]
@@ -919,5 +1150,68 @@ fn map_oauth_err(err: OAuthError) -> HttpError {
             HttpError::Internal
         }
         OAuthError::Mcp(e) => HttpError::Mcp(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ok_redirect_uses_root_when_caller_omitted_path() {
+        assert_eq!(ok_redirect(None), "/?status=ok");
+    }
+
+    #[test]
+    fn ok_redirect_appends_status_to_safe_path() {
+        assert_eq!(
+            ok_redirect(Some("/connections/oauth-callback?server_id=abc")),
+            "/connections/oauth-callback?server_id=abc&status=ok"
+        );
+    }
+
+    // open-redirect attempts get clamped to `/` via sanitize_return_to.
+    #[test]
+    fn ok_redirect_rejects_absolute_url() {
+        assert_eq!(
+            ok_redirect(Some("https://attacker.example/steal")),
+            "/?status=ok"
+        );
+    }
+
+    #[test]
+    fn ok_redirect_rejects_protocol_relative_url() {
+        assert_eq!(ok_redirect(Some("//attacker.example")), "/?status=ok");
+    }
+
+    #[test]
+    fn failed_redirect_lowercases_and_escapes_reason() {
+        assert_eq!(
+            failed_redirect(None, "Access Denied!"),
+            "/?status=failed&reason=access_denied_"
+        );
+    }
+
+    #[test]
+    fn failed_redirect_falls_back_when_reason_is_empty() {
+        assert_eq!(failed_redirect(None, ""), "/?status=failed&reason=unknown");
+    }
+
+    #[test]
+    fn sanitize_reason_caps_length_and_normalizes() {
+        let long = "x".repeat(200);
+        let out = sanitize_reason(&long);
+        assert_eq!(out.len(), 64);
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn encode_query_value_passes_through_safe_chars() {
+        assert_eq!(encode_query_value("abc_123-XYZ.~"), "abc_123-XYZ.~");
+    }
+
+    #[test]
+    fn encode_query_value_percent_encodes_unsafe_chars() {
+        assert_eq!(encode_query_value("a b/c"), "a%20b%2Fc");
     }
 }

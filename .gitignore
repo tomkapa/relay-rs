@@ -14,3 +14,8 @@
 web/node_modules/
 web/dist/
 web/.bun/
+
+# Playwright MCP screenshots / accessibility snapshots saved during
+# visual verification of the Connections UI. Local-only; never committed.
+.playwright-mcp/
+/v*.png
