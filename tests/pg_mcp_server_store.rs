@@ -3,7 +3,6 @@
 
 #![allow(clippy::expect_used)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use relay_rs::clock::SystemClock;
@@ -25,7 +24,6 @@ fn store(db: &TestDb) -> Arc<PgMcpServerStore> {
 fn http_transport(url: &str) -> McpTransport {
     McpTransport::Http {
         url: McpHttpUrl::try_from(url).expect("valid url"),
-        headers: BTreeMap::new(),
     }
 }
 

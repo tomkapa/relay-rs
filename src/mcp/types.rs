@@ -4,7 +4,6 @@
 //! smart constructor. The HTTP boundary parses raw JSON into these types once; nothing
 //! downstream constructs them directly.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +13,7 @@ use crate::types::ParseError;
 
 use super::limits::{
     MCP_ALIAS_MAX_LEN, MCP_DESCRIPTION_MAX_LEN, MCP_HEADER_NAME_MAX_LEN, MCP_HEADER_VALUE_MAX_LEN,
-    MCP_MAX_HEADERS, MCP_URL_MAX_LEN,
+    MCP_URL_MAX_LEN,
 };
 
 crate::uuid_newtype! {
@@ -126,15 +125,17 @@ impl TryFrom<String> for McpDescription {
 /// Validated MCP transport configuration. Persisted as JSONB; round-trips through the
 /// same `TryFrom<McpTransportInput>` so the storage and HTTP boundaries enforce the
 /// same invariants.
+///
+/// **Non-sensitive only.** Sensitive material (bearer tokens, secret-bearing
+/// headers) lives in [`crate::mcp::CredentialPayload`] under `mcp_server_credentials`
+/// — never in this struct. The decision is enforced by construction: there is
+/// no `headers` field here at all. The earlier shape carried `headers: BTreeMap`
+/// in plaintext JSONB; phase B (R2) split that material out into the encrypted
+/// seam.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "McpTransportInput", into = "McpTransportInput")]
 pub enum McpTransport {
-    Http {
-        url: McpHttpUrl,
-        /// `BTreeMap` so the JSONB ordering is deterministic — diffs and tests don't
-        /// flicker on hash randomisation.
-        headers: BTreeMap<McpHeaderName, McpHeaderValue>,
-    },
+    Http { url: McpHttpUrl },
 }
 
 /// On-the-wire shape used for both deserialize-from and serialize-to. Adding a new
@@ -142,35 +143,16 @@ pub enum McpTransport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum McpTransportInput {
-    Http {
-        url: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
-    },
+    Http { url: String },
 }
 
 impl TryFrom<McpTransportInput> for McpTransport {
     type Error = ParseError;
     fn try_from(raw: McpTransportInput) -> Result<Self, Self::Error> {
         match raw {
-            McpTransportInput::Http { url, headers } => {
+            McpTransportInput::Http { url } => {
                 let url = McpHttpUrl::try_from(url.as_str())?;
-                if headers.len() > MCP_MAX_HEADERS {
-                    return Err(ParseError::OutOfRange {
-                        field: "mcp_transport.headers",
-                        detail: "too many headers",
-                    });
-                }
-                let mut parsed = BTreeMap::new();
-                for (name, value) in headers {
-                    let name = McpHeaderName::try_from(name)?;
-                    let value = McpHeaderValue::try_from(value)?;
-                    parsed.insert(name, value);
-                }
-                Ok(Self::Http {
-                    url,
-                    headers: parsed,
-                })
+                Ok(Self::Http { url })
             }
         }
     }
@@ -179,12 +161,8 @@ impl TryFrom<McpTransportInput> for McpTransport {
 impl From<McpTransport> for McpTransportInput {
     fn from(value: McpTransport) -> Self {
         match value {
-            McpTransport::Http { url, headers } => Self::Http {
+            McpTransport::Http { url } => Self::Http {
                 url: url.as_str().to_owned(),
-                headers: headers
-                    .into_iter()
-                    .map(|(k, v)| (k.into_string(), v.into_string()))
-                    .collect(),
             },
         }
     }
@@ -464,14 +442,8 @@ mod tests {
 
     #[test]
     fn transport_round_trips_through_serde() {
-        let mut headers = BTreeMap::new();
-        headers.insert(
-            McpHeaderName::try_from("Authorization".to_owned()).expect("valid"),
-            McpHeaderValue::try_from("Bearer token-123".to_owned()).expect("valid"),
-        );
         let original = McpTransport::Http {
             url: McpHttpUrl::try_from("https://example.com/mcp").expect("valid"),
-            headers,
         };
         let json = serde_json::to_value(&original).expect("serialize");
         let round: McpTransport = serde_json::from_value(json).expect("deserialize");

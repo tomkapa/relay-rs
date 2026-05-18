@@ -97,6 +97,11 @@ impl AuthAgentsHarness {
             memory_store,
             mcp_store,
             mcp_refresh,
+            mcp_credentials: std::sync::Arc::new(relay_rs::mcp::PgMcpCredentialStore::new(
+                pool.clone(),
+                clock.clone(),
+                std::sync::Arc::new(relay_rs::crypto::OrgEncryptor::for_test([0u8; 32])),
+            )),
             mcp_test_rate: relay_rs::mcp::TestConnectRateLimiter::new(clock.clone()),
             thread_stream,
             pool,

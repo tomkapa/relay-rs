@@ -24,11 +24,13 @@ use crate::agents::{
 use crate::auth::{GoogleOAuth, JwtSigner, OrgId, PgUserStore, SharedUserStore};
 use crate::clock::{SharedClock, SystemClock};
 use crate::config::{EmbeddingSettings, ProviderSettings, Settings};
+use crate::crypto::OrgEncryptor;
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
 use crate::mcp::{
-    McpRefresher, McpRegistry, PgMcpServerStore, ScopedMcpSource, SharedMcpServerStore,
+    McpRefresher, McpRegistry, PgMcpCredentialStore, PgMcpServerStore, ScopedMcpSource,
+    SharedMcpCredentialStore, SharedMcpServerStore,
 };
 use crate::memory::{
     AgentMemory, LibrarianScheduler, MemorySectionLoader, ModeCores, PgMemoryStore,
@@ -298,6 +300,7 @@ struct Collaborators {
     sink: SharedResponseSink,
     responses: SharedResponseSource,
     mcp_store: SharedMcpServerStore,
+    mcp_credentials: SharedMcpCredentialStore,
     mcp_registry: McpRegistry,
     scheduled_tasks: SharedScheduledTaskStore,
 }
@@ -381,7 +384,20 @@ impl Collaborators {
 
         let mcp_store: SharedMcpServerStore =
             Arc::new(PgMcpServerStore::new(pool.clone(), clock.clone()));
-        let mcp_registry = McpRegistry::new(mcp_store.clone(), clock.clone());
+        let encryptor = Arc::new(
+            OrgEncryptor::from_settings(&settings.auth.master_kek)
+                .map_err(|e| AppError::Misconfigured(format!("RELAY_MASTER_KEK: {e}")))?,
+        );
+        let mcp_credentials: SharedMcpCredentialStore = Arc::new(PgMcpCredentialStore::new(
+            pool.clone(),
+            clock.clone(),
+            encryptor,
+        ));
+        let mcp_registry = McpRegistry::with_credentials(
+            mcp_store.clone(),
+            Some(mcp_credentials.clone()),
+            clock.clone(),
+        );
 
         let scheduled_tasks: SharedScheduledTaskStore =
             Arc::new(PgScheduledTaskStore::new(pool.clone(), clock.clone()));
@@ -450,6 +466,7 @@ impl Collaborators {
             sink,
             responses,
             mcp_store,
+            mcp_credentials,
             mcp_registry,
             scheduled_tasks,
         })
@@ -621,6 +638,7 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
 
 /// Build the full HTTP + worker pool composition. The returned [`Server`] is ready to
 /// hand to `axum::serve` and a graceful-shutdown loop.
+#[allow(clippy::too_many_lines)] // composition root: configuration + binding, not branching
 pub async fn build_server(
     settings: Settings,
     cancel: CancellationToken,
@@ -730,6 +748,7 @@ pub async fn build_server(
         dag: pieces.dag,
         memory_store: pieces.memory_store.clone(),
         mcp_store: pieces.mcp_store,
+        mcp_credentials: pieces.mcp_credentials,
         mcp_refresh,
         mcp_test_rate,
         thread_stream,

@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::crypto::CryptoError;
 use crate::types::ParseError;
 
 use super::types::McpServerId;
@@ -40,4 +41,7 @@ pub enum McpError {
 
     #[error("mcp store db error: {0}")]
     Db(#[from] sqlx::Error),
+
+    #[error("mcp credential crypto: {0}")]
+    Crypto(#[from] CryptoError),
 }

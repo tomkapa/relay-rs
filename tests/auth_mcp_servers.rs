@@ -8,7 +8,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use relay_rs::auth::OrgId;
@@ -92,6 +91,11 @@ impl AuthMcpHarness {
             memory_store,
             mcp_store: mcp_store.clone(),
             mcp_refresh,
+            mcp_credentials: std::sync::Arc::new(relay_rs::mcp::PgMcpCredentialStore::new(
+                pool.clone(),
+                clock.clone(),
+                std::sync::Arc::new(relay_rs::crypto::OrgEncryptor::for_test([0u8; 32])),
+            )),
             mcp_test_rate: relay_rs::mcp::TestConnectRateLimiter::new(clock.clone()),
             thread_stream,
             pool,
@@ -117,7 +121,6 @@ impl AuthMcpHarness {
         let config = McpTransport::Http {
             url: McpHttpUrl::try_from(&*format!("http://localhost:9000/{alias_str}"))
                 .expect("valid url"),
-            headers: BTreeMap::new(),
         };
         self.mcp_store
             .create(McpServerCreate {
@@ -318,4 +321,153 @@ async fn test_connect_rate_limits_per_user() {
         last_status = res.status();
     }
     assert_eq!(last_status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_with_credentials_seals_to_encrypted_table() {
+    let h = AuthMcpHarness::new().await;
+    let app = router(h.state.clone());
+    // Create a server *with* a secret-bearing header in one request.
+    let body = r#"{
+        "alias": "secret1",
+        "config": {"type": "http", "url": "http://127.0.0.1:1/"},
+        "credentials": {
+            "kind": "static_headers",
+            "headers": {"authorization": "Bearer leaky-token-do-not-echo"}
+        }
+    }"#;
+    let res = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp-servers")
+                .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", h.primary.csrf_header())
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    // R2: response never echoes the secret.
+    let body_text = serde_json::to_string(&json).expect("ser");
+    assert!(
+        !body_text.contains("leaky-token-do-not-echo"),
+        "response leaked the secret"
+    );
+    assert_eq!(json["has_credentials"], serde_json::json!(true));
+    assert_eq!(
+        json["credentials_kind"],
+        serde_json::json!("static_headers")
+    );
+
+    // R2: DB ciphertext is opaque — the plaintext token never lives in the
+    // table.
+    let cipher: Vec<u8> =
+        sqlx::query_scalar("SELECT ciphertext FROM mcp_server_credentials LIMIT 1")
+            .fetch_one(&h.state.pool)
+            .await
+            .expect("ciphertext");
+    let cipher_str = String::from_utf8_lossy(&cipher);
+    assert!(
+        !cipher_str.contains("leaky-token-do-not-echo"),
+        "ciphertext is not opaque"
+    );
+
+    // R2: GET also does not surface the secret.
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/mcp-servers")
+                .header("cookie", h.primary.cookie_header())
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let list_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let list_text = String::from_utf8(list_bytes.to_vec()).expect("utf8");
+    assert!(
+        !list_text.contains("leaky-token-do-not-echo"),
+        "list response leaked the secret"
+    );
+    let arr: serde_json::Value = serde_json::from_str(&list_text).expect("json");
+    let row = arr.as_array().expect("array")[0].clone();
+    assert_eq!(row["has_credentials"], serde_json::json!(true));
+    assert_eq!(row["credentials_kind"], serde_json::json!("static_headers"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn put_credentials_replaces_without_revealing_old_value() {
+    let h = AuthMcpHarness::new().await;
+    h.seed_mcp(h.primary.org_id, "rotate").await;
+    let server_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM mcp_servers WHERE alias = 'rotate' AND org_id = $1")
+            .bind(h.primary.org_id)
+            .fetch_one(&h.state.pool)
+            .await
+            .expect("seeded id");
+
+    let app = router(h.state.clone());
+    // First write
+    let first = r#"{"kind":"static_headers","headers":{"authorization":"Bearer old-secret"}}"#;
+    let res = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/mcp-servers/{server_id}/credentials"))
+                .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", h.primary.csrf_header())
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(first))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::NO_CONTENT);
+    let first_cipher: Vec<u8> =
+        sqlx::query_scalar("SELECT ciphertext FROM mcp_server_credentials WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&h.state.pool)
+            .await
+            .expect("first ciphertext");
+
+    // Replace
+    let second = r#"{"kind":"static_headers","headers":{"authorization":"Bearer new-secret"}}"#;
+    let res = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/mcp-servers/{server_id}/credentials"))
+                .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", h.primary.csrf_header())
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(second))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::NO_CONTENT);
+    let second_cipher: Vec<u8> =
+        sqlx::query_scalar("SELECT ciphertext FROM mcp_server_credentials WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_one(&h.state.pool)
+            .await
+            .expect("second ciphertext");
+    assert_ne!(first_cipher, second_cipher);
+    let raw = String::from_utf8_lossy(&second_cipher);
+    assert!(!raw.contains("old-secret"));
+    assert!(!raw.contains("new-secret"));
 }

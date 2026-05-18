@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use crate::auth::{AuthError, Principal};
 use crate::mcp::{
-    DiscoveredTool, McpClient, McpDescription, McpError, McpServerAlias, McpServerCreate,
-    McpServerId, McpServerRecord, McpServerUpdate, McpTransport,
+    CredentialPayload, DiscoveredTool, McpClient, McpCredentialWrite, McpDescription, McpError,
+    McpServerAlias, McpServerCreate, McpServerId, McpServerRecord, McpServerUpdate, McpTransport,
 };
 
 use super::super::error::HttpError;
@@ -45,10 +45,20 @@ pub(super) fn router() -> Router<AppState> {
                 .merge(put(update_mcp_server))
                 .merge(delete(delete_mcp_server)),
         )
+        .route(
+            "/mcp-servers/{id}/credentials",
+            put(put_mcp_credentials).merge(delete(delete_mcp_credentials)),
+        )
 }
 
 /// What we hand back on every CRUD response. Mirrors `mcp_servers` plus a flag
 /// telling the operator whether the row is currently exposed by the live registry.
+///
+/// **Never carries credential plaintext.** Phase B (R2) moves all secret
+/// material into the encrypted `mcp_server_credentials` table; the wire
+/// shape surfaces only "are credentials set?" + "what kind?", so the UI can
+/// render a state badge without the backend ever echoing the secret value
+/// back to the caller (R2 — credentials must not appear in API responses).
 #[derive(Debug, Serialize)]
 struct McpServerResponse {
     id: McpServerId,
@@ -60,12 +70,21 @@ struct McpServerResponse {
     last_error: Option<String>,
     discovered_tools: Option<Vec<DiscoveredTool>>,
     created_by_user_id: crate::auth::UserId,
+    /// `false` when no row exists in `mcp_server_credentials` for this
+    /// server; `true` otherwise. The frontend uses this to render a state
+    /// badge without us ever decrypting the payload.
+    has_credentials: bool,
+    /// `None` when `has_credentials = false`; otherwise the stable
+    /// `kind` label (`"static_headers"` or `"oauth2"`).
+    credentials_kind: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl From<McpServerRecord> for McpServerResponse {
-    fn from(r: McpServerRecord) -> Self {
+impl McpServerResponse {
+    /// Construct from a server record plus the per-server credential summary
+    /// (kind label or absence) that the SELECT already produced.
+    fn from_record(r: McpServerRecord, credentials_kind: Option<String>) -> Self {
         Self {
             id: r.id,
             alias: r.alias.as_str().to_owned(),
@@ -76,6 +95,8 @@ impl From<McpServerRecord> for McpServerResponse {
             last_error: r.last_error,
             discovered_tools: r.discovered_tools,
             created_by_user_id: r.created_by_user_id,
+            has_credentials: credentials_kind.is_some(),
+            credentials_kind,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -90,6 +111,11 @@ struct CreateMcpServerRequest {
     description: Option<String>,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    /// Optional credentials, set in the same request the row is created in.
+    /// When present, sealed under the org KEK and written to
+    /// `mcp_server_credentials` before the create returns.
+    #[serde(default)]
+    credentials: Option<CredentialInput>,
 }
 
 fn default_enabled() -> bool {
@@ -137,6 +163,14 @@ async fn create_mcp_server(
         .map(McpDescription::try_from)
         .transpose()
         .map_err(HttpError::Parse)?;
+    let credentials_payload = match payload.credentials {
+        Some(c) => {
+            c.check_caps()?;
+            Some(c.into_payload())
+        }
+        None => None,
+    };
+
     let record = state
         .mcp_store
         .create(McpServerCreate {
@@ -148,8 +182,27 @@ async fn create_mcp_server(
             enabled: payload.enabled,
         })
         .await?;
+
+    let credentials_kind = if let Some(payload) = credentials_payload {
+        let kind = payload.kind_label().to_owned();
+        state
+            .mcp_credentials
+            .upsert(McpCredentialWrite {
+                server_id: record.id,
+                org_id: principal.active_org_id,
+                payload,
+            })
+            .await?;
+        Some(kind)
+    } else {
+        None
+    };
+
     state.mcp_refresh.request();
-    Ok((StatusCode::CREATED, Json(record.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(McpServerResponse::from_record(record, credentials_kind)),
+    ))
 }
 
 async fn list_mcp_servers(
@@ -159,12 +212,18 @@ async fn list_mcp_servers(
     // Tenant-scoped read: open a tx, set `app.user_id` via the GUC, and
     // let the `mcp_servers_org_isolation` RLS policy do the filtering.
     // Bypasses the store's privileged read path so the user can see only
-    // their own org's rows.
+    // their own org's rows. The LEFT JOIN onto `mcp_server_credentials`
+    // surfaces only the `kind` label — never the ciphertext — so the
+    // response can render `has_credentials` without an extra round-trip.
     let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let rows = sqlx::query_as::<_, McpServerRowForList>(
-        "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
-                discovered_tools, created_by_user_id, created_at, updated_at \
-         FROM mcp_servers ORDER BY alias ASC",
+        "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
+                s.last_seen_at, s.last_error, s.discovered_tools, \
+                s.created_by_user_id, s.created_at, s.updated_at, \
+                c.kind AS credentials_kind \
+         FROM mcp_servers s \
+         LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
+         ORDER BY s.alias ASC",
     )
     .fetch_all(&mut *tx)
     .await
@@ -185,9 +244,13 @@ async fn read_mcp_server(
     let id = McpServerId::from(id);
     let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let row = sqlx::query_as::<_, McpServerRowForList>(
-        "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
-                discovered_tools, created_by_user_id, created_at, updated_at \
-         FROM mcp_servers WHERE id = $1",
+        "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
+                s.last_seen_at, s.last_error, s.discovered_tools, \
+                s.created_by_user_id, s.created_at, s.updated_at, \
+                c.kind AS credentials_kind \
+         FROM mcp_servers s \
+         LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
+         WHERE s.id = $1",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -240,8 +303,15 @@ async fn update_mcp_server(
             },
         )
         .await?;
+    // Look up the credential kind label after the update so the response
+    // surface remains uniform across CRUD endpoints.
+    let credentials_kind = state
+        .mcp_credentials
+        .read(row.id, principal.active_org_id)
+        .await?
+        .map(|c| c.payload.kind_label().to_owned());
     state.mcp_refresh.request();
-    Ok(Json(row.into()))
+    Ok(Json(McpServerResponse::from_record(row, credentials_kind)))
 }
 
 async fn delete_mcp_server(
@@ -265,17 +335,122 @@ async fn delete_mcp_server(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Request body for `POST /mcp-servers/test-connect`. Carries a full transport
-/// config exactly as a create request would, *except* that nothing is persisted
-/// — the handler builds an [`McpClient`] in-process, performs the MCP
-/// `initialize` handshake plus one `list_tools` round-trip, then drops the
-/// client. The 401-redact contract still applies: the request body may carry
-/// secret bearer tokens in `config.headers`, so on every response we surface
-/// either the tool list (on success) or a free-text error string — never echo
-/// the input back.
+/// PUT `/mcp-servers/{id}/credentials` — replace (or insert) the credential
+/// row for `id`. The body shape matches [`CredentialInput`]. Always writes
+/// fresh ciphertext; the old plaintext is never reconstructed (R2 —
+/// replacement must not expose the old credential).
+async fn put_mcp_credentials(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<CredentialInput>,
+) -> Result<StatusCode, HttpError> {
+    payload.check_caps()?;
+    let server_id = McpServerId::from(id);
+    // Tenant gate: 404 cross-org / unknown ids without leaking existence.
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::McpServers,
+        server_id.as_uuid(),
+    )
+    .await?
+    {
+        return Err(HttpError::NotFound);
+    }
+    state
+        .mcp_credentials
+        .upsert(McpCredentialWrite {
+            server_id,
+            org_id: principal.active_org_id,
+            payload: payload.into_payload(),
+        })
+        .await?;
+    state.mcp_refresh.request();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE `/mcp-servers/{id}/credentials` — drop the credential row.
+/// Idempotent: no body, returns 204 whether or not a row existed.
+async fn delete_mcp_credentials(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, HttpError> {
+    let server_id = McpServerId::from(id);
+    if !crate::auth::visible_to(
+        &state.pool,
+        &principal,
+        crate::auth::VisibilityTable::McpServers,
+        server_id.as_uuid(),
+    )
+    .await?
+    {
+        return Err(HttpError::NotFound);
+    }
+    state
+        .mcp_credentials
+        .delete(server_id, principal.active_org_id)
+        .await?;
+    state.mcp_refresh.request();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Boundary shape for credential input on create / replace / test paths.
+///
+/// Matches the on-disk [`CredentialPayload`] enum: the wire form carries a
+/// `kind` discriminant and the variant payload. The OAuth flow does not
+/// populate credentials through this path (the callback writes them
+/// directly); only `static_headers` is accepted here today.
+///
+/// Validation: every header name and value passes through its own newtype
+/// smart constructor; the map size is bounded by the
+/// [`crate::mcp::MCP_MAX_HEADERS`] cap, checked in the route handler.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CredentialInput {
+    StaticHeaders {
+        headers: std::collections::BTreeMap<crate::mcp::McpHeaderName, crate::mcp::McpHeaderValue>,
+    },
+}
+
+impl CredentialInput {
+    fn into_payload(self) -> CredentialPayload {
+        match self {
+            Self::StaticHeaders { headers } => CredentialPayload::StaticHeaders { headers },
+        }
+    }
+
+    /// Validate boundary-only caps (the per-newtype parsers already cover
+    /// length/charset; this catches the map-size limit that no parser sees).
+    fn check_caps(&self) -> Result<(), HttpError> {
+        match self {
+            Self::StaticHeaders { headers } => {
+                if headers.len() > crate::mcp::MCP_MAX_HEADERS {
+                    return Err(HttpError::BadRequest(format!(
+                        "credentials: too many headers (max {})",
+                        crate::mcp::MCP_MAX_HEADERS
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Request body for `POST /mcp-servers/test-connect`. Carries a transport
+/// config plus optional credentials; nothing is persisted — the handler
+/// builds an [`McpClient`] in-process, performs the MCP `initialize`
+/// handshake plus one `list_tools` round-trip, then drops the client. The
+/// secret-redact contract still applies: the request body may carry bearer
+/// tokens in `credentials.headers`, so on every response we surface either
+/// the tool list (on success) or a free-text error string — never echo the
+/// input back.
 #[derive(Debug, Deserialize)]
 struct TestConnectRequest {
     config: McpTransport,
+    #[serde(default)]
+    credentials: Option<CredentialInput>,
 }
 
 /// Response shape: a single discriminant indicates success vs. failure so the
@@ -315,7 +490,8 @@ async fn test_connect_mcp_server(
     // MCP_LIST_TOOLS_TIMEOUT). Failures collapse to a structured 200 response
     // body — the call itself succeeded from a transport perspective even
     // when the upstream MCP server refused the handshake.
-    let connect = McpClient::connect(&payload.config).await;
+    let credentials = payload.credentials.map(CredentialInput::into_payload);
+    let connect = McpClient::connect(&payload.config, credentials.as_ref()).await;
     let client = match connect {
         Ok(c) => c,
         Err(e) => {
@@ -404,6 +580,7 @@ struct McpServerRowForList {
     created_by_user_id: crate::auth::UserId,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    credentials_kind: Option<String>,
 }
 
 impl McpServerRowForList {
@@ -440,6 +617,8 @@ impl McpServerRowForList {
             last_error: self.last_error,
             discovered_tools,
             created_by_user_id: self.created_by_user_id,
+            has_credentials: self.credentials_kind.is_some(),
+            credentials_kind: self.credentials_kind,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

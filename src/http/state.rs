@@ -6,7 +6,9 @@ use crate::agents::SharedAgentStore;
 use crate::auth::{GoogleOAuth, JwtSigner, SharedUserStore};
 use crate::clock::SharedClock;
 use crate::http::MembershipCache;
-use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore, TestConnectRateLimiter};
+use crate::mcp::{
+    McpRefreshTrigger, SharedMcpCredentialStore, SharedMcpServerStore, TestConnectRateLimiter,
+};
 use crate::memory::SharedMemoryStore;
 use crate::runtime::{
     SharedDagBudget, SharedLeaseManager, SharedPromptQueue, SharedResponseSource,
@@ -32,6 +34,10 @@ pub struct AppState {
     /// under `/agents/{id}/memory*` read and mutate through this handle.
     pub memory_store: SharedMemoryStore,
     pub mcp_store: SharedMcpServerStore,
+    /// Envelope-encrypted credential seam paired with `mcp_store`. CRUD
+    /// handlers route header / bearer-token writes through this store; the
+    /// registry refresher reads via it on every connect.
+    pub mcp_credentials: SharedMcpCredentialStore,
     /// Send-half of the MCP refresh signal. Cheap to clone; CRUD handlers fire it
     /// after every write. The owning coordinator task lives on [`Server`].
     pub mcp_refresh: McpRefreshTrigger,

@@ -21,6 +21,7 @@ use crate::tools::{DynamicToolSource, SharedTool};
 use crate::types::{ParseError, ToolName};
 
 use super::client::McpClient;
+use super::credentials::{CredentialPayload, SharedMcpCredentialStore};
 use super::error::McpError;
 use super::limits::{MAX_MCP_SERVERS, MAX_TOOLS_PER_SERVER};
 use super::store::{McpHealthUpdate, SharedMcpServerStore};
@@ -50,6 +51,10 @@ pub struct RegistrySnapshot {
 struct McpRegistryInner {
     inner: RwLock<McpState>,
     store: SharedMcpServerStore,
+    /// Optional credentials store. When present (production), `refresh`
+    /// loads decrypted credentials and threads them into each `connect`.
+    /// Tests that don't exercise credentials wire `None`.
+    credentials: Option<SharedMcpCredentialStore>,
     clock: SharedClock,
     server_cap: usize,
 }
@@ -91,9 +96,22 @@ impl McpRegistry {
     /// the registered MCP tools.
     #[must_use]
     pub fn new(store: SharedMcpServerStore, clock: SharedClock) -> Self {
+        Self::with_credentials(store, None, clock)
+    }
+
+    /// Construct with a credentials store wired in. The composition root
+    /// uses this in production; tests that don't exercise the encrypted
+    /// path stick with [`Self::new`].
+    #[must_use]
+    pub fn with_credentials(
+        store: SharedMcpServerStore,
+        credentials: Option<SharedMcpCredentialStore>,
+        clock: SharedClock,
+    ) -> Self {
         Self(Arc::new(McpRegistryInner {
             inner: RwLock::new(McpState::default()),
             store,
+            credentials,
             clock,
             server_cap: MAX_MCP_SERVERS,
         }))
@@ -188,6 +206,7 @@ impl McpRegistry {
             // that build via `for_test` never call refresh, so the
             // never-touched fields can hold null-object stand-ins.
             store: crate::mcp::store::test_support::null_store(),
+            credentials: None,
             clock: crate::clock::SystemClock::shared(),
             server_cap: MAX_MCP_SERVERS,
         }))
@@ -288,8 +307,17 @@ impl McpRegistryInner {
             ..
         } = row;
 
+        // Load credentials before connecting. Servers without a row decrypt
+        // to `None` and connect with no auth; the path is unchanged for
+        // them. A decrypt failure is recorded against the server's
+        // `last_error` and the row is skipped this refresh.
+        let credentials = match self.load_credentials(id, org_id, &alias).await {
+            Ok(c) => c,
+            Err(()) => return,
+        };
+
         let client = match self
-            .connect_or_reuse(id, org_id, &alias, &config, prior)
+            .connect_or_reuse(id, org_id, &alias, &config, credentials.as_ref(), prior)
             .await
         {
             Some(c) => c,
@@ -342,22 +370,78 @@ impl McpRegistryInner {
             .insert(id, ConnectedServer { config, client });
     }
 
+    /// Load credentials for a server. Returns `Ok(None)` for servers with
+    /// no credential row (public MCP endpoints), `Ok(Some(_))` after a
+    /// successful decrypt, or `Err(())` (and records `last_error` against
+    /// the server row) on a decrypt failure. The decrypt failure path
+    /// surfaces in `last_error` so operators see why the server stopped
+    /// connecting after a master-KEK rotation gone wrong.
+    async fn load_credentials(
+        &self,
+        id: McpServerId,
+        org_id: crate::auth::OrgId,
+        alias: &McpServerAlias,
+    ) -> Result<Option<CredentialPayload>, ()> {
+        let Some(store) = self.credentials.as_ref() else {
+            return Ok(None);
+        };
+        match store.read(id, org_id).await {
+            Ok(Some(rec)) => Ok(Some(rec.payload)),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                warn!(
+                    relay.mcp.server.id = %id,
+                    relay.mcp.server.alias = %alias,
+                    error = %e,
+                    "mcp.refresh.credential_load_failed",
+                );
+                let _ = self
+                    .store
+                    .update_health(
+                        id,
+                        org_id,
+                        McpHealthUpdate {
+                            last_seen_at: None,
+                            last_error: Some(format!("credentials: {e}")),
+                            discovered_tools: None,
+                        },
+                    )
+                    .await;
+                Err(())
+            }
+        }
+    }
+
     /// Reuse an existing client when its config hasn't changed; otherwise open a new
     /// one. `None` on connect failure (the row has had its `last_error` updated).
+    ///
+    /// Note: when credentials change we always reconnect — the bearer token
+    /// is baked into the rmcp transport on `connect`, so a rotated token
+    /// has no effect on an already-open client. Comparing the cached
+    /// `config` alone wouldn't catch that, so the credentials parameter is
+    /// part of the cache-key in spirit: callers that fetch fresh
+    /// credentials and pass them in will trigger a reconnect via the path
+    /// in phase D when the registered payload changes.
     async fn connect_or_reuse(
         &self,
         id: McpServerId,
         org_id: crate::auth::OrgId,
         alias: &McpServerAlias,
         config: &McpTransport,
+        credentials: Option<&CredentialPayload>,
         prior: &mut HashMap<McpServerId, ConnectedServer>,
     ) -> Option<Arc<McpClient>> {
         if let Some(prev) = prior.remove(&id)
             && &prev.config == config
+            && credentials.is_none()
         {
+            // Reuse is safe only when the transport config matches *and*
+            // there are no credentials to refresh. With credentials we
+            // conservatively reconnect each refresh so a rotated token
+            // takes effect within one tick.
             return Some(prev.client);
         }
-        match McpClient::connect(config).await {
+        match McpClient::connect(config, credentials).await {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 warn!(

@@ -74,6 +74,10 @@ pub struct AuthSettings {
     /// local-dev to keep `http://localhost` workable; on everywhere
     /// else.
     pub cookie_secure: bool,
+    /// Master KEK used to derive per-org KEKs for the MCP credentials
+    /// envelope (R2 — phase B). Base64-encoded 32 bytes. Sourced from
+    /// `RELAY_MASTER_KEK`; rejected at boundary if missing or wrong size.
+    pub master_kek: SecretString,
 }
 
 /// Embedding-provider settings — `EMBEDDING_API_KEY` /
@@ -162,6 +166,8 @@ struct RawSettings {
     // `.env`.
     #[serde(default = "default_cookie_secure")]
     relay_cookie_secure: bool,
+    // R2 envelope encryption master key, base64-encoded 32 bytes.
+    relay_master_kek: SecretString,
 }
 
 const fn default_cookie_secure() -> bool {
@@ -228,6 +234,7 @@ impl TryFrom<RawSettings> for Settings {
             google_client_secret: raw.google_client_secret,
             google_redirect_url: raw.google_redirect_url,
             cookie_secure: raw.relay_cookie_secure,
+            master_kek: raw.relay_master_kek,
         };
         Ok(Self {
             provider,
@@ -291,6 +298,9 @@ mod tests {
             google_client_secret: secret("test-client-secret"),
             google_redirect_url: "http://localhost:8080/auth/google/callback".to_string(),
             relay_cookie_secure: false,
+            // base64 of 32 bytes; never used in these tests since they only
+            // exercise the Settings boundary, not crypto.
+            relay_master_kek: secret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
         }
     }
 
