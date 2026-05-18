@@ -720,6 +720,7 @@ pub async fn build_server(
     let users: SharedUserStore = Arc::new(PgUserStore::new(pieces.pool.clone()));
 
     let memberships = Arc::new(crate::http::MembershipCache::new(pieces.clock.clone()));
+    let mcp_test_rate = crate::mcp::TestConnectRateLimiter::new(pieces.clock.clone());
     let state = AppState {
         queue: pieces.queue,
         leases: pieces.leases,
@@ -730,6 +731,7 @@ pub async fn build_server(
         memory_store: pieces.memory_store.clone(),
         mcp_store: pieces.mcp_store,
         mcp_refresh,
+        mcp_test_rate,
         thread_stream,
         pool: pieces.pool.clone(),
         jwt,

@@ -9,6 +9,7 @@ mod client;
 mod error;
 mod limits;
 mod pg_store;
+mod rate_limit;
 mod refresher;
 mod registry;
 mod scoped;
@@ -22,9 +23,10 @@ pub use limits::{
     MAX_MCP_SERVERS, MAX_TOOLS_PER_SERVER, MCP_ALIAS_MAX_LEN, MCP_CALL_TIMEOUT,
     MCP_CONNECT_TIMEOUT, MCP_DESCRIPTION_MAX_LEN, MCP_HEADER_NAME_MAX_LEN,
     MCP_HEADER_VALUE_MAX_LEN, MCP_LIST_TOOLS_TIMEOUT, MCP_MAX_HEADERS, MCP_RESULT_RENDER_CAP,
-    MCP_URL_MAX_LEN,
+    MCP_TEST_CONNECT_BUCKETS_MAX, MCP_TEST_CONNECT_PER_MIN, MCP_URL_MAX_LEN,
 };
 pub use pg_store::PgMcpServerStore;
+pub use rate_limit::TestConnectRateLimiter;
 pub use refresher::{McpRefreshTrigger, McpRefresher};
 pub use registry::McpRegistry;
 pub use scoped::ScopedMcpSource;

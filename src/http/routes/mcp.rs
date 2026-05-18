@@ -1,10 +1,11 @@
 //! CRUD endpoints for the MCP server registry.
 //!
-//! `POST /mcp-servers`        — create
-//! `GET  /mcp-servers`        — list
-//! `GET  /mcp-servers/{id}`   — read one
-//! `PUT  /mcp-servers/{id}`   — update
-//! `DELETE /mcp-servers/{id}` — delete
+//! `POST /mcp-servers`               — create
+//! `GET  /mcp-servers`               — list
+//! `GET  /mcp-servers/{id}`          — read one
+//! `PUT  /mcp-servers/{id}`          — update
+//! `DELETE /mcp-servers/{id}`        — delete
+//! `POST /mcp-servers/test-connect`  — validate a candidate config without persisting
 //!
 //! Every mutating handler signals the long-running MCP refresh coordinator (via the
 //! cheap clone-able [`McpRefreshTrigger`]) so the registered tools become callable on
@@ -22,8 +23,8 @@ use uuid::Uuid;
 
 use crate::auth::{AuthError, Principal};
 use crate::mcp::{
-    DiscoveredTool, McpDescription, McpServerAlias, McpServerCreate, McpServerId, McpServerRecord,
-    McpServerUpdate, McpTransport,
+    DiscoveredTool, McpClient, McpDescription, McpError, McpServerAlias, McpServerCreate,
+    McpServerId, McpServerRecord, McpServerUpdate, McpTransport,
 };
 
 use super::super::error::HttpError;
@@ -31,6 +32,9 @@ use super::super::state::AppState;
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
+        // The static path goes first so `/mcp-servers/test-connect` is not
+        // captured by the `{id}` route.
+        .route("/mcp-servers/test-connect", post(test_connect_mcp_server))
         .route(
             "/mcp-servers",
             post(create_mcp_server).get(list_mcp_servers),
@@ -55,6 +59,7 @@ struct McpServerResponse {
     last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
     last_error: Option<String>,
     discovered_tools: Option<Vec<DiscoveredTool>>,
+    created_by_user_id: crate::auth::UserId,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -70,6 +75,7 @@ impl From<McpServerRecord> for McpServerResponse {
             last_seen_at: r.last_seen_at,
             last_error: r.last_error,
             discovered_tools: r.discovered_tools,
+            created_by_user_id: r.created_by_user_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -135,6 +141,7 @@ async fn create_mcp_server(
         .mcp_store
         .create(McpServerCreate {
             org_id: principal.active_org_id,
+            created_by_user_id: principal.user_id,
             alias,
             config: payload.config,
             description,
@@ -156,7 +163,7 @@ async fn list_mcp_servers(
     let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let rows = sqlx::query_as::<_, McpServerRowForList>(
         "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
-                discovered_tools, created_at, updated_at \
+                discovered_tools, created_by_user_id, created_at, updated_at \
          FROM mcp_servers ORDER BY alias ASC",
     )
     .fetch_all(&mut *tx)
@@ -179,7 +186,7 @@ async fn read_mcp_server(
     let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let row = sqlx::query_as::<_, McpServerRowForList>(
         "SELECT id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
-                discovered_tools, created_at, updated_at \
+                discovered_tools, created_by_user_id, created_at, updated_at \
          FROM mcp_servers WHERE id = $1",
     )
     .bind(id)
@@ -258,6 +265,127 @@ async fn delete_mcp_server(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Request body for `POST /mcp-servers/test-connect`. Carries a full transport
+/// config exactly as a create request would, *except* that nothing is persisted
+/// — the handler builds an [`McpClient`] in-process, performs the MCP
+/// `initialize` handshake plus one `list_tools` round-trip, then drops the
+/// client. The 401-redact contract still applies: the request body may carry
+/// secret bearer tokens in `config.headers`, so on every response we surface
+/// either the tool list (on success) or a free-text error string — never echo
+/// the input back.
+#[derive(Debug, Deserialize)]
+struct TestConnectRequest {
+    config: McpTransport,
+}
+
+/// Response shape: a single discriminant indicates success vs. failure so the
+/// frontend can render a clear pass/fail state without parsing error strings.
+#[derive(Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum TestConnectResponse {
+    Ok {
+        discovered_tools: Vec<DiscoveredTool>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+async fn test_connect_mcp_server(
+    State(state): State<AppState>,
+    principal: Principal,
+    Json(payload): Json<TestConnectRequest>,
+) -> Result<Json<TestConnectResponse>, HttpError> {
+    // Per-user rate limit, enforced before we open any outbound connection.
+    // This is the SSRF guardrail: a logged-in user can probe at most
+    // `MCP_TEST_CONNECT_PER_MIN` distinct URLs per rolling minute.
+    if !state.mcp_test_rate.try_admit(principal.user_id) {
+        return Err(HttpError::TooManyRequests);
+    }
+
+    let span = tracing::info_span!(
+        "mcp.test_connect",
+        relay.user.id = %principal.user_id,
+        relay.org.id = %principal.active_org_id,
+    );
+    let _guard = span.enter();
+
+    // Connect + list_tools inside the operator-trusted MCP-client path. Both
+    // calls are bounded by their own internal timeouts (MCP_CONNECT_TIMEOUT,
+    // MCP_LIST_TOOLS_TIMEOUT). Failures collapse to a structured 200 response
+    // body — the call itself succeeded from a transport perspective even
+    // when the upstream MCP server refused the handshake.
+    let connect = McpClient::connect(&payload.config).await;
+    let client = match connect {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(error = %e, "mcp.test_connect.connect_failed");
+            return Ok(Json(TestConnectResponse::Failed {
+                error: redact_error(&e),
+            }));
+        }
+    };
+
+    let McpTransport::Http { url, .. } = &payload.config;
+    let alias_prefix = "test"; // No alias on a test-connect; we still need a
+    // stable prefix for any rendered tool name. Frontends ignore the prefix —
+    // the names are only here so the UI can render "found N tools" alongside
+    // their remote names. Using a fixed prefix avoids leaking real aliases.
+
+    let listed = match client.list_tools().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::info!(error = %e, "mcp.test_connect.list_failed");
+            return Ok(Json(TestConnectResponse::Failed {
+                error: redact_error(&e),
+            }));
+        }
+    };
+
+    let discovered: Vec<DiscoveredTool> = listed
+        .into_iter()
+        .map(|t| {
+            let remote_name = t.name.to_string();
+            DiscoveredTool {
+                prefixed_name: format!("mcp_{alias_prefix}_{remote_name}"),
+                description: t.description.as_deref().map(str::to_owned),
+                remote_name,
+            }
+        })
+        .collect();
+
+    tracing::info!(
+        relay.mcp.url = %url.as_str(),
+        relay.mcp.discovered = discovered.len(),
+        "mcp.test_connect.ok"
+    );
+    Ok(Json(TestConnectResponse::Ok {
+        discovered_tools: discovered,
+    }))
+}
+
+/// Strip any potentially-sensitive sub-strings (currently a no-op: McpError's
+/// Display impls already omit bearer-token-carrying header bytes) and clamp
+/// the message length so a stack-traced underlying error can't bloat the
+/// response. Kept as a single seam so a future format-string regression can
+/// be patched in one place.
+fn redact_error(err: &McpError) -> String {
+    const MAX: usize = 512;
+    let s = err.to_string();
+    if s.len() > MAX {
+        // Floor by char boundary, not byte: an MCP error string is ASCII in
+        // practice, but a stray UTF-8 sequence inside Url::parse output is
+        // possible. `s.is_char_boundary` walks at most 3 bytes back.
+        let mut cut = MAX;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}…", &s[..cut])
+    } else {
+        s
+    }
+}
+
 // Local row type for the tenant-scoped SELECTs. Mirrors the columns
 // returned by the store's read path but lives here so the route can
 // run raw SQL inside the principal-scoped tx without going through
@@ -273,6 +401,7 @@ struct McpServerRowForList {
     last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
     last_error: Option<String>,
     discovered_tools: Option<serde_json::Value>,
+    created_by_user_id: crate::auth::UserId,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -310,6 +439,7 @@ impl McpServerRowForList {
             last_seen_at: self.last_seen_at,
             last_error: self.last_error,
             discovered_tools,
+            created_by_user_id: self.created_by_user_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

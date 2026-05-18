@@ -92,6 +92,7 @@ impl AuthMcpHarness {
             memory_store,
             mcp_store: mcp_store.clone(),
             mcp_refresh,
+            mcp_test_rate: relay_rs::mcp::TestConnectRateLimiter::new(clock.clone()),
             thread_stream,
             pool,
             jwt,
@@ -121,6 +122,7 @@ impl AuthMcpHarness {
         self.mcp_store
             .create(McpServerCreate {
                 org_id: org,
+                created_by_user_id: self.primary.user_id,
                 alias,
                 config,
                 description: None,
@@ -233,4 +235,87 @@ async fn cross_org_isolation_filters_to_caller_org() {
         .map(|r| r["alias"].as_str().expect("alias"))
         .collect();
     assert_eq!(aliases, vec!["theirs"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_test_connect_returns_401() {
+    let h = AuthMcpHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp-servers/test-connect")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"config":{"type":"http","url":"http://localhost:1/"}}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_connect_against_dead_url_returns_failed_outcome() {
+    let h = AuthMcpHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/mcp-servers/test-connect")
+                .header("cookie", h.primary.cookie_header())
+                .header("x-csrf-token", h.primary.csrf_header())
+                .header("content-type", "application/json")
+                // 127.0.0.1:1 is the canonical "nothing listening" address.
+                .body(axum::body::Body::from(
+                    r#"{"config":{"type":"http","url":"http://127.0.0.1:1/"}}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(json["outcome"], "failed");
+    assert!(!json["error"].as_str().expect("error string").is_empty());
+    // No persisted side effect — the catalog stays empty.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers")
+        .fetch_one(&h.state.pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_connect_rate_limits_per_user() {
+    let h = AuthMcpHarness::new().await;
+    let app = router(h.state.clone());
+    let body = r#"{"config":{"type":"http","url":"http://127.0.0.1:1/"}}"#;
+    let mut last_status = axum::http::StatusCode::OK;
+    // Burst past the per-minute cap. `MCP_TEST_CONNECT_PER_MIN` is 10; sending
+    // 12 calls back-to-back guarantees at least one 429.
+    for _ in 0..12 {
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp-servers/test-connect")
+                    .header("cookie", h.primary.cookie_header())
+                    .header("x-csrf-token", h.primary.csrf_header())
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        last_status = res.status();
+    }
+    assert_eq!(last_status, axum::http::StatusCode::TOO_MANY_REQUESTS);
 }

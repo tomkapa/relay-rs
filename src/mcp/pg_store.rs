@@ -29,7 +29,7 @@ const MCP_CREATE_LOCK_KEY: i64 = 0x006D_6370_5F63_7265;
 macro_rules! mcp_row_cols {
     () => {
         "id, org_id, alias, enabled, config, description, last_seen_at, last_error, \
-         discovered_tools, created_at, updated_at"
+         discovered_tools, created_by_user_id, created_at, updated_at"
     };
 }
 
@@ -72,6 +72,7 @@ impl McpServerStore for PgMcpServerStore {
     async fn create(&self, payload: McpServerCreate) -> Result<McpServerRecord, McpError> {
         let McpServerCreate {
             org_id,
+            created_by_user_id,
             alias,
             config,
             description,
@@ -107,8 +108,9 @@ impl McpServerStore for PgMcpServerStore {
             }
             sqlx::query(
                 "INSERT INTO mcp_servers \
-                 (id, org_id, alias, enabled, config, description, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
+                 (id, org_id, alias, enabled, config, description, \
+                  created_by_user_id, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
             )
             .bind(id)
             .bind(org_id)
@@ -116,6 +118,7 @@ impl McpServerStore for PgMcpServerStore {
             .bind(enabled)
             .bind(&config_json)
             .bind(description.as_ref().map(McpDescription::as_str))
+            .bind(created_by_user_id)
             .bind(now)
             .execute(&mut **tx)
             .await
@@ -134,6 +137,7 @@ impl McpServerStore for PgMcpServerStore {
             last_seen_at: None,
             last_error: None,
             discovered_tools: None,
+            created_by_user_id,
             created_at: now,
             updated_at: now,
         })
@@ -326,6 +330,7 @@ struct McpServerRow {
     last_seen_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
     discovered_tools: Option<serde_json::Value>,
+    created_by_user_id: crate::auth::UserId,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -355,6 +360,7 @@ impl McpServerRow {
             last_seen_at: self.last_seen_at,
             last_error: self.last_error,
             discovered_tools,
+            created_by_user_id: self.created_by_user_id,
             created_at: self.created_at,
             updated_at: self.updated_at,
         })

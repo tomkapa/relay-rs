@@ -6,7 +6,7 @@ use crate::agents::SharedAgentStore;
 use crate::auth::{GoogleOAuth, JwtSigner, SharedUserStore};
 use crate::clock::SharedClock;
 use crate::http::MembershipCache;
-use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore};
+use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore, TestConnectRateLimiter};
 use crate::memory::SharedMemoryStore;
 use crate::runtime::{
     SharedDagBudget, SharedLeaseManager, SharedPromptQueue, SharedResponseSource,
@@ -35,6 +35,9 @@ pub struct AppState {
     /// Send-half of the MCP refresh signal. Cheap to clone; CRUD handlers fire it
     /// after every write. The owning coordinator task lives on [`Server`].
     pub mcp_refresh: McpRefreshTrigger,
+    /// Per-user rate limiter for `POST /mcp-servers/test-connect`. Process-wide
+    /// singleton shared across all handlers.
+    pub mcp_test_rate: TestConnectRateLimiter,
     /// Fan-in DAG stream — `GET /threads/{id}/stream` subscribes here. The
     /// owning task is held by [`Server`]; this handle is cheap to clone.
     pub thread_stream: SharedThreadStream,

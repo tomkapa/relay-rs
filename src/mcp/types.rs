@@ -398,6 +398,10 @@ pub struct McpServerRecord {
     pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_error: Option<String>,
     pub discovered_tools: Option<Vec<DiscoveredTool>>,
+    /// Audit field: which user created this row through the HTTP API.
+    /// Non-optional because the column is `NOT NULL` (pre-launch: no
+    /// nullable shim per `feedback_no_backcompat`).
+    pub created_by_user_id: crate::auth::UserId,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

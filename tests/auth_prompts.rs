@@ -102,6 +102,7 @@ impl AuthPromptsHarness {
             memory_store,
             mcp_store,
             mcp_refresh,
+            mcp_test_rate: relay_rs::mcp::TestConnectRateLimiter::new(clock.clone()),
             thread_stream,
             pool,
             jwt,
