@@ -6,7 +6,10 @@ use crate::agents::SharedAgentStore;
 use crate::auth::{GoogleOAuth, JwtSigner, SharedUserStore};
 use crate::clock::SharedClock;
 use crate::http::MembershipCache;
-use crate::mcp::{McpRefreshTrigger, SharedMcpServerStore};
+use crate::mcp::oauth::{OAuthFlowClient, SharedMcpOAuthClientStore, SharedMcpOAuthPendingStore};
+use crate::mcp::{
+    McpRefreshTrigger, SharedMcpCredentialStore, SharedMcpServerStore, TestConnectRateLimiter,
+};
 use crate::memory::SharedMemoryStore;
 use crate::runtime::{
     SharedDagBudget, SharedLeaseManager, SharedPromptQueue, SharedResponseSource,
@@ -32,9 +35,27 @@ pub struct AppState {
     /// under `/agents/{id}/memory*` read and mutate through this handle.
     pub memory_store: SharedMemoryStore,
     pub mcp_store: SharedMcpServerStore,
+    /// Envelope-encrypted credential seam paired with `mcp_store`. CRUD
+    /// handlers route header / bearer-token writes through this store; the
+    /// registry refresher reads via it on every connect.
+    pub mcp_credentials: SharedMcpCredentialStore,
     /// Send-half of the MCP refresh signal. Cheap to clone; CRUD handlers fire it
     /// after every write. The owning coordinator task lives on [`Server`].
     pub mcp_refresh: McpRefreshTrigger,
+    /// Per-user rate limiter for `POST /mcp-servers/test-connect`. Process-wide
+    /// singleton shared across all handlers.
+    pub mcp_test_rate: TestConnectRateLimiter,
+    /// Per-(org, issuer) registered DCR clients store.
+    pub mcp_oauth_clients: SharedMcpOAuthClientStore,
+    /// Pending-authorization rows that bridge `POST /oauth/start` →
+    /// `GET /oauth/callback`.
+    pub mcp_oauth_pending: SharedMcpOAuthPendingStore,
+    /// HTTP client bundle that drives discovery / DCR / token exchange.
+    pub mcp_oauth_flow: OAuthFlowClient,
+    /// Public-facing base URL Relay tells vendors to redirect back to.
+    /// E.g. `https://relay.example/mcp-oauth/callback` is built by
+    /// appending the canonical path to this base.
+    pub oauth_redirect_base: std::sync::Arc<str>,
     /// Fan-in DAG stream — `GET /threads/{id}/stream` subscribes here. The
     /// owning task is held by [`Server`]; this handle is cheap to clone.
     pub thread_stream: SharedThreadStream,

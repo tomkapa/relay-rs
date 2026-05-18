@@ -49,3 +49,16 @@ pub const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Independent of (and always less than or equal to) `tools::TOOL_RESULT_MAX_BYTES`,
 /// which is the agent-side cap.
 pub const MCP_RESULT_RENDER_CAP: usize = 128 * 1024;
+
+/// Per-user cap on `POST /mcp-servers/test-connect` calls per rolling minute.
+///
+/// Sized for legitimate "click test, fix the URL, click test" UX without
+/// letting a curious user turn the endpoint into an SSRF probe. Enforced by a
+/// bounded in-memory token-bucket map (CLAUDE.md §5).
+pub const MCP_TEST_CONNECT_PER_MIN: usize = 10;
+
+/// Cap on the in-memory rate-limiter map entries.
+///
+/// Older entries are evicted LRU when the cap is hit so a flood of one-shot
+/// user ids can't grow the map unboundedly (CLAUDE.md §5).
+pub const MCP_TEST_CONNECT_BUCKETS_MAX: usize = 4096;

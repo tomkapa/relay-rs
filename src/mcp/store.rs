@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::auth::OrgId;
+use crate::auth::{OrgId, UserId};
 
 use super::error::McpError;
 use super::types::{
@@ -23,6 +23,9 @@ pub struct McpServerCreate {
     /// Owning organisation. Set by the HTTP handler from the request
     /// principal; required because `mcp_servers.org_id` is `NOT NULL`.
     pub org_id: OrgId,
+    /// Audit field: the user that initiated the create through the HTTP API.
+    /// Required because `mcp_servers.created_by_user_id` is `NOT NULL`.
+    pub created_by_user_id: UserId,
     pub alias: McpServerAlias,
     pub config: McpTransport,
     pub description: Option<McpDescription>,

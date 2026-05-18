@@ -50,4 +50,7 @@ pub enum AppError {
 
     #[error("auth: {0}")]
     Auth(#[from] AuthError),
+
+    #[error("misconfigured: {0}")]
+    Misconfigured(String),
 }

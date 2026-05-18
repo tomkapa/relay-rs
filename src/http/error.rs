@@ -27,6 +27,9 @@ pub enum HttpError {
     #[error("payload too large")]
     PayloadTooLarge,
 
+    #[error("too many requests")]
+    TooManyRequests,
+
     #[error("parse: {0}")]
     Parse(#[from] ParseError),
 
@@ -59,6 +62,7 @@ impl IntoResponse for HttpError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             Self::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too large".into()),
+            Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too many requests".into()),
             Self::Parse(e) | Self::Auth(AuthError::Parse(e)) => {
                 (StatusCode::BAD_REQUEST, e.to_string())
             }

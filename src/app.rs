@@ -24,11 +24,17 @@ use crate::agents::{
 use crate::auth::{GoogleOAuth, JwtSigner, OrgId, PgUserStore, SharedUserStore};
 use crate::clock::{SharedClock, SystemClock};
 use crate::config::{EmbeddingSettings, ProviderSettings, Settings};
+use crate::crypto::OrgEncryptor;
 use crate::error::AppError;
 use crate::hook::HookChain;
 use crate::http::{AppState, router};
+use crate::mcp::oauth::{
+    OAuthFlowClient, OAuthRefresher, PgMcpOAuthClientStore, PgMcpOAuthPendingStore, RefresherDeps,
+    SharedMcpOAuthClientStore, SharedMcpOAuthPendingStore,
+};
 use crate::mcp::{
-    McpRefresher, McpRegistry, PgMcpServerStore, ScopedMcpSource, SharedMcpServerStore,
+    McpRefresher, McpRegistry, PgMcpCredentialStore, PgMcpServerStore, ScopedMcpSource,
+    SharedMcpCredentialStore, SharedMcpServerStore,
 };
 use crate::memory::{
     AgentMemory, LibrarianScheduler, MemorySectionLoader, ModeCores, PgMemoryStore,
@@ -275,6 +281,7 @@ pub struct Server {
     pub state: AppState,
     pub workers: WorkerPoolHandle,
     pub mcp_refresher: McpRefresher,
+    pub oauth_refresher: OAuthRefresher,
     pub reflection_scheduler: ReflectionScheduler,
     pub librarian_scheduler: LibrarianScheduler,
     pub scheduling_scheduler: ScheduledTaskScheduler,
@@ -298,6 +305,11 @@ struct Collaborators {
     sink: SharedResponseSink,
     responses: SharedResponseSource,
     mcp_store: SharedMcpServerStore,
+    mcp_credentials: SharedMcpCredentialStore,
+    mcp_oauth_clients: SharedMcpOAuthClientStore,
+    mcp_oauth_pending: SharedMcpOAuthPendingStore,
+    mcp_oauth_flow: OAuthFlowClient,
+    mcp_encryptor: crate::crypto::SharedOrgEncryptor,
     mcp_registry: McpRegistry,
     scheduled_tasks: SharedScheduledTaskStore,
 }
@@ -381,7 +393,29 @@ impl Collaborators {
 
         let mcp_store: SharedMcpServerStore =
             Arc::new(PgMcpServerStore::new(pool.clone(), clock.clone()));
-        let mcp_registry = McpRegistry::new(mcp_store.clone(), clock.clone());
+        let encryptor = Arc::new(
+            OrgEncryptor::from_settings(&settings.auth.master_kek)
+                .map_err(|e| AppError::Misconfigured(format!("RELAY_MASTER_KEK: {e}")))?,
+        );
+        let mcp_credentials: SharedMcpCredentialStore = Arc::new(PgMcpCredentialStore::new(
+            pool.clone(),
+            clock.clone(),
+            encryptor.clone(),
+        ));
+        let mcp_oauth_clients: SharedMcpOAuthClientStore = Arc::new(PgMcpOAuthClientStore::new(
+            pool.clone(),
+            clock.clone(),
+            encryptor.clone(),
+        ));
+        let mcp_oauth_pending: SharedMcpOAuthPendingStore =
+            Arc::new(PgMcpOAuthPendingStore::new(pool.clone(), clock.clone()));
+        let mcp_oauth_flow = OAuthFlowClient::new(http.clone())
+            .map_err(|e| AppError::Misconfigured(format!("mcp oauth flow http: {e}")))?;
+        let mcp_registry = McpRegistry::with_credentials(
+            mcp_store.clone(),
+            Some(mcp_credentials.clone()),
+            clock.clone(),
+        );
 
         let scheduled_tasks: SharedScheduledTaskStore =
             Arc::new(PgScheduledTaskStore::new(pool.clone(), clock.clone()));
@@ -450,6 +484,11 @@ impl Collaborators {
             sink,
             responses,
             mcp_store,
+            mcp_credentials,
+            mcp_oauth_clients,
+            mcp_oauth_pending,
+            mcp_oauth_flow,
+            mcp_encryptor: encryptor,
             mcp_registry,
             scheduled_tasks,
         })
@@ -621,6 +660,7 @@ fn build_agent_from(pieces: &Collaborators, settings: &Settings) -> Agent {
 
 /// Build the full HTTP + worker pool composition. The returned [`Server`] is ready to
 /// hand to `axum::serve` and a graceful-shutdown loop.
+#[allow(clippy::too_many_lines)] // composition root: configuration + binding, not branching
 pub async fn build_server(
     settings: Settings,
     cancel: CancellationToken,
@@ -720,6 +760,22 @@ pub async fn build_server(
     let users: SharedUserStore = Arc::new(PgUserStore::new(pieces.pool.clone()));
 
     let memberships = Arc::new(crate::http::MembershipCache::new(pieces.clock.clone()));
+    let mcp_test_rate = crate::mcp::TestConnectRateLimiter::new(pieces.clock.clone());
+
+    let oauth_redirect_uri = format!(
+        "{}{}",
+        settings.auth.oauth_redirect_base, "/mcp-oauth/callback"
+    );
+    let (oauth_refresher, _oauth_token_cache) = OAuthRefresher::spawn(RefresherDeps {
+        pool: pieces.pool.clone(),
+        clock: pieces.clock.clone(),
+        enc: pieces.mcp_encryptor.clone(),
+        credentials: pieces.mcp_credentials.clone(),
+        oauth_clients: pieces.mcp_oauth_clients.clone(),
+        flow: pieces.mcp_oauth_flow.clone(),
+        redirect_uri: oauth_redirect_uri,
+    });
+
     let state = AppState {
         queue: pieces.queue,
         leases: pieces.leases,
@@ -729,7 +785,13 @@ pub async fn build_server(
         dag: pieces.dag,
         memory_store: pieces.memory_store.clone(),
         mcp_store: pieces.mcp_store,
+        mcp_credentials: pieces.mcp_credentials,
         mcp_refresh,
+        mcp_test_rate,
+        mcp_oauth_clients: pieces.mcp_oauth_clients,
+        mcp_oauth_pending: pieces.mcp_oauth_pending,
+        mcp_oauth_flow: pieces.mcp_oauth_flow,
+        oauth_redirect_base: Arc::from(settings.auth.oauth_redirect_base.as_str()),
         thread_stream,
         pool: pieces.pool.clone(),
         jwt,
@@ -744,6 +806,7 @@ pub async fn build_server(
         state,
         workers,
         mcp_refresher,
+        oauth_refresher,
         reflection_scheduler,
         librarian_scheduler,
         scheduling_scheduler,
@@ -759,6 +822,7 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
         state,
         workers,
         mcp_refresher,
+        oauth_refresher,
         reflection_scheduler,
         librarian_scheduler,
         scheduling_scheduler,
@@ -787,6 +851,7 @@ pub async fn run_server(server: Server, cancel: CancellationToken) -> Result<(),
     scheduling_scheduler.shutdown().await;
     info!("scheduling_scheduler.shutdown.complete");
     mcp_refresher.shutdown().await;
+    oauth_refresher.shutdown().await;
     info!("mcp.refresher.shutdown.complete");
     workers.shutdown().await;
     info!("workers.shutdown.complete");

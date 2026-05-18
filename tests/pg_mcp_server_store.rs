@@ -3,7 +3,6 @@
 
 #![allow(clippy::expect_used)]
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use relay_rs::clock::SystemClock;
@@ -25,7 +24,6 @@ fn store(db: &TestDb) -> Arc<PgMcpServerStore> {
 fn http_transport(url: &str) -> McpTransport {
     McpTransport::Http {
         url: McpHttpUrl::try_from(url).expect("valid url"),
-        headers: BTreeMap::new(),
     }
 }
 
@@ -40,6 +38,7 @@ async fn create_read_roundtrip() {
 
     let payload = McpServerCreate {
         org_id: db.default_org_id,
+        created_by_user_id: db.default_user_id,
         alias: alias("every"),
         config: http_transport("http://localhost:9000/"),
         description: None,
@@ -53,6 +52,7 @@ async fn create_read_roundtrip() {
     assert_eq!(read.last_seen_at, None);
     assert_eq!(read.last_error, None);
     assert_eq!(read.discovered_tools, None);
+    assert_eq!(read.created_by_user_id, db.default_user_id);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -63,6 +63,7 @@ async fn duplicate_alias_is_rejected() {
     store
         .create(McpServerCreate {
             org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
             alias: alias("dup"),
             config: http_transport("http://localhost:9000/"),
             description: None,
@@ -73,6 +74,7 @@ async fn duplicate_alias_is_rejected() {
     let err = store
         .create(McpServerCreate {
             org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
             alias: alias("dup"),
             config: http_transport("http://localhost:9001/"),
             description: None,
@@ -91,6 +93,7 @@ async fn list_orders_by_alias() {
         store
             .create(McpServerCreate {
                 org_id: db.default_org_id,
+                created_by_user_id: db.default_user_id,
                 alias: alias(name),
                 config: http_transport(&format!("http://localhost:9000/{name}")),
                 description: None,
@@ -114,6 +117,7 @@ async fn update_changes_alias_and_config() {
     let row = store
         .create(McpServerCreate {
             org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
             alias: alias("first"),
             config: http_transport("http://localhost:9000/"),
             description: None,
@@ -148,6 +152,7 @@ async fn delete_returns_not_found_after() {
     let row = store
         .create(McpServerCreate {
             org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
             alias: alias("temp"),
             config: http_transport("http://localhost:9000/"),
             description: None,
@@ -178,6 +183,7 @@ async fn update_health_persists_discovered_tools() {
     let row = store
         .create(McpServerCreate {
             org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
             alias: alias("health"),
             config: http_transport("http://localhost:9000/"),
             description: None,

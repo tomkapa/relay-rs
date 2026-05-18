@@ -11,6 +11,7 @@ pub mod auth;
 pub mod cache;
 pub mod clock;
 pub mod config;
+pub mod crypto;
 pub mod error;
 pub mod hook;
 pub mod http;

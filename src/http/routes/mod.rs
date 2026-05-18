@@ -20,7 +20,13 @@ use super::csrf::require_csrf;
 use super::state::AppState;
 
 pub fn router(state: AppState) -> Router {
-    let public = Router::new().merge(auth::router()).merge(healthz::router());
+    let public = Router::new()
+        .merge(auth::router())
+        .merge(healthz::router())
+        // The MCP OAuth callback runs without a session cookie — the
+        // browser is returning from the vendor. CSRF is provided by the
+        // PKCE state column, not the double-submit cookie.
+        .merge(mcp::oauth_callback_router());
 
     let private = Router::new()
         .merge(prompts::router())

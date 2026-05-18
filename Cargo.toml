@@ -141,6 +141,26 @@ tracing-opentelemetry = { version = "0.32", default-features = false }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# §8 (zero-dep bias): RustCrypto AEAD + KDF + scrubbing. We envelope-encrypt
+# upstream MCP credentials per-org (R2). Rolling AES-GCM + HKDF-SHA256 in-tree
+# is precisely the "do not write your own crypto" rule the §8 paragraph names:
+# nonce handling, GHASH, polynomial reduction, constant-time tag compare are
+# all subtle and a known footgun. The three crates are tiny (`aes-gcm` and
+# `hkdf` are no-std-capable), independently audited, and share a single
+# upstream owner (RustCrypto). `zeroize` clears the per-org KEK + per-record
+# plaintext from memory on drop so a `Debug` impl or a panic backtrace can't
+# leak the bytes (CLAUDE.md §2 — secret material must not surface in
+# tracing/logs). Owner: crypto/.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "getrandom"] }
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
+# §8: random nonces + DEKs. `rand` and its `getrandom` backend are pulled in
+# transitively already (via tokio/uuid); declaring `rand` directly pins the
+# top-level surface to a single version and lets us call `OsRng` without
+# digging through transitive re-exports.
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
 # Binary entry only (CLAUDE.md §12 — `anyhow` may not appear in library signatures).
 anyhow = "1"
 
