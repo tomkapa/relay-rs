@@ -136,6 +136,18 @@ pub enum McpTransport {
     Http { url: McpHttpUrl },
 }
 
+impl McpTransport {
+    /// URL we can drive an HTTP-flavored MCP discovery or connect against.
+    /// Today every variant is HTTP; when a non-HTTP transport lands the
+    /// match arm forces every caller to handle the negative case.
+    #[must_use]
+    pub const fn http_url(&self) -> &McpHttpUrl {
+        match self {
+            Self::Http { url } => url,
+        }
+    }
+}
+
 /// On-the-wire shape used for both deserialize-from and serialize-to. Adding a new
 /// transport variant is a one-tag change here plus one match arm in `TryFrom`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

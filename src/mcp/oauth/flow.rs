@@ -181,17 +181,21 @@ pub async fn register_dynamic_client(
         .map(SecretString::try_from)
         .transpose()
         .map_err(|e| OAuthError::Dcr(format!("invalid registration_access_token: {e}")))?;
+    let client_id = super::store::OAuthClientId::try_from(raw.client_id)
+        .map_err(|e| OAuthError::Dcr(format!("invalid client_id: {e}")))?;
     Ok(NewOAuthClient {
         org_id,
         issuer: as_metadata.issuer.clone(),
-        client_id: raw.client_id,
+        client_id,
         client_secret,
         authorization_endpoint: as_metadata.authorization_endpoint.clone(),
         token_endpoint: as_metadata.token_endpoint.clone(),
-        registration_client_uri: raw.registration_client_uri,
-        registration_access_token,
         token_endpoint_auth_method: auth_method,
         scope: scope.map(str::to_owned),
+        provenance: super::store::ClientProvenance::Dcr {
+            registration_client_uri: raw.registration_client_uri,
+            registration_access_token,
+        },
     })
 }
 
@@ -310,7 +314,8 @@ fn build_basic_client(
         .map_err(|e| OAuthError::Misconfigured(format!("token_endpoint: {e}")))?;
     let redirect = RedirectUrl::new(redirect_uri.to_owned())
         .map_err(|e| OAuthError::Misconfigured(format!("redirect_uri: {e}")))?;
-    let mut b = BasicClient::new(ClientId::new(client.client_id.clone())).set_auth_uri(auth_url);
+    let mut b = BasicClient::new(ClientId::new(client.client_id.as_str().to_owned()))
+        .set_auth_uri(auth_url);
     if let Some(secret) = &client.client_secret {
         b = b.set_client_secret(ClientSecret::new(secret.expose().to_owned()));
     }

@@ -31,7 +31,7 @@ pub use flow::{
 pub use pg_store::{PgMcpOAuthClientStore, PgMcpOAuthPendingStore};
 pub use refresher::{OAUTH_REFRESH_SKEW, OAuthRefresher, RefresherDeps, SharedOAuthTokenCache};
 pub use store::{
-    DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
-    PendingAuthorizationWrite, SharedMcpOAuthClientStore, SharedMcpOAuthPendingStore,
-    TokenAuthMethod,
+    ClientProvenance, DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
+    OAuthClientId, PendingAuthorizationWrite, SharedMcpOAuthClientStore,
+    SharedMcpOAuthPendingStore, TokenAuthMethod,
 };

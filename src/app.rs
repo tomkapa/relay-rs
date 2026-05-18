@@ -634,6 +634,7 @@ pub async fn build_server(
         mcp_oauth_pending: pieces.mcp_oauth_pending,
         mcp_oauth_flow: pieces.mcp_oauth_flow,
         oauth_redirect_base: Arc::from(settings.auth.oauth_redirect_base.as_str()),
+        web_base_url: settings.auth.web_base_url.as_deref().map(Arc::from),
         thread_stream,
         pool: pieces.pool.clone(),
         jwt,
