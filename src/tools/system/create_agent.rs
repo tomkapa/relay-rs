@@ -7,7 +7,7 @@
 //! Per design, the tool:
 //! * Always writes `is_default = false` — promoting the default stays an
 //!   operator action via `PUT /agents/{id}` (doc/agent_discovery_plan.md §6).
-//! * Accepts the operator-curated `allowed_mcp_servers` allowlist; empty is
+//! * Accepts the operator-curated `allowed_mcp_tools` allowlist; empty is
 //!   the lockdown default. Dangling ids are inert at runtime — the
 //!   `McpRegistry` filters live tools — so the tool does not pre-validate
 //!   them.
@@ -26,10 +26,11 @@ use tracing::{error, info};
 
 use crate::agents::{
     AGENT_DESCRIPTION_MAX_LEN, AGENT_NAME_MAX_LEN, AGENT_SYSTEM_PROMPT_MAX_LEN, AgentDescription,
-    AgentId, AgentName, AgentStoreError, AgentSystemPrompt, AllowedMcpServers,
-    MAX_ALLOWED_MCP_SERVERS_PER_AGENT, NewAgent, SharedAgentStore,
+    AgentId, AgentName, AgentStoreError, AgentSystemPrompt, AllowedMcpTools,
+    MAX_ALLOWED_MCP_SERVERS_PER_AGENT, MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT, NewAgent,
+    SharedAgentStore,
 };
-use crate::mcp::McpServerId;
+use crate::mcp::MCP_TOOL_REMOTE_NAME_MAX_LEN;
 use crate::tools::{RequestKindModes, Tool, ToolCallContext, ToolError};
 use crate::types::ToolName;
 
@@ -46,9 +47,10 @@ const TOOL_DESCRIPTION: &str = "Hire a new agent into the team. Use this only af
       hire should pay attention to and remember as they work.\n\
     - `description`: one sentence other agents read when deciding whether to delegate \
       here. Operator-facing, model-readable; embedded for `search_agents`.\n\
-    - `allowed_mcp_servers` (optional): UUID list of MCP servers the new agent may \
-      access. Default empty (no MCP tools). Stale ids are inert; the runtime filters \
-      live tools.\n\
+    - `allowed_mcp_tools` (optional): object mapping MCP server UUID to either \
+      `null` (= every tool from that server) or an array of remote tool names \
+      (= only those tools). Default empty `{}` = no MCP access. Stale ids are \
+      inert; the runtime filters live tools.\n\
     \n\
     The created agent is never the default. After it's created, tell the customer to \
     open a new session with the returned name — do not `send_message` the new hire \
@@ -61,7 +63,7 @@ struct Input {
     system_prompt: String,
     description: String,
     #[serde(default)]
-    allowed_mcp_servers: Vec<McpServerId>,
+    allowed_mcp_tools: AllowedMcpTools,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,11 +108,25 @@ impl CreateAgentTool {
                     "minLength": 1,
                     "maxLength": AGENT_DESCRIPTION_MAX_LEN,
                 },
-                "allowed_mcp_servers": {
-                    "type": "array",
-                    "maxItems": MAX_ALLOWED_MCP_SERVERS_PER_AGENT,
-                    "uniqueItems": true,
-                    "items": { "type": "string", "format": "uuid" },
+                "allowed_mcp_tools": {
+                    "type": "object",
+                    "description": "Map MCP server UUID to `null` (all tools) or array of remote tool names.",
+                    "maxProperties": MAX_ALLOWED_MCP_SERVERS_PER_AGENT,
+                    "additionalProperties": {
+                        "oneOf": [
+                            { "type": "null" },
+                            {
+                                "type": "array",
+                                "maxItems": MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT,
+                                "uniqueItems": true,
+                                "items": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": MCP_TOOL_REMOTE_NAME_MAX_LEN,
+                                },
+                            },
+                        ],
+                    },
                 },
             },
             "additionalProperties": false,
@@ -147,8 +163,11 @@ impl CreateAgentTool {
             .map_err(|e| parse("system_prompt", e))?;
         let description =
             AgentDescription::try_from(input.description).map_err(|e| parse("description", e))?;
-        let allowed_mcp_servers = AllowedMcpServers::try_from(input.allowed_mcp_servers)
-            .map_err(|e| parse("allowed_mcp_servers", e))?;
+        // `allowed_mcp_tools` is validated by `AllowedMcpTools`'s
+        // `Deserialize` impl at the JSON boundary — a malformed payload
+        // returns `ToolError::InvalidInput` via the `serde_json::from_value`
+        // call site below, not here.
+        let allowed_mcp_tools = input.allowed_mcp_tools;
 
         // Hire into the calling agent's org. The viewer is always an
         // agent (guarded above), and every agent row has a NOT NULL
@@ -169,7 +188,7 @@ impl CreateAgentTool {
             system_prompt,
             description,
             is_default: false,
-            allowed_mcp_servers,
+            allowed_mcp_tools,
         };
 
         // Every input field is pre-parsed via its newtype `TryFrom` above,

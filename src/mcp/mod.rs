@@ -31,13 +31,14 @@ pub use limits::{
     MAX_MCP_SERVERS, MAX_TOOLS_PER_SERVER, MCP_ALIAS_MAX_LEN, MCP_CALL_TIMEOUT,
     MCP_CONNECT_TIMEOUT, MCP_CREDENTIAL_READ_TIMEOUT, MCP_DESCRIPTION_MAX_LEN,
     MCP_HEADER_NAME_MAX_LEN, MCP_HEADER_VALUE_MAX_LEN, MCP_LIST_TOOLS_TIMEOUT, MCP_MAX_HEADERS,
-    MCP_RESULT_RENDER_CAP, MCP_TEST_CONNECT_BUCKETS_MAX, MCP_TEST_CONNECT_PER_MIN, MCP_URL_MAX_LEN,
+    MCP_RESULT_RENDER_CAP, MCP_TEST_CONNECT_BUCKETS_MAX, MCP_TEST_CONNECT_PER_MIN,
+    MCP_TOOL_REMOTE_NAME_MAX_LEN, MCP_URL_MAX_LEN,
 };
 pub use pg_credentials::PgMcpCredentialStore;
 pub use pg_store::PgMcpServerStore;
 pub use rate_limit::TestConnectRateLimiter;
 pub use refresher::{McpRefreshTrigger, McpRefresher};
-pub use registry::McpRegistry;
+pub use registry::{McpRegistry, RegistrySnapshot, ToolOrigin};
 pub use scoped::ScopedMcpSource;
 pub use store::{
     McpHealthUpdate, McpServerCreate, McpServerStore, McpServerUpdate, SharedMcpServerStore,
@@ -45,5 +46,5 @@ pub use store::{
 pub use tool::McpTool;
 pub use types::{
     ConnectionStatus, DiscoveredTool, McpDescription, McpHeaderName, McpHeaderValue, McpHttpUrl,
-    McpServerAlias, McpServerId, McpServerRecord, McpTransport,
+    McpServerAlias, McpServerId, McpServerRecord, McpToolRemoteName, McpTransport,
 };

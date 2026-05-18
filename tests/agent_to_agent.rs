@@ -155,7 +155,7 @@ async fn translator_delegation_round_trips_and_emits_root_done() {
             )
             .expect("desc"),
             is_default: false,
-            allowed_mcp_servers: relay_rs::agents::AllowedMcpServers::empty(),
+            allowed_mcp_tools: relay_rs::agents::AllowedMcpTools::empty(),
         })
         .await
         .expect("create translator");

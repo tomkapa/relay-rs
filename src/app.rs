@@ -350,7 +350,7 @@ impl AgentFactoryPieces {
     fn build(&self, record: &crate::agents::AgentRecord) -> Agent {
         let dynamic = Arc::new(ScopedMcpSource::new(
             self.mcp_registry.clone(),
-            &record.allowed_mcp_servers,
+            &record.allowed_mcp_tools,
         ));
         let toolbox = ToolBox::new(self.builtin_tools.clone(), dynamic);
         AgentBuilder::new(
@@ -509,10 +509,12 @@ pub async fn build_server(
     cancel: CancellationToken,
 ) -> Result<Server, AppError> {
     let pieces = Collaborators::new(&settings).await?;
-    // Per-agent MCP scope: the factory reads the row's `allowed_mcp_servers`
-    // and builds a `ScopedMcpSource` so the agent's `ToolBox` only sees the
-    // permitted servers' tools. Everything else (provider, sessions, memory,
-    // builtins, hooks) is cheap-clone shared across agents.
+    // Per-agent MCP scope: the factory reads the row's `allowed_mcp_tools`
+    // and builds a `ScopedMcpSource` so the agent's `ToolBox` only sees
+    // the permitted servers' tools (and within each server, only the
+    // optionally-narrowed remote-name subset). Everything else (provider,
+    // sessions, memory, builtins, hooks) is cheap-clone shared across
+    // agents.
     let factory_pieces = AgentFactoryPieces {
         provider: pieces.provider.clone(),
         sessions: pieces.sessions.clone(),

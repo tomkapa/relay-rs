@@ -26,7 +26,9 @@ use super::error::McpError;
 use super::limits::{MAX_MCP_SERVERS, MAX_TOOLS_PER_SERVER};
 use super::store::{McpHealthUpdate, SharedMcpServerStore};
 use super::tool::McpTool;
-use super::types::{DiscoveredTool, McpServerAlias, McpServerId, McpServerRecord, McpTransport};
+use super::types::{
+    DiscoveredTool, McpServerAlias, McpServerId, McpServerRecord, McpToolRemoteName, McpTransport,
+};
 
 /// Cheap-clone handle to the live MCP tool catalogue.
 ///
@@ -37,13 +39,24 @@ use super::types::{DiscoveredTool, McpServerAlias, McpServerId, McpServerRecord,
 #[derive(Clone, Debug)]
 pub struct McpRegistry(Arc<McpRegistryInner>);
 
-/// Point-in-time read view returned by [`McpRegistry::snapshot`]. Holding
-/// both `Arc`s lets a caller iterate specs and look up source servers
-/// without re-entering the registry lock per spec.
+/// Point-in-time read view returned by [`McpRegistry::snapshot`].
+///
+/// Holding both `Arc`s lets a caller iterate specs and look up source
+/// servers without re-entering the registry lock per spec. `tool_origins`
+/// carries the source server **and** the remote (unprefixed) name so the
+/// per-agent scope filter can match tool subsets without re-parsing the
+/// prefixed name.
 #[derive(Debug, Clone)]
 pub struct RegistrySnapshot {
     pub specs: Arc<[ToolSpec]>,
-    pub tool_servers: Arc<HashMap<ToolName, McpServerId>>,
+    pub tool_origins: Arc<HashMap<ToolName, ToolOrigin>>,
+}
+
+/// Source-server back-pointer for a single tool in the registry.
+#[derive(Debug, Clone)]
+pub struct ToolOrigin {
+    pub server: McpServerId,
+    pub remote_name: McpToolRemoteName,
 }
 
 /// Inner state — held behind an `Arc` by [`McpRegistry`]. Holds the live
@@ -73,11 +86,11 @@ impl std::fmt::Debug for McpRegistryInner {
 #[derive(Default)]
 struct McpState {
     by_name: HashMap<ToolName, SharedTool>,
-    /// Per-tool back-pointer to the server that produced it. Wrapped in
-    /// `Arc` so [`ScopedMcpSource`] can pull a single snapshot under one
-    /// read lock alongside `specs` instead of looking each name up
-    /// through a fresh acquisition.
-    tool_servers: Arc<HashMap<ToolName, McpServerId>>,
+    /// Per-tool back-pointer to (server, remote_name). Wrapped in `Arc` so
+    /// [`ScopedMcpSource`] can pull a single snapshot under one read lock
+    /// alongside `specs` instead of looking each name up through a fresh
+    /// acquisition.
+    tool_origins: Arc<HashMap<ToolName, ToolOrigin>>,
     specs: Arc<[ToolSpec]>,
     /// Indexed by server id so we can reuse a client across refreshes when its config
     /// hasn't changed (avoids re-running the MCP `initialize` handshake on every CRUD
@@ -139,11 +152,11 @@ impl McpRegistry {
         self.0.snapshot()
     }
 
-    /// Single-lock-acquisition lookup of a tool and its source server. Used
-    /// by [`ScopedMcpSource::get`] so dispatch never pays two round-trips
-    /// through the read lock.
+    /// Single-lock-acquisition lookup of a tool and its origin (server id +
+    /// remote name). Used by [`ScopedMcpSource::get`] so dispatch never
+    /// pays two round-trips through the read lock.
     #[must_use]
-    pub fn lookup(&self, name: &str) -> Option<(SharedTool, McpServerId)> {
+    pub fn lookup(&self, name: &str) -> Option<(SharedTool, ToolOrigin)> {
         self.0.lookup(name)
     }
 
@@ -178,12 +191,17 @@ impl McpRegistry {
     /// used as the registry key (no `mcp_<alias>_` prefixing — tests build
     /// whatever names they need). Lives behind `#[cfg(test)]` so it never
     /// reaches release artifacts.
+    /// Test seam: bypass the refresh path by installing a synthetic catalogue
+    /// directly. Each entry is `(server_id, remote_name, tool)`. Lives behind
+    /// `#[cfg(test)]` so it never reaches release artifacts.
     #[cfg(test)]
-    pub(crate) fn for_test(entries: Vec<(McpServerId, SharedTool)>) -> Self {
+    pub(crate) fn for_test_with_remote_names(
+        entries: Vec<(McpServerId, String, SharedTool)>,
+    ) -> Self {
         let mut by_name: HashMap<ToolName, SharedTool> = HashMap::new();
-        let mut tool_servers: HashMap<ToolName, McpServerId> = HashMap::new();
+        let mut tool_origins: HashMap<ToolName, ToolOrigin> = HashMap::new();
         let mut specs: Vec<ToolSpec> = Vec::with_capacity(entries.len());
-        for (server, tool) in entries {
+        for (server, remote, tool) in entries {
             let name = tool.name().clone();
             let spec = ToolSpec {
                 name: name.clone(),
@@ -191,14 +209,22 @@ impl McpRegistry {
                 input_schema: tool.input_schema(),
             };
             specs.push(spec);
-            tool_servers.insert(name.clone(), server);
+            let remote_name = McpToolRemoteName::try_from(remote.as_str())
+                .expect("invariant: test remote_name within cap");
+            tool_origins.insert(
+                name.clone(),
+                ToolOrigin {
+                    server,
+                    remote_name,
+                },
+            );
             by_name.insert(name, tool);
         }
         specs.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         Self(Arc::new(McpRegistryInner {
             inner: RwLock::new(McpState {
                 by_name,
-                tool_servers: Arc::new(tool_servers),
+                tool_origins: Arc::new(tool_origins),
                 specs: Arc::from(specs),
                 servers: HashMap::new(),
             }),
@@ -235,15 +261,15 @@ impl McpRegistryInner {
         let guard = self.inner.read().expect("registry lock poisoned");
         RegistrySnapshot {
             specs: guard.specs.clone(),
-            tool_servers: guard.tool_servers.clone(),
+            tool_origins: guard.tool_origins.clone(),
         }
     }
 
-    fn lookup(&self, name: &str) -> Option<(SharedTool, McpServerId)> {
+    fn lookup(&self, name: &str) -> Option<(SharedTool, ToolOrigin)> {
         let guard = self.inner.read().expect("registry lock poisoned");
-        let server = guard.tool_servers.get(name).copied()?;
+        let origin = guard.tool_origins.get(name).cloned()?;
         let tool = guard.by_name.get(name).cloned()?;
-        Some((tool, server))
+        Some((tool, origin))
     }
 
     fn len(&self) -> usize {
@@ -512,6 +538,24 @@ fn ingest_tools(
                 .unwrap_or("(no description provided)"),
         );
         let schema = Arc::new(Value::Object((*remote.input_schema).clone()));
+        // The remote name has already been validated by the registry
+        // when the prefixed name fit within `ToolName`'s 64-byte cap;
+        // failing to parse here would mean we built a longer prefixed
+        // name from a shorter remote name, which is impossible. Skip the
+        // tool (with a warn) rather than panic on the path so a single
+        // misbehaving server can't take the whole refresh down.
+        let remote_name = match McpToolRemoteName::try_from(remote.name.as_ref()) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(
+                    relay.mcp.server.alias = %alias,
+                    relay.mcp.tool.remote = %remote.name,
+                    error = %e,
+                    "mcp.tool.remote_name_invalid",
+                );
+                continue;
+            }
+        };
         discovered.push(DiscoveredTool {
             remote_name: remote.name.to_string(),
             prefixed_name: prefixed.as_str().to_owned(),
@@ -529,7 +573,13 @@ fn ingest_tools(
             description,
             input_schema: schema,
         });
-        builder.tool_servers.insert(prefixed.clone(), server_id);
+        builder.tool_origins.insert(
+            prefixed.clone(),
+            ToolOrigin {
+                server: server_id,
+                remote_name,
+            },
+        );
         builder.by_name.insert(prefixed, tool);
     }
     discovered
@@ -541,7 +591,7 @@ fn ingest_tools(
 /// to a single `&mut` borrow.
 struct McpStateBuilder {
     by_name: HashMap<ToolName, SharedTool>,
-    tool_servers: HashMap<ToolName, McpServerId>,
+    tool_origins: HashMap<ToolName, ToolOrigin>,
     specs: Vec<ToolSpec>,
     servers: HashMap<McpServerId, ConnectedServer>,
 }
@@ -550,7 +600,7 @@ impl McpStateBuilder {
     fn with_capacity(server_count: usize) -> Self {
         Self {
             by_name: HashMap::new(),
-            tool_servers: HashMap::new(),
+            tool_origins: HashMap::new(),
             specs: Vec::new(),
             servers: HashMap::with_capacity(server_count),
         }
@@ -561,7 +611,7 @@ impl McpStateBuilder {
             .sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
         McpState {
             by_name: self.by_name,
-            tool_servers: Arc::new(self.tool_servers),
+            tool_origins: Arc::new(self.tool_origins),
             specs: Arc::from(self.specs),
             servers: self.servers,
         }

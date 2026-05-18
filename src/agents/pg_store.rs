@@ -16,10 +16,10 @@ use std::fmt;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use sqlx::types::Json;
 
 use crate::auth::{OrgId, UserId, run_as_user, run_privileged};
 use crate::clock::SharedClock;
-use crate::mcp::McpServerId;
 use crate::pg_vector;
 use crate::provider::{SharedEmbeddingProvider, embed_one};
 
@@ -27,7 +27,7 @@ use super::error::AgentStoreError;
 use super::store::{AgentStore, AgentUpdate, NewAgent};
 use super::types::{
     AgentCard, AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt,
-    AllowedMcpServers, DefaultAgentSeed,
+    AllowedMcpTools, DefaultAgentSeed,
 };
 
 /// Hard cap on `list_names` SQL — fetched batches are bounded per
@@ -47,7 +47,7 @@ const AGENT_DEFAULT_SEED_LOCK_KEY: i64 = 0x6167_656E_745F_6473;
 /// hydrates an [`AgentRow`] must use this — adding a column then becomes a
 /// one-line edit here plus the matching `AgentRow` field.
 const AGENT_COLS: &str = "id, org_id, name, system_prompt, description, is_default, \
-    allowed_mcp_servers, created_at, updated_at";
+    allowed_mcp_tools, created_at, updated_at";
 
 /// Postgres-backed [`AgentStore`]. Holds a cheap clone of a [`PgPool`], a
 /// [`SharedClock`], and a [`SharedEmbeddingProvider`] for `description`
@@ -116,9 +116,9 @@ impl PgAgentStore {
             }
 
             let id = AgentId::new();
-            // `allowed_mcp_servers` is intentionally left to the column's
-            // SQL default (`'{}'`): a freshly seeded agent has no MCP
-            // access. An operator opts it in via PUT after startup.
+            // `allowed_mcp_tools` is intentionally left to the column's
+            // SQL default (`'{}'::jsonb`): a freshly seeded agent has no
+            // MCP access. An operator opts it in via PUT after startup.
             sqlx::query(
                 "INSERT INTO agents \
                      (id, org_id, name, system_prompt, description, description_embedding, \
@@ -241,8 +241,8 @@ impl AgentStore for PgAgentStore {
             if let Some(description) = payload.description {
                 current.description = description;
             }
-            if let Some(allowed) = payload.allowed_mcp_servers {
-                current.allowed_mcp_servers = allowed;
+            if let Some(allowed) = payload.allowed_mcp_tools {
+                current.allowed_mcp_tools = allowed;
             }
 
             // Promote: clear the old default in the *same org* in the same
@@ -270,7 +270,7 @@ impl AgentStore for PgAgentStore {
                 "UPDATE agents \
                  SET name = $2, system_prompt = $3, description = $4, \
                      description_embedding = COALESCE($5::vector, description_embedding), \
-                     is_default = $6, allowed_mcp_servers = $7, updated_at = $8 \
+                     is_default = $6, allowed_mcp_tools = $7, updated_at = $8 \
                  WHERE id = $1",
             )
             .bind(id)
@@ -279,7 +279,7 @@ impl AgentStore for PgAgentStore {
             .bind(current.description.as_str())
             .bind(embedding_arg)
             .bind(current.is_default)
-            .bind(current.allowed_mcp_servers.as_slice())
+            .bind(Json(&current.allowed_mcp_tools))
             .bind(now)
             .execute(&mut **tx)
             .await?;
@@ -462,7 +462,7 @@ async fn create_in_tx(
     let insert = sqlx::query(
         "INSERT INTO agents \
                  (id, org_id, name, system_prompt, description, description_embedding, \
-                  is_default, allowed_mcp_servers, created_at, updated_at) \
+                  is_default, allowed_mcp_tools, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8, $9, $9)",
     )
     .bind(id)
@@ -472,7 +472,7 @@ async fn create_in_tx(
     .bind(payload.description.as_str())
     .bind(embedding_literal)
     .bind(payload.is_default)
-    .bind(payload.allowed_mcp_servers.as_slice())
+    .bind(Json(&payload.allowed_mcp_tools))
     .bind(now)
     .execute(&mut **tx)
     .await;
@@ -491,7 +491,7 @@ async fn create_in_tx(
         system_prompt: payload.system_prompt,
         description: payload.description,
         is_default: payload.is_default,
-        allowed_mcp_servers: payload.allowed_mcp_servers,
+        allowed_mcp_tools: payload.allowed_mcp_tools,
         created_at: now,
         updated_at: now,
     })
@@ -505,7 +505,7 @@ struct AgentRow {
     system_prompt: String,
     description: String,
     is_default: bool,
-    allowed_mcp_servers: Vec<McpServerId>,
+    allowed_mcp_tools: Json<AllowedMcpTools>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -521,7 +521,7 @@ impl TryFrom<AgentRow> for AgentRecord {
             system_prompt: AgentSystemPrompt::try_from(row.system_prompt)?,
             description: AgentDescription::try_from(row.description)?,
             is_default: row.is_default,
-            allowed_mcp_servers: AllowedMcpServers::try_from(row.allowed_mcp_servers)?,
+            allowed_mcp_tools: row.allowed_mcp_tools.0,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })

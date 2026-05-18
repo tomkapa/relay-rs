@@ -13,6 +13,16 @@ pub const MAX_MCP_SERVERS: usize = 32;
 /// could otherwise flood the agent's tool list and balloon every provider request.
 pub const MAX_TOOLS_PER_SERVER: usize = 64;
 
+/// Length cap on a remote MCP tool name (the name the server publishes
+/// before relay prefixes it with `mcp_<alias>_`).
+///
+/// Set to the `ToolName` cap so it can never exceed what `prefixed_name`
+/// would tolerate even if alias-prefix overhead were zero. The runtime
+/// rejects (and warns) on a longer prefixed name in `ingest_tools`; this
+/// cap guards the per-agent allowlist input path before any registry
+/// lookup happens.
+pub const MCP_TOOL_REMOTE_NAME_MAX_LEN: usize = 64;
+
 /// How long the alias may be. Matches the schema CHECK constraint and reserves enough
 /// budget that `mcp_<alias>_<remote>` always fits in the 64-char `ToolName` cap.
 /// `4 + 16 + 1 + 43 = 64`.

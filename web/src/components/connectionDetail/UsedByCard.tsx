@@ -14,7 +14,9 @@ export function UsedByCard({ serverId }: { serverId: string }) {
   const agentsQuery = useAgents();
   const agents = useMemo<Agent[]>(() => {
     const all = (agentsQuery.data ?? []) as Agent[];
-    return all.filter((a) => a.allowed_mcp_servers?.includes(serverId));
+    return all.filter((a) =>
+      Object.prototype.hasOwnProperty.call(a.allowed_mcp_tools ?? {}, serverId),
+    );
   }, [agentsQuery.data, serverId]);
 
   return (

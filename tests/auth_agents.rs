@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use relay_rs::agents::{
-    AgentDescription, AgentName, AgentSystemPrompt, AllowedMcpServers, NewAgent, SharedAgentStore,
+    AgentDescription, AgentName, AgentSystemPrompt, AllowedMcpTools, NewAgent, SharedAgentStore,
 };
 use relay_rs::auth::OrgId;
 use relay_rs::clock::SystemClock;
@@ -148,7 +148,7 @@ impl AuthAgentsHarness {
                 description: AgentDescription::try_from(format!("agent {name}"))
                     .expect("valid desc"),
                 is_default: false,
-                allowed_mcp_servers: AllowedMcpServers::empty(),
+                allowed_mcp_tools: AllowedMcpTools::empty(),
             })
             .await
             .expect("seed agent");
