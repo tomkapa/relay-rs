@@ -49,9 +49,12 @@ pub enum CredentialPayload {
     Oauth2(OAuth2Payload),
 }
 
-/// OAuth credential payload. The variant is stored encrypted alongside
-/// `static_headers`; phase C drives the actual flow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// OAuth credential payload. Stored encrypted alongside `static_headers`.
+///
+/// Hand-rolled `Debug` that redacts `access_token` / `refresh_token`:
+/// the struct travels through tracing spans and panic backtraces, and a
+/// stray `?payload` would otherwise leak the bearer (CLAUDE.md §2).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OAuth2Payload {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -59,6 +62,19 @@ pub struct OAuth2Payload {
     pub scope: Option<String>,
     pub issuer: String,
     pub token_endpoint: String,
+}
+
+impl fmt::Debug for OAuth2Payload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuth2Payload")
+            .field("access_token", &"***")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .field("issuer", &self.issuer)
+            .field("token_endpoint", &self.token_endpoint)
+            .finish()
+    }
 }
 
 impl CredentialPayload {

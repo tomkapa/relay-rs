@@ -127,9 +127,12 @@ impl OAuthRefresher {
         let cache_clone = cache.clone();
         let handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(OAUTH_REFRESH_TICK);
-            // Skip the initial fire so we don't run a refresh on startup
-            // before the registry has had a chance to do its first
-            // connect pass.
+            // The default `Burst` policy would replay missed ticks back-
+            // to-back after a stall; `Skip` collapses them so a paused
+            // host can't cause a thundering refresh storm on resume. The
+            // first tick fires immediately, which is what we want: any
+            // token that expired while we were down gets caught before
+            // serving traffic.
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {

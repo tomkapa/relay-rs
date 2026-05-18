@@ -51,9 +51,14 @@ impl McpCredentialStore for PgMcpCredentialStore {
         let now = self.clock.now_utc();
         crate::auth::run_privileged::<(), McpError>(&self.pool, async |tx| {
             // ON CONFLICT updates the existing row in a single statement —
-            // we never read the old ciphertext back, satisfying R2 (replace
-            // must not expose the old credential).
-            sqlx::query(
+            // we never read the old ciphertext back, so a replacement
+            // cannot expose the prior credential. The `WHERE … org_id =
+            // EXCLUDED.org_id` guard is defence-in-depth on top of the
+            // parent-org trigger: a future regression that lets a
+            // mismatched org_id reach this code is silently turned into
+            // a no-op rather than overwriting another tenant's row, and
+            // the rows_affected check below promotes that to an error.
+            let affected = sqlx::query(
                 "INSERT INTO mcp_server_credentials \
                  (server_id, org_id, kind, ciphertext, nonce, key_version, created_at, updated_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $7) \
@@ -62,7 +67,8 @@ impl McpCredentialStore for PgMcpCredentialStore {
                      ciphertext = EXCLUDED.ciphertext, \
                      nonce = EXCLUDED.nonce, \
                      key_version = EXCLUDED.key_version, \
-                     updated_at = EXCLUDED.updated_at",
+                     updated_at = EXCLUDED.updated_at \
+                 WHERE mcp_server_credentials.org_id = EXCLUDED.org_id",
             )
             .bind(server_id)
             .bind(org_id)
@@ -72,7 +78,13 @@ impl McpCredentialStore for PgMcpCredentialStore {
             .bind(blob.key_version)
             .bind(now)
             .execute(&mut **tx)
-            .await?;
+            .await?
+            .rows_affected();
+            if affected == 0 {
+                return Err(McpError::Backend(
+                    "credential upsert: org_id mismatch on existing row".into(),
+                ));
+            }
             Ok(())
         })
         .await

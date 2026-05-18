@@ -842,17 +842,23 @@ async fn handle_oauth_callback(
         .map_err(HttpError::Mcp)?;
 
     // Flip the connection_status back to `ok` (it might have been
-    // `reconnect_required` from a prior revocation) and signal a
-    // refresh so the new token is used immediately.
-    let _ = sqlx::query(
-        "UPDATE mcp_servers SET connection_status = 'ok', last_error = NULL, \
-                                updated_at = $3 \
-         WHERE id = $1 AND org_id = $2",
-    )
-    .bind(pending.server_id)
-    .bind(pending.org_id)
-    .bind(now)
-    .execute(&state.pool)
+    // `reconnect_required` from a prior revocation) and signal a refresh
+    // so the new token is used immediately. The callback runs without a
+    // session cookie, so we drop into `run_privileged` rather than
+    // `begin_as`; the explicit `org_id = $2` filter pins the row.
+    crate::auth::run_privileged::<(), crate::auth::AuthError>(&state.pool, async |tx| {
+        sqlx::query(
+            "UPDATE mcp_servers SET connection_status = 'ok', last_error = NULL, \
+                                    updated_at = $3 \
+             WHERE id = $1 AND org_id = $2",
+        )
+        .bind(pending.server_id)
+        .bind(pending.org_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    })
     .await
     .map_err(|e| {
         tracing::error!(error = %e, "mcp.oauth.callback.status_update_failed");

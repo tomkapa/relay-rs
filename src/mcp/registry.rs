@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
-use tracing::{instrument, warn};
+use tracing::{error, instrument, warn};
 
 use crate::clock::SharedClock;
 use crate::provider::ToolSpec;
@@ -389,10 +389,14 @@ impl McpRegistryInner {
             Ok(Some(rec)) => Ok(Some(rec.payload)),
             Ok(None) => Ok(None),
             Err(e) => {
-                warn!(
+                // `error!` so the refresh span's status flips to ERROR
+                // via the OTel bridge; credential decrypt failure here
+                // is unexpected (master KEK rotation gone wrong, or
+                // schema drift) and an operator needs to see it.
+                error!(
                     relay.mcp.server.id = %id,
                     relay.mcp.server.alias = %alias,
-                    error = %e,
+                    error = ?e,
                     "mcp.refresh.credential_load_failed",
                 );
                 let _ = self

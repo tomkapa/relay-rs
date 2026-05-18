@@ -129,7 +129,12 @@ impl AuthMcpHarness {
         }
     }
 
-    async fn seed_mcp(&self, org: OrgId, alias_str: &str) {
+    async fn seed_mcp(
+        &self,
+        org: OrgId,
+        created_by_user_id: relay_rs::auth::UserId,
+        alias_str: &str,
+    ) {
         let alias = McpServerAlias::try_from(alias_str).expect("valid alias");
         let config = McpTransport::Http {
             url: McpHttpUrl::try_from(&*format!("http://localhost:9000/{alias_str}"))
@@ -138,7 +143,7 @@ impl AuthMcpHarness {
         self.mcp_store
             .create(McpServerCreate {
                 org_id: org,
-                created_by_user_id: self.primary.user_id,
+                created_by_user_id,
                 alias,
                 config,
                 description: None,
@@ -196,8 +201,9 @@ async fn cross_org_isolation_filters_to_caller_org() {
     // Mint a *second* principal in a different org and seed one row in
     // each org via the privileged store.
     let other = seed_principal(&h.state.pool, &h.state.jwt).await;
-    h.seed_mcp(h.primary.org_id, "mine").await;
-    h.seed_mcp(other.org_id, "theirs").await;
+    h.seed_mcp(h.primary.org_id, h.primary.user_id, "mine")
+        .await;
+    h.seed_mcp(other.org_id, other.user_id, "theirs").await;
 
     let app = router(h.state.clone());
 
@@ -381,9 +387,15 @@ async fn create_with_credentials_seals_to_encrypted_table() {
     );
 
     // R2: DB ciphertext is opaque — the plaintext token never lives in the
-    // table.
+    // table. Scope by id (rather than `LIMIT 1`) so the assertion stays
+    // tight if future tests seed additional rows.
+    let server_id: uuid::Uuid = json["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .expect("create response had `id`");
     let cipher: Vec<u8> =
-        sqlx::query_scalar("SELECT ciphertext FROM mcp_server_credentials LIMIT 1")
+        sqlx::query_scalar("SELECT ciphertext FROM mcp_server_credentials WHERE server_id = $1")
+            .bind(server_id)
             .fetch_one(&h.state.pool)
             .await
             .expect("ciphertext");
@@ -423,7 +435,8 @@ async fn create_with_credentials_seals_to_encrypted_table() {
 #[tokio::test(flavor = "multi_thread")]
 async fn put_credentials_replaces_without_revealing_old_value() {
     let h = AuthMcpHarness::new().await;
-    h.seed_mcp(h.primary.org_id, "rotate").await;
+    h.seed_mcp(h.primary.org_id, h.primary.user_id, "rotate")
+        .await;
     let server_id: uuid::Uuid =
         sqlx::query_scalar("SELECT id FROM mcp_servers WHERE alias = 'rotate' AND org_id = $1")
             .bind(h.primary.org_id)

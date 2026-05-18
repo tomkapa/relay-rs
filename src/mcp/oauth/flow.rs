@@ -167,12 +167,20 @@ pub async fn register_dynamic_client(
     }
     let raw: DcrResponse =
         serde_json::from_slice(&bytes).map_err(|e| OAuthError::Dcr(format!("parse: {e}")))?;
+    // Surface SecretString::try_from failures (empty / oversized) as a
+    // typed DCR error rather than silently dropping the field — a half-
+    // registered client where the secret was discarded would fail later
+    // in non-obvious ways.
     let client_secret = raw
         .client_secret
-        .and_then(|s| SecretString::try_from(s).ok());
+        .map(SecretString::try_from)
+        .transpose()
+        .map_err(|e| OAuthError::Dcr(format!("invalid client_secret: {e}")))?;
     let registration_access_token = raw
         .registration_access_token
-        .and_then(|s| SecretString::try_from(s).ok());
+        .map(SecretString::try_from)
+        .transpose()
+        .map_err(|e| OAuthError::Dcr(format!("invalid registration_access_token: {e}")))?;
     Ok(NewOAuthClient {
         org_id,
         issuer: as_metadata.issuer.clone(),
