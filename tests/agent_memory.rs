@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use relay_rs::agents::{AgentNamesCache, AgentPromptCache, SharedAgentStore};
+use relay_rs::auth::{Language, SharedOrgLanguageResolver};
 use relay_rs::clock::{SharedClock, SystemClock, TestClock};
 use relay_rs::memory::{
     AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, DATE_TAG_CLOSE, DATE_TAG_OPEN, MEMORY_TAG_CLOSE,
@@ -20,21 +21,18 @@ use relay_rs::memory::{
     MemorySectionLoader, MemoryState, MutationSource, PgMemoryStore, ROLE_TAG_CLOSE, ROLE_TAG_OPEN,
     SessionMemoryCache, SharedMemoryStore,
 };
+use relay_rs::prompts::Prompts;
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
 use relay_rs::types::Participant;
 
 mod common;
+use common::lang::StaticOrgLanguageResolver;
 use common::pg::{TestDb, human_to_agent_session};
 
-const CORE: &str = "be professional and helpful";
-
-fn cores() -> relay_rs::memory::ModeCores {
-    relay_rs::memory::ModeCores {
-        normal: std::sync::Arc::from(CORE),
-        reflection: std::sync::Arc::from(CORE),
-        resolution: std::sync::Arc::from(CORE),
-    }
-}
+/// Marker substring used by the original ordering tests to confirm the
+/// `<core>` body is present. Matches a stable phrase in the real English
+/// `<identity>` block (see `src/prompts/internal.toml`).
+const CORE_MARKER: &str = "thoughtful, professional teammate";
 
 struct Fixture {
     memory: AgentMemory,
@@ -57,12 +55,16 @@ fn build_memory(db: &TestDb, clock: SharedClock) -> Fixture {
     let session_cache = SessionMemoryCache::new(16, Duration::from_secs(60), clock.clone());
     let loader =
         MemorySectionLoader::new(store.clone(), sessions.clone(), embeddings, session_cache);
+    let prompts = Arc::new(Prompts::load());
+    let language_resolver: SharedOrgLanguageResolver =
+        Arc::new(StaticOrgLanguageResolver::new(Language::En));
     let memory = AgentMemory::new(
         agents.clone(),
         prompt_cache,
         names_cache,
         loader,
-        cores(),
+        prompts,
+        language_resolver,
         clock,
     );
     Fixture {
@@ -105,7 +107,7 @@ async fn assembles_core_then_role_in_order() {
     assert!(core_open < core_close, "core tags ordered");
     assert!(core_close < role_open, "core block precedes role block");
     assert!(role_open < role_close, "role tags ordered");
-    assert!(s.contains(CORE), "core text present");
+    assert!(s.contains(CORE_MARKER), "core text present");
     assert!(
         s.contains("test default prompt"),
         "role text from the seeded agent present"

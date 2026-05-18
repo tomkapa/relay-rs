@@ -53,8 +53,8 @@ async fn run_as_user_commits_on_ok_and_pins_app_user_id() {
         // `relay_app`. `organizations` is granted to the role; the
         // INSERT lets us verify post-commit visibility below.
         sqlx::query(
-            "INSERT INTO organizations (id, name, slug, created_at, updated_at) \
-             VALUES ($1, $2, $3, now(), now())",
+            "INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'en', now(), now())",
         )
         .bind(new_org)
         .bind("Run-As Commit")
@@ -84,8 +84,8 @@ async fn run_as_user_rolls_back_on_err() {
 
     let res = run_as_user::<(), TxTestError>(&db.pool, user, async |tx| {
         sqlx::query(
-            "INSERT INTO organizations (id, name, slug, created_at, updated_at) \
-             VALUES ($1, $2, $3, now(), now())",
+            "INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'en', now(), now())",
         )
         .bind(new_org)
         .bind("Rolled Back")
@@ -119,8 +119,8 @@ async fn run_privileged_commits_on_ok_and_skips_app_user_id() {
         assert!(pinned.is_none(), "privileged tx should not set app.user_id");
 
         sqlx::query(
-            "INSERT INTO organizations (id, name, slug, created_at, updated_at) \
-             VALUES ($1, $2, $3, now(), now())",
+            "INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'en', now(), now())",
         )
         .bind(new_org)
         .bind("Privileged Commit")
@@ -149,8 +149,8 @@ async fn run_privileged_rolls_back_on_err() {
 
     let res = run_privileged::<(), TxTestError>(&db.pool, async |tx| {
         sqlx::query(
-            "INSERT INTO organizations (id, name, slug, created_at, updated_at) \
-             VALUES ($1, $2, $3, now(), now())",
+            "INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'en', now(), now())",
         )
         .bind(new_org)
         .bind("Privileged Rollback")

@@ -56,7 +56,7 @@ async fn seed_second_org(pool: &PgPool) -> (OrgId, UserId, relay_rs::agents::Age
         .execute(pool)
         .await
         .expect("seed other user");
-    sqlx::query("INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)")
+    sqlx::query("INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at) VALUES ($1, $2, $3, 'en', $4, $4)")
         .bind(org_id)
         .bind("Other Org")
         .bind(&slug)

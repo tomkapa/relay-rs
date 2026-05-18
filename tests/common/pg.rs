@@ -116,7 +116,7 @@ impl TestDb {
             .execute(&pool)
             .await
             .expect("seed user");
-        sqlx::query("INSERT INTO organizations (id, name, slug, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)")
+        sqlx::query("INSERT INTO organizations (id, name, slug, default_language, created_at, updated_at) VALUES ($1, $2, $3, 'en', $4, $4)")
             .bind(default_org_id)
             .bind("Seeded Test Org")
             .bind(&org_slug)

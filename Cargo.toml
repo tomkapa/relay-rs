@@ -96,6 +96,12 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
 ] }
 thiserror = "2"
+# §8 (zero-dep bias): TOML parser for the per-language prompt registry
+# (`src/prompts/{internal,en,vi}.toml`). Multi-line prompt bodies in JSON
+# would be unreadable (`\n` escapes) and translators have to edit them by
+# hand. `toml` is mature, small, and is the parser Cargo itself uses; we
+# only need `parse` at startup, not write. Owner: prompts/.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",

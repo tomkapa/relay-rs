@@ -39,10 +39,7 @@ pub use memory::{
     MemoryForgetTool, MemoryToolDeps, MemoryUpdateTool, MemoryValidateTool, MemoryWriteTool,
     RecallTool,
 };
-pub use scheduling::{
-    CancelScheduledTaskTool, ListScheduledTasksTool, SCHEDULING_CORE_PROMPT_SUPPLEMENT,
-    ScheduleTaskTool,
-};
+pub use scheduling::{CancelScheduledTaskTool, ListScheduledTasksTool, ScheduleTaskTool};
 pub use search_agents::SearchAgentsTool;
 pub use send_message::SendMessageTool;
 pub use web_fetch::WebFetchTool;

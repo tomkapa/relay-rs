@@ -30,31 +30,8 @@ pub use cancel_scheduled_task::CancelScheduledTaskTool;
 pub use list_scheduled_tasks::ListScheduledTasksTool;
 pub use schedule_task::ScheduleTaskTool;
 
-/// Supplementary `<core>` instructions for the scheduling tool surface.
-///
-/// Concatenated onto the base `Normal` system prompt at composition time
-/// so the tool docs and the model-facing instructions can't drift apart —
-/// they live in the same module. Wrapped in `<scheduling>` so it sits as
-/// its own peer section inside the outer `<core>` envelope alongside
-/// `<identity>`, `<communication>`, and `<chain_of_command>`.
-pub const SCHEDULING_CORE_PROMPT_SUPPLEMENT: &str = "\n\
-    \n\
-    <scheduling>\n\
-    Use `schedule_task` to register a future wake-up. The system fires \
-    the prompt you supply at the chosen time as a fresh turn for you, \
-    exactly as if a user had typed it. Two shapes are supported: `once` \
-    (a specific moment) and `recurring` (a set of weekdays at a \
-    time-of-day in an IANA timezone). Each scheduled fire arrives in a \
-    brand-new conversation thread; reply through \
-    `send_message(receiver=Human, …)` like any normal turn.\n\
-    \n\
-    When the user explicitly asks for a schedule (\"every morning at \
-    7am, …\", \"remind me tomorrow to …\"), call the tool directly. \
-    When you think a schedule would help but the user did not ask, \
-    propose it first and wait for consent — do not silently schedule. \
-    Always confirm the timezone if the user didn't say; do not assume.\n\
-    \n\
-    Use `list_scheduled_tasks` to check what is already scheduled \
-    before adding a duplicate, and `cancel_scheduled_task` to remove a \
-    task by id.\n\
-    </scheduling>";
+// The `<scheduling>` supplement body lives in `src/prompts/internal.toml`
+// under the `scheduling_supplement` key and is joined onto the base
+// `Normal` `<core>` body at startup by `Prompts::load`. The tool docs
+// stay in this module (close to the impls); the model-facing copy lives
+// next to the other prompts so a translation pass touches one TOML.

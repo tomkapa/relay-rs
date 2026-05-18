@@ -21,6 +21,12 @@ pub enum HttpError {
     #[error("not found")]
     NotFound,
 
+    /// 403 with a fixed reason string. Use for role-gated routes (e.g.
+    /// owner/admin-only mutations) where the failure mode is purely
+    /// "your role isn't high enough", not an unknown resource.
+    #[error("forbidden: {0}")]
+    Forbidden(&'static str),
+
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -60,6 +66,7 @@ impl IntoResponse for HttpError {
         let (status, message) = match &self {
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
+            Self::Forbidden(reason) => (StatusCode::FORBIDDEN, (*reason).into()),
             Self::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "too large".into()),
             Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too many requests".into()),

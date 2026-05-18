@@ -3,7 +3,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::agents::SharedAgentStore;
-use crate::auth::{GoogleOAuth, JwtSigner, SharedUserStore};
+use crate::auth::{GoogleOAuth, JwtSigner, SharedOrgLanguageResolver, SharedUserStore};
 use crate::clock::SharedClock;
 use crate::http::MembershipCache;
 use crate::mcp::oauth::{OAuthFlowClient, SharedMcpOAuthClientStore, SharedMcpOAuthPendingStore};
@@ -11,6 +11,7 @@ use crate::mcp::{
     McpRefreshTrigger, SharedMcpCredentialStore, SharedMcpServerStore, TestConnectRateLimiter,
 };
 use crate::memory::SharedMemoryStore;
+use crate::prompts::Prompts;
 use crate::runtime::{
     SharedDagBudget, SharedLeaseManager, SharedPromptQueue, SharedResponseSource,
     SharedThreadStream,
@@ -86,6 +87,15 @@ pub struct AppState {
     /// `(user_id, org_id) → role` lookup cache. Cuts the per-request
     /// membership round-trip down to a Mutex lookup for repeat callers.
     pub memberships: Arc<MembershipCache>,
+    /// Per-language prompt registry. Loaded once at startup; the OAuth
+    /// callback reads it to seed the per-org default agent in the right
+    /// language. The agent worker hits it on every turn through
+    /// `AgentMemory`.
+    pub prompts: Arc<Prompts>,
+    /// Per-agent language lookup. The `PATCH /me/org/language` handler
+    /// invalidates the cache here so a switch propagates to the next
+    /// agent turn without waiting for TTL.
+    pub language_resolver: SharedOrgLanguageResolver,
 }
 
 impl AppState {

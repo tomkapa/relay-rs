@@ -1,5 +1,6 @@
 import type {
   Agent,
+  Language,
   Me,
   Role,
   SubmitPromptResponse,
@@ -72,6 +73,16 @@ export const api = {
       body: JSON.stringify({ org_id: orgId }),
     }),
   logout: () => request<void>("/auth/logout", { method: "POST" }),
+
+  /** Owner/admin only — mutates the active org's `default_language`.
+   *  Server returns `{ default_language: Language }`; the caller is
+   *  expected to mirror the value into `useAuthStore` so the UI flips
+   *  immediately without waiting for a `/me` re-poll. */
+  setOrgLanguage: (language: Language) =>
+    request<{ default_language: Language }>("/me/org/language", {
+      method: "PATCH",
+      body: JSON.stringify({ language }),
+    }),
 
   agents: () => request<Agent[]>("/agents"),
 

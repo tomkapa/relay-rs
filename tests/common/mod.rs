@@ -8,4 +8,5 @@
 pub mod auth;
 pub mod embedding;
 pub mod harness;
+pub mod lang;
 pub mod pg;

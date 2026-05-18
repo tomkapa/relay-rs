@@ -14,6 +14,8 @@
 
 use axum::Router;
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
+use axum::http::header::ACCEPT_LANGUAGE;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
@@ -22,7 +24,7 @@ use cookie::time::Duration as CookieDuration;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::auth::{OAuthStateRow, limits::COOKIE_NAME};
+use crate::auth::{Language, LocaleHint, OAuthStateRow, limits::COOKIE_NAME};
 
 use super::super::csrf::{build_csrf_cookie, mint_csrf_token};
 use super::super::error::HttpError;
@@ -52,6 +54,7 @@ struct CallbackQuery {
 
 async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> Result<Redirect, HttpError> {
     let start = state.oauth.start()?;
@@ -60,17 +63,57 @@ async fn login(
         + chrono::Duration::from_std(crate::auth::limits::OAUTH_STATE_TTL)
             .unwrap_or_else(|_| chrono::Duration::seconds(600));
     let safe_return = query.return_to.and_then(|r| sanitize_return_to(&r));
+    // Extract the primary tag from the inbound Accept-Language so the
+    // callback has a locale fallback when Google's userinfo doesn't
+    // carry one. Walks all entries for the first that maps to a
+    // supported `Language`; the bound is enforced by the `LocaleHint`
+    // newtype which matches the `oauth_login_states.detected_locale`
+    // column CHECK.
+    let detected_locale = headers
+        .get(ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_primary_locale);
     state
         .users
         .insert_oauth_state(&OAuthStateRow {
             state: start.state.clone(),
             pkce_verifier: start.pkce_verifier.clone(),
             redirect_to: safe_return,
+            detected_locale,
             created_at: now,
             expires_at: expires,
         })
         .await?;
     Ok(Redirect::to(start.authorize_url.as_str()))
+}
+
+/// Walk an `Accept-Language` header for the first entry whose primary
+/// subtag maps to a supported [`Language`], returning that subtag.
+///
+/// `Accept-Language` follows the shape `tag(;q=...)?(,tag(;q=...)?)*` —
+/// e.g. `fr-CA,vi;q=0.9,en;q=0.8`. We honour entry order over `q=`
+/// (browsers always emit entries in user-preference order, with `q=`
+/// merely ranking duplicates) and skip entries whose primary tag we
+/// don't speak so a header like `fr-CA,vi;q=0.9` resolves to `vi`
+/// rather than stashing `fr` and falling back to English. Returns
+/// `None` when no supported tag is present; the OAuth callback then
+/// hands `None` to [`Language::from_locale_hint`] which falls through
+/// to `Language::DEFAULT`.
+fn extract_primary_locale(raw: &str) -> Option<LocaleHint> {
+    raw.split(',')
+        .filter_map(|entry| primary_subtag(entry.trim()))
+        .find(|tag| Language::parse(tag).is_some())
+        .and_then(|tag| LocaleHint::try_from(tag.as_str()).ok())
+}
+
+/// Lowercase the primary subtag of one `Accept-Language` entry. Returns
+/// `None` for an empty entry or one whose primary part is blank.
+fn primary_subtag(entry: &str) -> Option<String> {
+    let primary = entry.split(['-', '_', ';']).next()?.trim();
+    if primary.is_empty() {
+        return None;
+    }
+    Some(primary.to_ascii_lowercase())
 }
 
 async fn callback(
@@ -113,18 +156,29 @@ async fn callback(
             .split('@')
             .next()
             .expect("invariant: str::split always yields at least one element");
+        // Per-org language seed. Google's userinfo `locale` field wins
+        // when present; the inbound Accept-Language primary tag stashed
+        // at /auth/google/login is the fallback. Both are hints —
+        // `Language::from_locale_hint` is the single normalization
+        // point and falls back to `Language::DEFAULT` (`En`) when
+        // neither matches a supported language.
+        let language = Language::from_locale_hint(
+            profile.locale.as_ref().map(LocaleHint::as_str),
+            consumed.detected_locale.as_ref().map(LocaleHint::as_str),
+        );
         let new_org = state
             .users
-            .create_personal_org(upserted.user.id, slug_seed, &display, now)
+            .create_personal_org(upserted.user.id, slug_seed, &display, language, now)
             .await?;
-        // Seed the freshly minted personal org's default agent so the
-        // cookie we mint below immediately resolves to a usable
-        // workspace. Idempotent: re-running this for a pre-existing org
-        // returns the existing default's id rather than minting another.
-        // `default_agent_seed` only fails if the seed constants violate
-        // a newtype invariant — surface as an internal error rather than
-        // a user-facing 4xx (it's a server-side bug, not a bad request).
-        let seed = crate::app::default_agent_seed().map_err(|e| {
+        // Seed the freshly minted personal org's default agent in the
+        // chosen language so the cookie we mint below immediately
+        // resolves to a usable workspace. Idempotent: re-running this
+        // for a pre-existing org returns the existing default's id
+        // rather than minting another. `default_agent_seed` only fails
+        // if the registry bodies violate a newtype invariant — surface
+        // as an internal error rather than a user-facing 4xx (it's a
+        // server-side bug, not a bad request).
+        let seed = crate::app::default_agent_seed(&state.prompts, language).map_err(|e| {
             tracing::error!(
                 event = "auth.callback.default_agent_seed_build_failed",
                 error = ?e,

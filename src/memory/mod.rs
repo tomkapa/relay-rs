@@ -30,7 +30,7 @@ mod types;
 // --- per-turn system-prompt assembly --------------------------------------
 pub use agent::{
     AgentMemory, CORE_TAG_CLOSE, CORE_TAG_OPEN, DATE_FORMAT, DATE_TAG_CLOSE, DATE_TAG_OPEN,
-    ModeCores, ROLE_TAG_CLOSE, ROLE_TAG_OPEN,
+    LANGUAGE_TAG_CLOSE, LANGUAGE_TAG_OPEN, ROLE_TAG_CLOSE, ROLE_TAG_OPEN,
 };
 pub use r#static::StaticMemory;
 pub use traits::{Memory, MemoryError, SharedMemory};

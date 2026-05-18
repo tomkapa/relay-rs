@@ -1,6 +1,7 @@
 import { forwardRef } from "react";
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 import { cn } from "../../lib/utils";
+import { useT } from "../../i18n";
 import { Spinner } from "./Spinner";
 
 type Variant = "primary" | "moss" | "ghost" | "danger";
@@ -53,6 +54,7 @@ export const Button = forwardRef<HTMLButtonElement, BaseProps>(function Button(
   },
   ref,
 ) {
+  const { t } = useT();
   const sizing = iconOnly ? SIZE_ICON[size] : SIZE_LABEL[size];
   return (
     <button
@@ -71,7 +73,7 @@ export const Button = forwardRef<HTMLButtonElement, BaseProps>(function Button(
       {loading ? (
         <>
           <Spinner size={12} />
-          <span className="sr-only">Loading</span>
+          <span className="sr-only">{t("button.loading")}</span>
         </>
       ) : (
         children

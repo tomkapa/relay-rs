@@ -4,9 +4,10 @@
 //! Each call resolves the viewer's role prompt (cached, TTL-bounded by
 //! [`crate::agents::AGENT_PROMPT_CACHE_TTL`]) and composes the final
 //! `system` field as `<core>...</core>\n<role>{prompt}</role>` followed
-//! by the rendered `<memory>...</memory>` section. Both the role prompt
-//! and the memory section are cached per session — the latter via
-//! [`SessionMemoryCache`].
+//! by `<date>`, the per-org `<language>` directive, and the rendered
+//! `<memory>...</memory>` section. The role prompt and memory section
+//! are cached per session; the language is cached per agent via the
+//! [`SharedOrgLanguageResolver`].
 //!
 //! See [`SessionMemoryCache`]'s module doc for the deliberate divergence
 //! from doc/memory.md's "frozen for the session's lifetime" wording: we
@@ -19,8 +20,10 @@ use async_trait::async_trait;
 use crate::agents::{
     AgentId, AgentNamesCache, AgentPromptCache, SharedAgentStore, render_agents_block,
 };
+use crate::auth::SharedOrgLanguageResolver;
 use crate::clock::SharedClock;
-use crate::runtime::{RequestKind, RequestKindPayload};
+use crate::prompts::Prompts;
+use crate::runtime::RequestKindPayload;
 use crate::session::SessionId;
 use crate::types::Participant;
 
@@ -38,6 +41,13 @@ pub const ROLE_TAG_OPEN: &str = "<role>\n";
 pub const ROLE_TAG_CLOSE: &str = "\n</role>";
 pub const DATE_TAG_OPEN: &str = "<date>\n";
 pub const DATE_TAG_CLOSE: &str = "\n</date>";
+/// `<language>` wraps the per-org language directive.
+///
+/// Placed between `<date>` and `<memory>` so the daily-churn date stays
+/// adjacent to the per-turn memory tail and the language sits with the
+/// other per-org stable-for-this-turn fields.
+pub const LANGUAGE_TAG_OPEN: &str = "<language>\n";
+pub const LANGUAGE_TAG_CLOSE: &str = "\n</language>";
 
 /// `strftime` pattern for the `<date>` body.
 ///
@@ -46,46 +56,25 @@ pub const DATE_TAG_CLOSE: &str = "\n</date>";
 /// ("next Friday", "tomorrow").
 pub const DATE_FORMAT: &str = "%Y-%m-%d (%A, UTC)";
 
-/// The per-mode `<core>` strings the composition root configures.
+/// Composite memory backing the per-turn system prompt.
 ///
-/// One field per [`RequestKind`] — exhaustive by construction. Adding a
-/// new `RequestKind` variant produces a compile error here, forcing the
-/// composition root to supply a core for the new mode.
-#[derive(Debug, Clone)]
-pub struct ModeCores {
-    pub normal: Arc<str>,
-    pub reflection: Arc<str>,
-    pub resolution: Arc<str>,
-}
-
-impl ModeCores {
-    /// Pick the core string for a request kind. Exhaustive `match` so a
-    /// new variant lights up here at compile time.
-    #[must_use]
-    pub fn for_kind(&self, kind: RequestKind) -> Arc<str> {
-        match kind {
-            RequestKind::Normal => self.normal.clone(),
-            RequestKind::Reflection => self.reflection.clone(),
-            RequestKind::Resolution => self.resolution.clone(),
-        }
-    }
-}
-
-/// Composite memory that assembles the system prompt from a per-mode
-/// core, a per-agent role string fetched on demand, and a per-session
-/// composed memory section.
+/// Assembles `<core>` + `<role>` + `<date>` + `<language>` + `<memory>`
+/// from the per-mode core (single-language), a per-agent role string
+/// fetched on demand, a per-session composed memory section, and the
+/// per-org language directive resolved on every turn.
 ///
-/// `prompt_cache` and `loader` are cheap-clone handles — both hold
-/// their own `Arc` state internally, so sharing across subsystems is
-/// just a clone. The loader is the single point that builds composed
-/// sections; the memory tool layer (`MemoryToolDeps`) takes the same
-/// loader so handle resolution and prompt rendering can never diverge.
+/// `prompt_cache` and `loader` are cheap-clone handles — both hold their
+/// own `Arc` state internally, so sharing across subsystems is just a
+/// clone. The loader is the single point that builds composed sections;
+/// the memory tool layer (`MemoryToolDeps`) takes the same loader so
+/// handle resolution and prompt rendering can never diverge.
 pub struct AgentMemory {
     agents: SharedAgentStore,
     prompt_cache: AgentPromptCache,
     names_cache: AgentNamesCache,
     loader: MemorySectionLoader,
-    cores: ModeCores,
+    prompts: Arc<Prompts>,
+    language_resolver: SharedOrgLanguageResolver,
     clock: SharedClock,
 }
 
@@ -96,7 +85,8 @@ impl AgentMemory {
         prompt_cache: AgentPromptCache,
         names_cache: AgentNamesCache,
         loader: MemorySectionLoader,
-        cores: ModeCores,
+        prompts: Arc<Prompts>,
+        language_resolver: SharedOrgLanguageResolver,
         clock: SharedClock,
     ) -> Self {
         Self {
@@ -104,7 +94,8 @@ impl AgentMemory {
             prompt_cache,
             names_cache,
             loader,
-            cores,
+            prompts,
+            language_resolver,
             clock,
         }
     }
@@ -181,7 +172,14 @@ impl Memory for AgentMemory {
             }
         };
 
-        let core_arc = self.cores.for_kind(kind_payload.kind());
+        // Per-org language. Cached behind the resolver so consecutive
+        // turns for the same agent stay one mutex round-trip away from
+        // the right directive. A switch propagates via the PATCH
+        // /me/org/language handler invalidating the cache.
+        let language = self.language_resolver.language_for_agent(agent_id).await?;
+        let directive = self.prompts.set(language).language_directive.clone();
+
+        let core_arc = self.prompts.cores.for_kind(kind_payload.kind());
         let core = core_arc.as_ref();
         let role_str = role.as_str();
         let memory_str = memory_section.text();
@@ -190,9 +188,13 @@ impl Memory for AgentMemory {
 
         // `<date>` sits between `<role>` and `<memory>` so the daily-churn seam
         // lies between the per-agent stable prefix and the per-turn memory tail.
+        // `<language>` follows `<date>` because it is also per-turn (cheap to
+        // re-render) and rotates with the org's setting rather than the agent's.
         let now_utc: chrono::DateTime<chrono::Utc> = self.clock.now_wall().into();
         let date_str = now_utc.format(DATE_FORMAT).to_string();
         let date_sep = "\n";
+        let lang_sep = "\n";
+        let directive_str = directive.as_ref();
 
         let mut out = String::with_capacity(
             CORE_TAG_OPEN.len()
@@ -207,6 +209,10 @@ impl Memory for AgentMemory {
                 + DATE_TAG_OPEN.len()
                 + date_str.len()
                 + DATE_TAG_CLOSE.len()
+                + lang_sep.len()
+                + LANGUAGE_TAG_OPEN.len()
+                + directive_str.len()
+                + LANGUAGE_TAG_CLOSE.len()
                 + memory_sep.len()
                 + memory_str.len(),
         );
@@ -222,6 +228,10 @@ impl Memory for AgentMemory {
         out.push_str(DATE_TAG_OPEN);
         out.push_str(&date_str);
         out.push_str(DATE_TAG_CLOSE);
+        out.push_str(lang_sep);
+        out.push_str(LANGUAGE_TAG_OPEN);
+        out.push_str(directive_str);
+        out.push_str(LANGUAGE_TAG_CLOSE);
         out.push_str(memory_sep);
         out.push_str(memory_str);
 

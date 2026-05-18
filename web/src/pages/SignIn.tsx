@@ -4,6 +4,7 @@ import { AlertTriangle, Radio } from "lucide-react";
 import { Banner } from "../components/molecules/Banner";
 import { Button } from "../components/atoms/Button";
 import signinArtwork from "../assets/signin.png";
+import { useT } from "../i18n";
 
 function GoogleG() {
   return (
@@ -36,6 +37,7 @@ function GoogleG() {
 
 export function SignIn() {
   const location = useLocation();
+  const { t } = useT();
 
   const { oauthDown, returnTo } = useMemo(() => {
     const params = new URLSearchParams(location.search);
@@ -67,7 +69,7 @@ export function SignIn() {
             <Radio className="h-4 w-4" />
           </span>
           <span className="font-[var(--font-mono)] text-[14px] font-semibold uppercase tracking-[0.28em] text-[var(--color-paper)]">
-            Relay
+            {t("signin.brand")}
           </span>
           <span
             aria-hidden="true"
@@ -80,14 +82,7 @@ export function SignIn() {
 
         <div className="mt-16">
           <p className="font-[var(--font-display)] text-[40px] font-bold leading-[1.1] tracking-tight text-[var(--color-paper)]">
-            The operator console for{" "}
-            <span className="inline-block bg-[var(--color-moss)] px-2 py-[2px] text-[var(--color-paper)]">
-              multi-agent
-            </span>{" "}
-            sessions.
-          </p>
-          <p className="mt-5 max-w-[420px] text-[13px] leading-[1.6] text-[var(--color-muted-2)]">
-            Spawn, supervise, and audit every agent in one place.
+            {t("signin.tagline")}
           </p>
         </div>
 
@@ -105,13 +100,10 @@ export function SignIn() {
       <main className="grain-paper relative flex flex-1 items-center justify-center px-6 py-10">
         <div className="w-full max-w-[420px]">
           <h1 className="font-[var(--font-display)] text-[36px] font-bold leading-[1.1] tracking-tight text-[var(--color-ink)]">
-            Sign in to{" "}
-            <span className="inline-block rounded-md bg-[var(--color-moss-tint)] px-2.5 py-[2px] text-[var(--color-moss-deep)]">
-              Relay
-            </span>
+            {t("signin.heading")}
           </h1>
           <p className="mt-3 text-[13px] leading-[1.55] text-[var(--color-muted)]">
-            Continue with your Google account.
+            {t("signin.subheading")}
           </p>
 
           {oauthDown ? (
@@ -120,7 +112,7 @@ export function SignIn() {
               icon={<AlertTriangle className="h-3.5 w-3.5" />}
               className="mt-5"
             >
-              Google is unreachable, try again.
+              {t("signin.error.oauth_down")}
             </Banner>
           ) : null}
 
@@ -131,12 +123,11 @@ export function SignIn() {
             className="mt-6 w-full gap-2"
           >
             <GoogleG />
-            Continue with Google
+            {t("signin.cta")}
           </Button>
 
           <p className="mt-8 text-[11px] leading-[1.6] text-[var(--color-muted-2)]">
-            By continuing, you agree to the Terms of Service and the Privacy
-            Policy. Sessions are bound to your tenant and audited.
+            {t("signin.legal")}
           </p>
         </div>
       </main>

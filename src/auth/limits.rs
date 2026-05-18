@@ -56,3 +56,13 @@ pub const CSRF_HEADER_NAME: &str = "X-CSRF-Token";
 /// mint produces a 22-char base64url token; anything ≫ that is junk
 /// and gets rejected before constant-time comparison.
 pub const CSRF_TOKEN_MAX_LEN: usize = 64;
+
+/// Maximum byte length of a detected-locale primary tag stashed on the
+/// `oauth_login_states` row.
+///
+/// Matches the column's CHECK constraint in migration 20. Real primary
+/// tags are 2–8 chars (`vi`, `en`, `zh-Hant` before we strip the
+/// region); the cap is generous so a malformed but otherwise harmless
+/// `Accept-Language` value is preserved rather than silently dropped —
+/// the `Language::from_locale_hint` parser is the final filter.
+pub const DETECTED_LOCALE_MAX_LEN: usize = 32;
