@@ -1252,7 +1252,7 @@ async fn put_oauth_client(
     let new = NewOAuthClient {
         org_id: principal.active_org_id,
         issuer: as_metadata.issuer.clone(),
-        client_id: client_id.into_inner(),
+        client_id,
         client_secret: credentials.into_secret(),
         authorization_endpoint: as_metadata.authorization_endpoint,
         token_endpoint: as_metadata.token_endpoint,
@@ -1273,7 +1273,7 @@ async fn put_oauth_client(
     );
     Ok(Json(OAuthClientResponse {
         issuer: stored.issuer,
-        client_id: stored.client_id,
+        client_id: stored.client_id.into_inner(),
         token_endpoint_auth_method: stored.token_endpoint_auth_method,
         scope: stored.scope,
     }))

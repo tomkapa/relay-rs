@@ -14,7 +14,7 @@ use crate::types::SecretString;
 use super::errors::OAuthError;
 use super::store::{
     ClientProvenance, DcrClientRecord, McpOAuthClientStore, McpOAuthPendingStore, NewOAuthClient,
-    PendingAuthorization, PendingAuthorizationWrite, TokenAuthMethod,
+    OAuthClientId, PendingAuthorization, PendingAuthorizationWrite, TokenAuthMethod,
 };
 
 pub struct PgMcpOAuthClientStore {
@@ -37,14 +37,32 @@ impl fmt::Debug for PgMcpOAuthClientStore {
     }
 }
 
-/// `ON CONFLICT` fragment selected by [`ClientProvenance`]. DCR rows are
-/// insert-or-return (no-op assignment forces RETURNING for the existing
-/// row); operator rows fully overwrite and force `registration_*` NULL.
-/// Kept as a `&'static str` so the SQL string is composed once at
-/// monomorphization time, not per call.
-const ON_CONFLICT_DCR_KEEP: &str =
-    "ON CONFLICT (org_id, issuer) DO UPDATE SET issuer = mcp_oauth_clients.issuer";
-const ON_CONFLICT_OPERATOR_OVERWRITE: &str = "ON CONFLICT (org_id, issuer) DO UPDATE SET \
+/// Insert-or-return: DCR is idempotent per `(org, issuer)`. The no-op
+/// `SET issuer = issuer` forces RETURNING to fire for the existing row.
+const SQL_UPSERT_DCR: &str = "INSERT INTO mcp_oauth_clients \
+     (org_id, issuer, client_id, authorization_endpoint, token_endpoint, \
+      registration_client_uri, registration_access_token_ciphertext, \
+      registration_access_token_nonce, client_secret_ciphertext, \
+      client_secret_nonce, key_version, token_endpoint_auth_method, scope, \
+      created_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+     ON CONFLICT (org_id, issuer) DO UPDATE SET issuer = mcp_oauth_clients.issuer \
+     RETURNING org_id, issuer, client_id, authorization_endpoint, \
+               token_endpoint, client_secret_ciphertext, client_secret_nonce, \
+               key_version, token_endpoint_auth_method, scope";
+
+/// Operator-supplied: full overwrite. The caller passes `None` for
+/// `registration_*` binds (operator provenance carries no such fields by
+/// construction), so VALUES is identical to the DCR shape; only the
+/// `ON CONFLICT` clause differs.
+const SQL_UPSERT_OPERATOR: &str = "INSERT INTO mcp_oauth_clients \
+     (org_id, issuer, client_id, authorization_endpoint, token_endpoint, \
+      registration_client_uri, registration_access_token_ciphertext, \
+      registration_access_token_nonce, client_secret_ciphertext, \
+      client_secret_nonce, key_version, token_endpoint_auth_method, scope, \
+      created_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+     ON CONFLICT (org_id, issuer) DO UPDATE SET \
         client_id = EXCLUDED.client_id, \
         authorization_endpoint = EXCLUDED.authorization_endpoint, \
         token_endpoint = EXCLUDED.token_endpoint, \
@@ -55,46 +73,39 @@ const ON_CONFLICT_OPERATOR_OVERWRITE: &str = "ON CONFLICT (org_id, issuer) DO UP
         client_secret_nonce = EXCLUDED.client_secret_nonce, \
         key_version = EXCLUDED.key_version, \
         token_endpoint_auth_method = EXCLUDED.token_endpoint_auth_method, \
-        scope = EXCLUDED.scope";
+        scope = EXCLUDED.scope \
+     RETURNING org_id, issuer, client_id, authorization_endpoint, \
+               token_endpoint, client_secret_ciphertext, client_secret_nonce, \
+               key_version, token_endpoint_auth_method, scope";
 
 #[async_trait]
 impl McpOAuthClientStore for PgMcpOAuthClientStore {
     async fn upsert(&self, new: NewOAuthClient) -> Result<DcrClientRecord, OAuthError> {
-        let (rcu, rat, on_conflict) = match &new.provenance {
+        // Both branches share parameter shape so the bind block is
+        // identical. The DB ignores positional binds the SQL doesn't
+        // reference (operator branch hard-codes NULLs in $6..$8 slots).
+        let (rcu, rat, sql) = match &new.provenance {
             ClientProvenance::Dcr {
                 registration_client_uri,
                 registration_access_token,
             } => (
                 registration_client_uri.as_deref(),
                 registration_access_token.as_ref(),
-                ON_CONFLICT_DCR_KEEP,
+                SQL_UPSERT_DCR,
             ),
-            ClientProvenance::Operator => (None, None, ON_CONFLICT_OPERATOR_OVERWRITE),
+            ClientProvenance::Operator => (None, None, SQL_UPSERT_OPERATOR),
         };
         let (secret_cipher, secret_nonce) =
             seal_optional(&self.enc, new.org_id, new.client_secret.as_ref())?;
         let (rat_cipher, rat_nonce) = seal_optional(&self.enc, new.org_id, rat)?;
         let now = self.clock.now_utc();
         let key_version = crate::crypto::CURRENT_KEY_VERSION;
-        let sql = format!(
-            "INSERT INTO mcp_oauth_clients \
-             (org_id, issuer, client_id, authorization_endpoint, token_endpoint, \
-              registration_client_uri, registration_access_token_ciphertext, \
-              registration_access_token_nonce, client_secret_ciphertext, \
-              client_secret_nonce, key_version, token_endpoint_auth_method, scope, \
-              created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-             {on_conflict} \
-             RETURNING org_id, issuer, client_id, authorization_endpoint, \
-                       token_endpoint, client_secret_ciphertext, client_secret_nonce, \
-                       key_version, token_endpoint_auth_method, scope",
-        );
         let row =
             crate::auth::run_privileged::<OAuthClientRow, OAuthError>(&self.pool, async |tx| {
-                Ok(sqlx::query_as::<_, OAuthClientRow>(&sql)
+                Ok(sqlx::query_as::<_, OAuthClientRow>(sql)
                     .bind(new.org_id)
                     .bind(&new.issuer)
-                    .bind(&new.client_id)
+                    .bind(new.client_id.as_str())
                     .bind(&new.authorization_endpoint)
                     .bind(&new.token_endpoint)
                     .bind(rcu)
@@ -173,10 +184,17 @@ struct OAuthClientRow {
 impl OAuthClientRow {
     fn into_record(self, enc: &SharedOrgEncryptor) -> Result<DcrClientRecord, OAuthError> {
         let client_secret = self.decode_client_secret(enc)?;
+        // We only ever write valid OAuthClientId-shaped values; a row
+        // that fails reconstruction here means DB-side corruption or a
+        // direct INSERT, both of which are operator errors worth
+        // surfacing as Misconfigured rather than a 500-on-read.
+        let client_id = OAuthClientId::try_from(self.client_id).map_err(|e| {
+            OAuthError::Misconfigured(format!("stored oauth client_id rejected: {e}"))
+        })?;
         Ok(DcrClientRecord {
             org_id: self.org_id,
             issuer: self.issuer,
-            client_id: self.client_id,
+            client_id,
             client_secret,
             authorization_endpoint: self.authorization_endpoint,
             token_endpoint: self.token_endpoint,

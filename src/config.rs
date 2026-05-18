@@ -196,28 +196,31 @@ const fn default_cookie_secure() -> bool {
     true
 }
 
-/// Validate and normalize `RELAY_WEB_BASE_URL`: must be an absolute http(s)
-/// URL with no path component and no trailing slash so callers can
-/// prepend it directly to a `/`-anchored route.
+/// Validate and normalize `RELAY_WEB_BASE_URL`: must be an absolute
+/// http(s) origin — no path, query, fragment, or userinfo — so callers
+/// can prepend it directly to a `/`-anchored route without producing
+/// malformed redirects.
 fn parse_web_base_url(raw: &str) -> Result<String, SettingsError> {
-    let parsed = url::Url::parse(raw).map_err(|_| SettingsError::InvalidWebBaseUrl {
+    let reject = |reason: &'static str| SettingsError::InvalidWebBaseUrl {
         raw: raw.to_owned(),
-        reason: "not a valid url",
-    })?;
+        reason,
+    };
+    let parsed = url::Url::parse(raw).map_err(|_| reject("not a valid url"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(SettingsError::InvalidWebBaseUrl {
-            raw: raw.to_owned(),
-            reason: "scheme must be http or https",
-        });
+        return Err(reject("scheme must be http or https"));
     }
     if parsed.path() != "/" && !parsed.path().is_empty() {
-        return Err(SettingsError::InvalidWebBaseUrl {
-            raw: raw.to_owned(),
-            reason: "must be an origin with no path",
-        });
+        return Err(reject("must be an origin with no path"));
     }
-    let trimmed = raw.trim_end_matches('/').to_owned();
-    Ok(trimmed)
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(reject("must not include query or fragment"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(reject("userinfo is not allowed"));
+    }
+    // `Origin::ascii_serialization` yields `scheme://host[:port]` with no
+    // trailing slash, regardless of whether `raw` ended with one.
+    Ok(parsed.origin().ascii_serialization())
 }
 
 fn default_timezone_raw() -> String {

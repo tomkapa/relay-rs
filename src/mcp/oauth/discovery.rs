@@ -232,6 +232,16 @@ async fn probe_resource_metadata_url(http: &Client, server_url: &Url) -> Result<
         .await
         .map_err(|_| OAuthError::Discovery("probe timed out".into()))?
         .map_err(|e| OAuthError::Discovery(format!("probe http: {e}")))?;
+    // RFC 9728 §5.1 ties the `resource_metadata` advertisement to a 401
+    // challenge. Refusing other statuses rules out a stale or
+    // intermediary-injected `WWW-Authenticate` on a 200/302 steering
+    // discovery to an attacker-controlled URL.
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Err(OAuthError::Discovery(format!(
+            "probe expected 401 challenge, got {}",
+            resp.status().as_u16()
+        )));
+    }
     for value in resp.headers().get_all(WWW_AUTHENTICATE) {
         let Ok(raw) = value.to_str() else { continue };
         // `get(..N)` returns `None` when `N` falls on a non-char boundary;

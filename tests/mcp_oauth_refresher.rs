@@ -53,7 +53,8 @@ async fn refresh_failure_with_no_refresh_token_flips_status() {
         .upsert(NewOAuthClient {
             org_id: db.default_org_id,
             issuer: "https://issuer.example".into(),
-            client_id: "client".into(),
+            client_id: relay_rs::mcp::oauth::OAuthClientId::try_from("client".to_owned())
+                .expect("valid"),
             client_secret: None,
             authorization_endpoint: "https://issuer.example/auth".into(),
             token_endpoint: "http://127.0.0.1:1/token".into(), // unreachable

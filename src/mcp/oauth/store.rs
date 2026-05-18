@@ -97,7 +97,7 @@ pub enum ClientProvenance {
 pub struct NewOAuthClient {
     pub org_id: OrgId,
     pub issuer: String,
-    pub client_id: String,
+    pub client_id: OAuthClientId,
     pub client_secret: Option<SecretString>,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
@@ -111,7 +111,7 @@ pub struct NewOAuthClient {
 pub struct DcrClientRecord {
     pub org_id: OrgId,
     pub issuer: String,
-    pub client_id: String,
+    pub client_id: OAuthClientId,
     pub client_secret: Option<SecretString>,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
