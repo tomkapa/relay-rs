@@ -68,7 +68,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     tileBg: "#5E6AD2",
     tileFg: "#FFFFFF",
     iconSlug: "linear",
-    defaultUrl: "https://mcp.linear.app/sse",
+    defaultUrl: "https://mcp.linear.app/mcp",
     auth: "oauth",
     toolCount: 14,
   },
@@ -85,8 +85,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     auth: "apiToken",
     apiTokenHeader: "Authorization",
     apiTokenPrefix: "Bearer ",
-    apiTokenHelpUrl:
-      "https://github.com/settings/tokens?type=beta",
+    apiTokenHelpUrl: "https://github.com/settings/tokens?type=beta",
     toolCount: 21,
   },
   {
@@ -98,7 +97,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     tileBg: "#4A154B",
     tileFg: "#FFFFFF",
     iconSlug: "slack",
-    defaultUrl: "https://mcp.slack.com/v1",
+    defaultUrl: "https://mcp.slack.com/mcp",
     auth: "oauth",
     toolCount: 9,
   },
@@ -162,8 +161,7 @@ export const MCP_CATALOG: CatalogEntry[] = [
     auth: "apiToken",
     apiTokenHeader: "Authorization",
     apiTokenPrefix: "Bearer ",
-    apiTokenHelpUrl:
-      "https://docs.sentry.io/account/auth-tokens/",
+    apiTokenHelpUrl: "https://docs.sentry.io/account/auth-tokens/",
     toolCount: 11,
   },
   {

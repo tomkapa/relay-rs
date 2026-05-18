@@ -117,6 +117,7 @@ impl PromptsHarness {
             mcp_oauth_flow: relay_rs::mcp::oauth::OAuthFlowClient::new(reqwest::Client::new())
                 .expect("oauth http"),
             oauth_redirect_base: std::sync::Arc::from("http://localhost:8080"),
+            web_base_url: None,
             thread_stream,
             pool,
             jwt,
