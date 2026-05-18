@@ -2,6 +2,7 @@
 //! `users`, `user_identities`, `organizations`, `org_members`, and the
 //! short-lived `oauth_login_states` rows.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,7 +12,7 @@ use super::error::AuthError;
 use super::language::Language;
 use super::locale_hint::LocaleHint;
 use super::types::{
-    GoogleProfile, OAuthState, OrgId, OrgMembership, PkceVerifier, Role, User, UserId,
+    Email, GoogleProfile, OAuthState, OrgId, OrgMembership, PkceVerifier, Role, User, UserId,
 };
 
 pub type SharedUserStore = Arc<dyn UserStore>;
@@ -92,6 +93,16 @@ pub trait UserStore: std::fmt::Debug + Send + Sync + 'static {
 
     /// Look up a user by id (for `/me`).
     async fn read_user(&self, user_id: UserId) -> Result<Option<User>, AuthError>;
+
+    /// Batched email lookup keyed by user id.
+    ///
+    /// Exists so tenant-scoped routes (which run as `relay_app` and
+    /// therefore cannot JOIN onto `users` — see migration 14) can still
+    /// surface creator emails without going through the privileged
+    /// store on every row. Missing ids are omitted from the map; the
+    /// caller decides how to render an absent value. Duplicates in
+    /// `ids` are deduped on the SQL side via `WHERE id = ANY($1)`.
+    async fn read_emails(&self, ids: &[UserId]) -> Result<HashMap<UserId, Email>, AuthError>;
 
     /// Read the org's `default_language`. Called by the language
     /// resolver on cache miss; the column is NOT NULL, so a missing row

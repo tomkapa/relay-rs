@@ -13,7 +13,8 @@ use crate::auth::{OrgId, UserId};
 
 use super::error::McpError;
 use super::types::{
-    DiscoveredTool, McpDescription, McpServerAlias, McpServerId, McpServerRecord, McpTransport,
+    ConnectionStatus, DiscoveredTool, McpDescription, McpServerAlias, McpServerId, McpServerRecord,
+    McpTransport,
 };
 
 /// Boundary type that captures a CRUD-create request after validation. Lives here (not
@@ -30,6 +31,11 @@ pub struct McpServerCreate {
     pub config: McpTransport,
     pub description: Option<McpDescription>,
     pub enabled: bool,
+    /// Initial lifecycle state. `AuthPending` parks a row so the
+    /// registry refresher skips it until OAuth credentials land —
+    /// otherwise the first connect runs without a Bearer token and the
+    /// upstream's 401 lands as a misleading `last_error`.
+    pub connection_status: ConnectionStatus,
 }
 
 /// Update payload. `None` fields keep the current value; `Some` replaces it.

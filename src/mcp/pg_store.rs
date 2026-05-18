@@ -77,6 +77,7 @@ impl McpServerStore for PgMcpServerStore {
             config,
             description,
             enabled,
+            connection_status,
         } = payload;
         let now = self.now();
         let id = McpServerId::new();
@@ -109,8 +110,8 @@ impl McpServerStore for PgMcpServerStore {
             sqlx::query(
                 "INSERT INTO mcp_servers \
                  (id, org_id, alias, enabled, config, description, \
-                  created_by_user_id, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
+                  created_by_user_id, connection_status, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)",
             )
             .bind(id)
             .bind(org_id)
@@ -119,6 +120,7 @@ impl McpServerStore for PgMcpServerStore {
             .bind(&config_json)
             .bind(description.as_ref().map(McpDescription::as_str))
             .bind(created_by_user_id)
+            .bind(connection_status)
             .bind(now)
             .execute(&mut **tx)
             .await
@@ -138,7 +140,7 @@ impl McpServerStore for PgMcpServerStore {
             last_error: None,
             discovered_tools: None,
             created_by_user_id,
-            connection_status: super::types::ConnectionStatus::Ok,
+            connection_status,
             created_at: now,
             updated_at: now,
         })
@@ -160,12 +162,20 @@ impl McpServerStore for PgMcpServerStore {
     }
 
     async fn list_enabled(&self) -> Result<Vec<McpServerRecord>, McpError> {
+        // `auth_pending` rows are intentionally skipped: the registry
+        // refresher would otherwise connect with no Authorization header
+        // and the upstream's "Auth required" response would land as a
+        // misleading `last_error` while the operator is still mid-flow
+        // in the browser. `mark_connected` flips the row to 'ok' after
+        // the OAuth callback persists credentials.
         let rows =
             crate::auth::run_privileged::<Vec<McpServerRow>, McpError>(&self.pool, async |tx| {
                 Ok(sqlx::query_as::<_, McpServerRow>(concat!(
                     "SELECT ",
                     mcp_row_cols!(),
-                    " FROM mcp_servers WHERE enabled = TRUE ORDER BY alias ASC",
+                    " FROM mcp_servers \
+                     WHERE enabled = TRUE AND connection_status <> 'auth_pending' \
+                     ORDER BY alias ASC",
                 ))
                 .fetch_all(&mut **tx)
                 .await?)

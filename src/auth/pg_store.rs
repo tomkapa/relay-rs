@@ -230,6 +230,28 @@ impl UserStore for PgUserStore {
         }))
     }
 
+    async fn read_emails(
+        &self,
+        ids: &[UserId],
+    ) -> Result<std::collections::HashMap<UserId, Email>, AuthError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut tx = super::begin_privileged(&self.pool).await?;
+        let rows = sqlx::query("SELECT id, email FROM users WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for r in rows {
+            let id = UserId::from(r.get::<uuid::Uuid, _>("id"));
+            let email = Email::try_from(r.get::<String, _>("email"))?;
+            out.insert(id, email);
+        }
+        Ok(out)
+    }
+
     async fn read_org_language(&self, org_id: OrgId) -> Result<Language, AuthError> {
         let mut tx = super::begin_privileged(&self.pool).await?;
         let value: Option<Language> =

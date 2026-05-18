@@ -17,9 +17,9 @@ use relay_rs::mcp::oauth::{
     McpOAuthClientStore as _, NewOAuthClient, OAuthRefresher, PgMcpOAuthClientStore, RefresherDeps,
 };
 use relay_rs::mcp::{
-    CredentialPayload, McpCredentialStore, McpCredentialWrite, McpHttpUrl, McpServerAlias,
-    McpServerCreate, McpServerStore, McpTransport, OAuth2Payload, PgMcpCredentialStore,
-    PgMcpServerStore,
+    ConnectionStatus, CredentialPayload, McpCredentialStore, McpCredentialWrite, McpHttpUrl,
+    McpServerAlias, McpServerCreate, McpServerStore, McpTransport, OAuth2Payload,
+    PgMcpCredentialStore, PgMcpServerStore,
 };
 
 mod common;
@@ -43,6 +43,7 @@ async fn refresh_failure_with_no_refresh_token_flips_status() {
             },
             description: None,
             enabled: true,
+            connection_status: ConnectionStatus::Ok,
         })
         .await
         .expect("create server");

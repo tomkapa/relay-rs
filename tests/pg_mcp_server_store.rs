@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use relay_rs::clock::SystemClock;
 use relay_rs::mcp::{
-    DiscoveredTool, McpError, McpHealthUpdate, McpHttpUrl, McpServerAlias, McpServerCreate,
-    McpServerId, McpServerStore, McpServerUpdate, McpTransport, PgMcpServerStore,
+    ConnectionStatus, DiscoveredTool, McpError, McpHealthUpdate, McpHttpUrl, McpServerAlias,
+    McpServerCreate, McpServerId, McpServerStore, McpServerUpdate, McpTransport, PgMcpServerStore,
 };
 
 mod common;
@@ -43,6 +43,7 @@ async fn create_read_roundtrip() {
         config: http_transport("http://localhost:9000/"),
         description: None,
         enabled: true,
+        connection_status: ConnectionStatus::Ok,
     };
     let row = store.create(payload).await.expect("create");
     let read = store.read(row.id, db.default_org_id).await.expect("read");
@@ -68,6 +69,7 @@ async fn duplicate_alias_is_rejected() {
             config: http_transport("http://localhost:9000/"),
             description: None,
             enabled: true,
+            connection_status: ConnectionStatus::Ok,
         })
         .await
         .expect("first create");
@@ -79,6 +81,7 @@ async fn duplicate_alias_is_rejected() {
             config: http_transport("http://localhost:9001/"),
             description: None,
             enabled: true,
+            connection_status: ConnectionStatus::Ok,
         })
         .await
         .expect_err("second create");
@@ -98,6 +101,7 @@ async fn list_orders_by_alias() {
                 config: http_transport(&format!("http://localhost:9000/{name}")),
                 description: None,
                 enabled: name != "mid",
+                connection_status: ConnectionStatus::Ok,
             })
             .await
             .expect("create");
@@ -108,6 +112,49 @@ async fn list_orders_by_alias() {
     let enabled = store.list_enabled().await.expect("list_enabled");
     let enabled_names: Vec<&str> = enabled.iter().map(|r| r.alias.as_str()).collect();
     assert_eq!(enabled_names, vec!["alpha", "zeta"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_enabled_skips_auth_pending_rows() {
+    // Regression for the "Auth required" warning on freshly-created
+    // OAuth servers: rows that are enabled but still mid-OAuth-flow
+    // (connection_status = AuthPending) must not be returned to the
+    // registry refresher, otherwise it connects without a Bearer token
+    // and the upstream's 401 lands as a misleading `last_error`.
+    let db = TestDb::fresh().await;
+    let store = store(&db);
+    store
+        .create(McpServerCreate {
+            org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
+            alias: alias("ready"),
+            config: http_transport("http://localhost:9000/ready"),
+            description: None,
+            enabled: true,
+            connection_status: ConnectionStatus::Ok,
+        })
+        .await
+        .expect("create ready");
+    store
+        .create(McpServerCreate {
+            org_id: db.default_org_id,
+            created_by_user_id: db.default_user_id,
+            alias: alias("pending"),
+            config: http_transport("http://localhost:9000/pending"),
+            description: None,
+            enabled: true,
+            connection_status: ConnectionStatus::AuthPending,
+        })
+        .await
+        .expect("create pending");
+
+    let enabled = store.list_enabled().await.expect("list_enabled");
+    let names: Vec<&str> = enabled.iter().map(|r| r.alias.as_str()).collect();
+    assert_eq!(names, vec!["ready"]);
+
+    let all = store.list().await.expect("list");
+    let all_names: Vec<&str> = all.iter().map(|r| r.alias.as_str()).collect();
+    assert_eq!(all_names, vec!["pending", "ready"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -122,6 +169,7 @@ async fn update_changes_alias_and_config() {
             config: http_transport("http://localhost:9000/"),
             description: None,
             enabled: true,
+            connection_status: ConnectionStatus::Ok,
         })
         .await
         .expect("create");
@@ -157,6 +205,7 @@ async fn delete_returns_not_found_after() {
             config: http_transport("http://localhost:9000/"),
             description: None,
             enabled: true,
+            connection_status: ConnectionStatus::Ok,
         })
         .await
         .expect("create");
@@ -188,6 +237,7 @@ async fn update_health_persists_discovered_tools() {
             config: http_transport("http://localhost:9000/"),
             description: None,
             enabled: true,
+            connection_status: ConnectionStatus::Ok,
         })
         .await
         .expect("create");

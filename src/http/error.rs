@@ -133,6 +133,17 @@ impl IntoResponse for HttpError {
             Self::Auth(_) => (StatusCode::INTERNAL_SERVER_ERROR, "auth error".into()),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
         };
+        // CLAUDE.md §2: every error response that maps to a 5xx is a
+        // server-side fault — emit a tracing::error event so operators
+        // see the underlying error variant rather than the bare wire
+        // message. The handler span (via `TraceLayer`) gets the status.
+        if status.is_server_error() {
+            tracing::error!(
+                event = "http.error.5xx",
+                http.response.status_code = status.as_u16(),
+                error = ?self,
+            );
+        }
         (status, Json(json!({ "error": message }))).into_response()
     }
 }

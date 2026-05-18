@@ -29,9 +29,9 @@ use crate::mcp::oauth::{
     register_dynamic_client,
 };
 use crate::mcp::{
-    CredentialPayload, DiscoveredTool, MCP_CREDENTIAL_READ_TIMEOUT, McpClient, McpCredentialWrite,
-    McpDescription, McpError, McpServerAlias, McpServerCreate, McpServerId, McpServerRecord,
-    McpServerUpdate, McpTransport, OAUTH2_KIND_LABEL, OAuth2Payload,
+    ConnectionStatus, CredentialPayload, DiscoveredTool, MCP_CREDENTIAL_READ_TIMEOUT, McpClient,
+    McpCredentialWrite, McpDescription, McpError, McpServerAlias, McpServerCreate, McpServerId,
+    McpServerRecord, McpServerUpdate, McpTransport, OAUTH2_KIND_LABEL, OAuth2Payload,
 };
 use crate::types::SecretString;
 
@@ -201,6 +201,17 @@ async fn create_mcp_server(
         None => None,
     };
 
+    // A row without inline credentials is parked in `AuthPending` so
+    // the registry refresher skips it until the OAuth callback's
+    // `mark_connected` flips it to `Ok`. Rows that carry static-header
+    // credentials in the same request are ready to serve and start in
+    // `Ok`.
+    let connection_status = if credentials_payload.is_some() {
+        ConnectionStatus::Ok
+    } else {
+        ConnectionStatus::AuthPending
+    };
+
     let record = state
         .mcp_store
         .create(McpServerCreate {
@@ -210,6 +221,7 @@ async fn create_mcp_server(
             config: payload.config,
             description,
             enabled: payload.enabled,
+            connection_status,
         })
         .await?;
 
@@ -245,23 +257,33 @@ async fn list_mcp_servers(
     // their own org's rows. The LEFT JOIN onto `mcp_server_credentials`
     // surfaces only the `kind` label — never the ciphertext — so the
     // response can render `has_credentials` without an extra round-trip.
+    //
+    // Identity tables (`users`) are intentionally REVOKED from `relay_app`
+    // (migration 14), so the creator-email enrichment runs as a second
+    // round-trip through the privileged `users` store after the tx commits.
     let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let rows = sqlx::query_as::<_, McpServerRowForList>(
         "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
                 s.last_seen_at, s.last_error, s.discovered_tools, \
                 s.created_by_user_id, s.connection_status, s.created_at, s.updated_at, \
-                c.kind AS credentials_kind, u.email AS creator_email \
+                c.kind AS credentials_kind \
          FROM mcp_servers s \
          LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
-         LEFT JOIN users u ON u.id = s.created_by_user_id \
          ORDER BY s.alias ASC",
     )
     .fetch_all(&mut *tx)
     .await
     .map_err(AuthError::from)?;
     tx.commit().await.map_err(AuthError::from)?;
+
+    let creator_ids: Vec<crate::auth::UserId> = rows.iter().map(|r| r.created_by_user_id).collect();
+    let emails = state.users.read_emails(&creator_ids).await?;
+
     let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
+    for mut r in rows {
+        r.creator_email = emails
+            .get(&r.created_by_user_id)
+            .map(|e| e.as_str().to_owned());
         out.push(r.try_into_response()?);
     }
     Ok(Json(out))
@@ -278,10 +300,9 @@ async fn read_mcp_server(
         "SELECT s.id, s.org_id, s.alias, s.enabled, s.config, s.description, \
                 s.last_seen_at, s.last_error, s.discovered_tools, \
                 s.created_by_user_id, s.connection_status, s.created_at, s.updated_at, \
-                c.kind AS credentials_kind, u.email AS creator_email \
+                c.kind AS credentials_kind \
          FROM mcp_servers s \
          LEFT JOIN mcp_server_credentials c ON c.server_id = s.id \
-         LEFT JOIN users u ON u.id = s.created_by_user_id \
          WHERE s.id = $1",
     )
     .bind(id)
@@ -290,6 +311,16 @@ async fn read_mcp_server(
     .map_err(AuthError::from)?;
     tx.commit().await.map_err(AuthError::from)?;
     let mut row = row.ok_or(HttpError::NotFound)?;
+    // Identity tables (`users`) are REVOKED from `relay_app` (migration
+    // 14), so the email lookup runs through the privileged user store
+    // outside the tenant-scoped tx above.
+    let emails = state
+        .users
+        .read_emails(std::slice::from_ref(&row.created_by_user_id))
+        .await?;
+    row.creator_email = emails
+        .get(&row.created_by_user_id)
+        .map(|e| e.as_str().to_owned());
     if row.credentials_kind.as_deref() == Some(OAUTH2_KIND_LABEL) {
         let cred = tokio::time::timeout(
             MCP_CREDENTIAL_READ_TIMEOUT,
@@ -628,7 +659,13 @@ struct McpServerRowForList {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     credentials_kind: Option<String>,
+    /// Stitched in by the handler after the tenant-scoped tx commits —
+    /// the SELECT does not return this column (identity tables are
+    /// revoked from `relay_app`).
+    #[sqlx(default)]
     creator_email: Option<String>,
+    /// Surfaced only on the per-server read path, by decrypting the
+    /// OAuth credential payload outside the SELECT.
     #[sqlx(default)]
     token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }

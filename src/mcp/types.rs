@@ -390,10 +390,11 @@ pub struct McpServerRecord {
     /// Non-optional because the column is `NOT NULL` (pre-launch: no
     /// nullable shim per `feedback_no_backcompat`).
     pub created_by_user_id: crate::auth::UserId,
-    /// Connection status surfaced to the UI. Defaults to `Ok` on insert;
-    /// flipped to `ReconnectRequired` by the OAuth refresher when a
-    /// refresh token is finally revoked, or to `Error` for sticky
-    /// connect failures the operator should fix.
+    /// Connection status surfaced to the UI. A row created without
+    /// credentials starts in `AuthPending` and the OAuth callback flips
+    /// it to `Ok`; rows created with static-header creds start in `Ok`.
+    /// The OAuth refresher flips a token-revoked row to
+    /// `ReconnectRequired`; sticky connect failures land in `Error`.
     pub connection_status: ConnectionStatus,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -405,6 +406,7 @@ crate::str_enum! {
     /// serialisation key off the same labels.
     pub enum ConnectionStatus {
         Ok                  => "ok",
+        AuthPending         => "auth_pending",
         ReconnectRequired   => "reconnect_required",
         Error               => "error",
     }

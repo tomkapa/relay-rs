@@ -17,7 +17,8 @@ use relay_rs::mcp::oauth::{
     PendingAuthorizationWrite, PgMcpOAuthClientStore, PgMcpOAuthPendingStore, TokenAuthMethod,
 };
 use relay_rs::mcp::{
-    McpHttpUrl, McpServerAlias, McpServerCreate, McpServerStore, McpTransport, PgMcpServerStore,
+    ConnectionStatus, McpHttpUrl, McpServerAlias, McpServerCreate, McpServerStore, McpTransport,
+    PgMcpServerStore,
 };
 use relay_rs::types::SecretString;
 
@@ -128,6 +129,7 @@ async fn seed_server(db: &TestDb) -> relay_rs::mcp::McpServerId {
             },
             description: None,
             enabled: true,
+            connection_status: ConnectionStatus::Ok,
         })
         .await
         .expect("seed server");

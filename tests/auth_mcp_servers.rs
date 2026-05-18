@@ -14,8 +14,8 @@ use relay_rs::auth::OrgId;
 use relay_rs::clock::SystemClock;
 use relay_rs::http::{AppState, router};
 use relay_rs::mcp::{
-    McpHttpUrl, McpRefresher, McpRegistry, McpServerAlias, McpServerCreate, McpTransport,
-    PgMcpServerStore, SharedMcpServerStore,
+    ConnectionStatus, McpHttpUrl, McpRefresher, McpRegistry, McpServerAlias, McpServerCreate,
+    McpTransport, PgMcpServerStore, SharedMcpServerStore,
 };
 use relay_rs::runtime::{
     PgDagBudget, PgPromptQueue, PgResponseHub, PgThreadStream, SharedDagBudget, SharedLeaseManager,
@@ -151,6 +151,7 @@ impl AuthMcpHarness {
                 config,
                 description: None,
                 enabled: true,
+                connection_status: ConnectionStatus::Ok,
             })
             .await
             .expect("seed mcp server");
@@ -195,6 +196,49 @@ async fn authenticated_new_user_sees_empty_list() {
         .expect("collect");
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(json, serde_json::json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_servers_surfaces_creator_email() {
+    // Regression: the tenant-scoped tx for `list_mcp_servers` runs as
+    // `relay_app`, and migration 14 REVOKEs ALL on `users` from that role.
+    // An earlier change tried to LEFT JOIN onto `users` from inside the
+    // tenant-scoped SELECT, which raised "permission denied for table users"
+    // and surfaced to the client as a 500 "auth error". Enrichment must
+    // happen via the privileged user store after the tx commits.
+    let h = AuthMcpHarness::new().await;
+    h.seed_mcp(h.primary.org_id, h.primary.user_id, "with-creator")
+        .await;
+
+    let expected_email: String = sqlx::query_scalar("SELECT email::text FROM users WHERE id = $1")
+        .bind(h.primary.user_id)
+        .fetch_one(&h.state.pool)
+        .await
+        .expect("read seeded user email");
+
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/mcp-servers")
+                .header("cookie", h.primary.cookie_header())
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let rows = json.as_array().expect("array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["creator_email"].as_str(),
+        Some(expected_email.as_str()),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
