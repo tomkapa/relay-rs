@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 
 use super::error::AuthError;
 use super::language::Language;
+use super::locale_hint::LocaleHint;
 use super::types::{
     GoogleProfile, OAuthState, OrgId, OrgMembership, PkceVerifier, Role, User, UserId,
 };
@@ -23,10 +24,9 @@ pub struct OAuthStateRow {
     pub redirect_to: Option<String>,
     /// Inbound `Accept-Language` primary tag captured at
     /// `/auth/google/login`. Replayed in the callback as a fallback when
-    /// Google's userinfo `locale` is missing. Length-capped to
-    /// [`super::limits::DETECTED_LOCALE_MAX_LEN`] before insert; the
-    /// column CHECK is the defence-in-depth backstop.
-    pub detected_locale: Option<String>,
+    /// Google's userinfo `locale` is missing. Bounded by [`LocaleHint`];
+    /// the column CHECK is the defence-in-depth backstop.
+    pub detected_locale: Option<LocaleHint>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -39,7 +39,7 @@ pub struct ConsumedOAuthState {
     /// The same `Accept-Language` primary tag the login round-trip
     /// stashed; consumed by the callback to derive the personal org's
     /// `default_language` via [`Language::from_locale_hint`].
-    pub detected_locale: Option<String>,
+    pub detected_locale: Option<LocaleHint>,
 }
 
 /// Result of an OAuth upsert. `is_new_user` lets the caller branch on

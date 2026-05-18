@@ -24,10 +24,7 @@ use cookie::time::Duration as CookieDuration;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::auth::{
-    Language, OAuthStateRow,
-    limits::{COOKIE_NAME, DETECTED_LOCALE_MAX_LEN},
-};
+use crate::auth::{Language, LocaleHint, OAuthStateRow, limits::COOKIE_NAME};
 
 use super::super::csrf::{build_csrf_cookie, mint_csrf_token};
 use super::super::error::HttpError;
@@ -68,8 +65,10 @@ async fn login(
     let safe_return = query.return_to.and_then(|r| sanitize_return_to(&r));
     // Extract the primary tag from the inbound Accept-Language so the
     // callback has a locale fallback when Google's userinfo doesn't
-    // carry one. Bounded length is asserted by `extract_primary_locale`;
-    // matches the `oauth_login_states.detected_locale` CHECK.
+    // carry one. Walks all entries for the first that maps to a
+    // supported `Language`; the bound is enforced by the `LocaleHint`
+    // newtype which matches the `oauth_login_states.detected_locale`
+    // column CHECK.
     let detected_locale = headers
         .get(ACCEPT_LANGUAGE)
         .and_then(|v| v.to_str().ok())
@@ -88,29 +87,33 @@ async fn login(
     Ok(Redirect::to(start.authorize_url.as_str()))
 }
 
-/// Extract the primary subtag of the first entry of an `Accept-Language`
-/// header, lowercased and length-bounded.
+/// Walk an `Accept-Language` header for the first entry whose primary
+/// subtag maps to a supported [`Language`], returning that subtag.
 ///
 /// `Accept-Language` follows the shape `tag(;q=...)?(,tag(;q=...)?)*` —
-/// e.g. `vi-VN,vi;q=0.9,en;q=0.8`. The first entry's primary tag is the
-/// caller's strongest preference; subsequent entries are fallbacks the
-/// browser will already have downgraded with `q=`. Returning just the
-/// primary tag keeps the stash within the column CHECK and matches what
-/// [`Language::from_locale_hint`] consumes.
-fn extract_primary_locale(raw: &str) -> Option<String> {
-    let first = raw.split(',').next()?.trim();
-    let primary = first.split(['-', '_', ';']).next()?.trim();
+/// e.g. `fr-CA,vi;q=0.9,en;q=0.8`. We honour entry order over `q=`
+/// (browsers always emit entries in user-preference order, with `q=`
+/// merely ranking duplicates) and skip entries whose primary tag we
+/// don't speak so a header like `fr-CA,vi;q=0.9` resolves to `vi`
+/// rather than stashing `fr` and falling back to English. Returns
+/// `None` when no supported tag is present; the OAuth callback then
+/// hands `None` to [`Language::from_locale_hint`] which falls through
+/// to `Language::DEFAULT`.
+fn extract_primary_locale(raw: &str) -> Option<LocaleHint> {
+    raw.split(',')
+        .filter_map(|entry| primary_subtag(entry.trim()))
+        .find(|tag| Language::parse(tag).is_some())
+        .and_then(|tag| LocaleHint::try_from(tag.as_str()).ok())
+}
+
+/// Lowercase the primary subtag of one `Accept-Language` entry. Returns
+/// `None` for an empty entry or one whose primary part is blank.
+fn primary_subtag(entry: &str) -> Option<String> {
+    let primary = entry.split(['-', '_', ';']).next()?.trim();
     if primary.is_empty() {
         return None;
     }
-    let lower = primary.to_ascii_lowercase();
-    // §6: helpers downstream rely on this being inside the CHECK
-    // bound. ASCII subtags are 2–8 chars in practice; the cap is the
-    // operational ceiling, not a per-input clamp.
-    if lower.len() > DETECTED_LOCALE_MAX_LEN {
-        return None;
-    }
-    Some(lower)
+    Some(primary.to_ascii_lowercase())
 }
 
 async fn callback(
@@ -160,8 +163,8 @@ async fn callback(
         // point and falls back to `Language::DEFAULT` (`En`) when
         // neither matches a supported language.
         let language = Language::from_locale_hint(
-            profile.locale.as_deref(),
-            consumed.detected_locale.as_deref(),
+            profile.locale.as_ref().map(LocaleHint::as_str),
+            consumed.detected_locale.as_ref().map(LocaleHint::as_str),
         );
         let new_org = state
             .users

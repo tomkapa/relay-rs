@@ -12,6 +12,7 @@ mod error;
 mod jwt;
 mod language;
 pub mod limits;
+mod locale_hint;
 mod oauth_google;
 mod org_language;
 mod pg_store;
@@ -21,6 +22,7 @@ mod types;
 pub use error::AuthError;
 pub use jwt::{JwtClaims, JwtSigner};
 pub use language::Language;
+pub use locale_hint::LocaleHint;
 pub use oauth_google::{AuthStart, GoogleOAuth, TokenExchanger};
 pub use org_language::{
     LanguageResolverError, OrgLanguageResolver, PgOrgLanguageResolver, SharedOrgLanguageResolver,

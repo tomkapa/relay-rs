@@ -92,7 +92,10 @@ export function useT(): { t: (key: TranslationKey) => string; language: Language
 import { useSyncExternalStore as useSyncExternalStoreImport } from "react";
 
 /** Subscribe to the active org's `default_language` in `authStore` and
- *  push it into the i18n module. Mount once at the App root. */
+ *  push it into the i18n module. Mount once at the App root. On
+ *  logout (or pre-auth) the language resets to the browser-detected
+ *  default so the sign-in page doesn't keep showing the previous
+ *  org's language after sign-out. */
 export function useLangFromOrg(): void {
   const lang = useAuthStore((s) => {
     const me = s.me;
@@ -101,6 +104,6 @@ export function useLangFromOrg(): void {
     return active?.default_language ?? null;
   });
   useEffect(() => {
-    if (lang) setLanguage(lang);
+    setLanguage(lang ?? detectInitialLanguage());
   }, [lang]);
 }

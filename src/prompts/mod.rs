@@ -116,6 +116,7 @@ impl Prompts {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InternalToml {
     core: String,
     scheduling_supplement: String,
@@ -124,6 +125,7 @@ struct InternalToml {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PromptSetToml {
     language_directive: String,
     default_agent_role: String,

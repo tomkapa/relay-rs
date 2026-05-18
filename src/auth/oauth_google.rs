@@ -25,6 +25,7 @@ use crate::types::SecretString;
 
 use super::error::AuthError;
 use super::limits::{MAX_USERINFO_BYTES, OAUTH_HTTP_TIMEOUT};
+use super::locale_hint::LocaleHint;
 use super::types::{Email, GoogleProfile, GoogleSubject, OAuthState, PkceVerifier};
 
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -169,13 +170,17 @@ impl GoogleOAuth {
             .ok_or_else(|| AuthError::OAuthProvider("userinfo missing email".into()))?;
         let email = Email::try_from(email_raw.as_str())?;
         let subject = GoogleSubject::try_from(raw.sub.as_str())?;
+        // Google's `locale` is a hint; if it parses past the bound it's
+        // dropped rather than failing the whole sign-in (a misshapen
+        // hint just means we fall back to `Accept-Language` / DEFAULT).
+        let locale = raw.locale.and_then(|raw| LocaleHint::try_from(raw).ok());
         Ok(GoogleProfile {
             subject,
             email,
             email_verified: true,
             display_name: raw.name,
             avatar_url: raw.picture,
-            locale: raw.locale,
+            locale,
         })
     }
 }

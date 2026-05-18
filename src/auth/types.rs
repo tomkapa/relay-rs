@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::types::ParseError;
 
 use super::language::Language;
+use super::locale_hint::LocaleHint;
 
 crate::uuid_newtype! {
     /// Opaque identifier for a user row in `users`.
@@ -353,10 +354,10 @@ pub struct GoogleProfile {
     pub avatar_url: Option<String>,
     /// BCP-47 locale tag (e.g. `"vi"`, `"en-US"`). Treated as a hint
     /// only — normalized into [`Language`] at the OAuth-callback boundary
-    /// via [`Language::from_locale_hint`]. Stays untyped here because
-    /// Google occasionally returns tags we don't recognize and the raw
-    /// value is still useful for diagnostics.
-    pub locale: Option<String>,
+    /// via [`Language::from_locale_hint`]. Bounded at the
+    /// `fetch_userinfo` ingestion seam so the cross-module value carries
+    /// a length invariant, not a free-form provider string.
+    pub locale: Option<LocaleHint>,
 }
 
 /// Materialised user row.

@@ -182,7 +182,16 @@ async fn set_org_language(
     principal: Principal,
     Json(req): Json<SetOrgLanguageRequest>,
 ) -> Result<Response, HttpError> {
-    match principal.role {
+    // `Principal.role` is whatever the JWT was minted with — stale if
+    // the caller was demoted after the cookie was issued. Re-read the
+    // current membership and authorize from that, so a recent demotion
+    // takes effect without waiting for the session TTL.
+    let role = state
+        .users
+        .membership(principal.user_id, principal.active_org_id)
+        .await?
+        .ok_or(AuthError::NotMember(principal.active_org_id))?;
+    match role {
         Role::Owner | Role::Admin => {}
         Role::Member => return Err(HttpError::Forbidden("owner or admin role required")),
     }

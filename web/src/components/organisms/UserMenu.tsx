@@ -20,7 +20,6 @@ const LANGUAGE_OPTIONS: { value: Language; label: TranslationKey }[] = [
 
 export function UserMenu() {
   const me = useAuthStore((s) => s.me);
-  const setMe = useAuthStore((s) => s.setMe);
   const logout = useLogout();
   const { t, language } = useT();
   const [open, setOpen] = useState(false);
@@ -42,13 +41,16 @@ export function UserMenu() {
     setLangError(null);
     try {
       const { default_language } = await api.setOrgLanguage(next);
-      // Mirror into the local store so other components (and the
-      // useLangFromOrg subscription) flip immediately without a /me
-      // re-poll. Replace the matching org row with the new language.
-      setMe({
-        ...me,
-        orgs: me.orgs.map((o) =>
-          o.id === me.active_org_id ? { ...o, default_language } : o,
+      // Read the latest store snapshot rather than the closed-over
+      // `me`: an org switch or /me re-poll that landed while we were
+      // awaiting the PATCH would otherwise be clobbered by the stale
+      // copy here.
+      const latest = useAuthStore.getState().me;
+      if (!latest) return;
+      useAuthStore.getState().setMe({
+        ...latest,
+        orgs: latest.orgs.map((o) =>
+          o.id === latest.active_org_id ? { ...o, default_language } : o,
         ),
       });
     } catch {

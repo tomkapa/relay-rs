@@ -14,6 +14,7 @@ use sqlx::Row;
 use super::error::AuthError;
 use super::language::Language;
 use super::limits::MAX_SLUG_RETRIES;
+use super::locale_hint::LocaleHint;
 use super::store::{ConsumedOAuthState, NewOrg, OAuthStateRow, UpsertedUser, UserStore};
 use super::types::{
     Email, GoogleProfile, OAuthState, OrgId, OrgMembership, OrgSlug, PkceVerifier, Role, User,
@@ -279,7 +280,7 @@ impl UserStore for PgUserStore {
         .bind(row.state.as_str())
         .bind(row.pkce_verifier.as_str())
         .bind(row.redirect_to.as_deref())
-        .bind(row.detected_locale.as_deref())
+        .bind(row.detected_locale.as_ref().map(LocaleHint::as_str))
         .bind(row.created_at)
         .bind(row.expires_at)
         .execute(&mut *tx)
@@ -311,10 +312,14 @@ impl UserStore for PgUserStore {
             .await?;
         tx.commit().await?;
         let row = row.ok_or(AuthError::OAuthStateInvalid)?;
+        let detected_locale = row
+            .get::<Option<String>, _>("detected_locale")
+            .map(LocaleHint::try_from)
+            .transpose()?;
         Ok(ConsumedOAuthState {
             pkce_verifier: PkceVerifier::try_from(row.get::<String, _>("pkce_verifier"))?,
             redirect_to: row.get("redirect_to"),
-            detected_locale: row.get("detected_locale"),
+            detected_locale,
         })
     }
 }
