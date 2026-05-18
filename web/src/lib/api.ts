@@ -1,11 +1,19 @@
 import type {
   Agent,
+  CreateMcpServerRequest,
+  CredentialInput,
   Language,
   Me,
+  McpServer,
+  OAuthStartRequest,
+  OAuthStartResponse,
   Role,
   SubmitPromptResponse,
+  TestConnectRequest,
+  TestConnectResponse,
   ThreadMessage,
   ThreadSummary,
+  UpdateMcpServerRequest,
 } from "../types/api";
 import { ApiError, AuthRedirect } from "./errors";
 import { readCookie } from "./cookies";
@@ -110,4 +118,41 @@ export const api = {
       throw e;
     }
   },
+
+  // ─── MCP servers ────────────────────────────────────────────────────
+  mcpServers: () => request<McpServer[]>("/mcp-servers"),
+  mcpServer: (id: string) => request<McpServer>(`/mcp-servers/${id}`),
+  createMcpServer: (input: CreateMcpServerRequest) =>
+    request<McpServer>("/mcp-servers", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  updateMcpServer: (id: string, patch: UpdateMcpServerRequest) =>
+    request<McpServer>(`/mcp-servers/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+  deleteMcpServer: (id: string) =>
+    request<void>(`/mcp-servers/${id}`, { method: "DELETE" }),
+  putMcpCredentials: (id: string, payload: CredentialInput) =>
+    request<void>(`/mcp-servers/${id}/credentials`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  deleteMcpCredentials: (id: string) =>
+    request<void>(`/mcp-servers/${id}/credentials`, { method: "DELETE" }),
+  mcpTestConnect: (input: TestConnectRequest) =>
+    request<TestConnectResponse>("/mcp-servers/test-connect", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  mcpOAuthStart: (id: string, input: OAuthStartRequest) =>
+    request<OAuthStartResponse>(`/mcp-servers/${id}/oauth/start`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  mcpOAuthDisconnect: (id: string) =>
+    request<{ ok: boolean }>(`/mcp-servers/${id}/oauth/disconnect`, {
+      method: "POST",
+    }),
 };

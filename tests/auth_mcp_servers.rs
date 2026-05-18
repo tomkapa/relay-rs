@@ -499,3 +499,87 @@ async fn put_credentials_replaces_without_revealing_old_value() {
     assert!(!raw.contains("old-secret"));
     assert!(!raw.contains("new-secret"));
 }
+
+/// `GET /mcp-oauth/callback` runs without a session cookie. When the
+/// vendor reports an `error=…` query parameter (user denied consent,
+/// scope rejected, …) the handler must redirect to the FE with
+/// `?status=failed&reason=…` so the Failed frame can render — not
+/// terminate the flow with a bare 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_callback_vendor_error_redirects_with_failed_status() {
+    let h = AuthMcpHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/mcp-oauth/callback?error=access_denied&error_description=user%20said%20no")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::SEE_OTHER);
+    let loc = res
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .expect("Location header")
+        .to_str()
+        .expect("ascii location");
+    assert_eq!(loc, "/?status=failed&reason=access_denied");
+}
+
+/// When `state` is missing the handler has nothing to consume and no
+/// `redirect_to` to honour; it must still bounce the user to a
+/// FE-friendly URL rather than 400.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_callback_missing_state_redirects_to_root_failed() {
+    let h = AuthMcpHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/mcp-oauth/callback?code=irrelevant")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::SEE_OTHER);
+    let loc = res
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .expect("Location header")
+        .to_str()
+        .expect("ascii location");
+    assert_eq!(loc, "/?status=failed&reason=state_missing");
+}
+
+/// An unknown `state` value (replay, expired) carries no pending row,
+/// so we fall back to `/` for the redirect base. `reason=unknown_or_
+/// expired_state` lets the FE distinguish replay attempts from
+/// vendor-side errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_callback_unknown_state_redirects_to_root_failed() {
+    let h = AuthMcpHarness::new().await;
+    let app = router(h.state.clone());
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/mcp-oauth/callback?code=irrelevant&state=never-issued")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), axum::http::StatusCode::SEE_OTHER);
+    let loc = res
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .expect("Location header")
+        .to_str()
+        .expect("ascii location");
+    assert_eq!(loc, "/?status=failed&reason=unknown_or_expired_state");
+}

@@ -1,5 +1,8 @@
 import { Route, Routes } from "react-router-dom";
 import { ChatView } from "./pages/ChatView";
+import { ConnectionsCatalog } from "./pages/ConnectionsCatalog";
+import { ConnectionsList } from "./pages/ConnectionsList";
+import { OAuthCallback } from "./pages/OAuthCallback";
 import { SignIn } from "./pages/SignIn";
 import { Protected } from "./components/organisms/Protected";
 import { useLangFromOrg } from "./i18n";
@@ -13,6 +16,30 @@ export function App() {
   return (
     <Routes>
       <Route path="/sign-in" element={<SignIn />} />
+      <Route
+        path="/connections"
+        element={
+          <Protected>
+            <ConnectionsList />
+          </Protected>
+        }
+      />
+      <Route
+        path="/connections/catalog"
+        element={
+          <Protected>
+            <ConnectionsCatalog />
+          </Protected>
+        }
+      />
+      <Route
+        path="/connections/oauth-callback"
+        element={
+          <Protected>
+            <OAuthCallback />
+          </Protected>
+        }
+      />
       <Route
         path="/*"
         element={

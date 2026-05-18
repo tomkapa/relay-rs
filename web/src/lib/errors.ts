@@ -15,3 +15,9 @@ export class AuthRedirect extends Error {
     this.name = "AuthRedirect";
   }
 }
+
+export function formatError(err: unknown): string {
+  if (err instanceof ApiError) return err.body || `HTTP ${err.status}`;
+  if (err instanceof Error) return err.message;
+  return "Unexpected error";
+}

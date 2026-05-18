@@ -18,30 +18,41 @@ export function Monogram({
   id,
   size = 28,
   tone,
+  bg,
+  fg,
+  glyph,
   className,
 }: {
   name: string;
   id?: string;
   size?: number;
   tone?: Tone;
+  /** Explicit background. Overrides `tone` palette — used for vendor-branded tiles. */
+  bg?: string;
+  /** Explicit foreground; pairs with `bg`. */
+  fg?: string;
+  /** Override the rendered text; defaults to `initials(name)`. */
+  glyph?: string;
   className?: string;
 }) {
+  const useExplicit = bg !== undefined;
   const t = tone ?? toneById(id);
   return (
     <span
       className={cn(
         "inline-flex shrink-0 items-center justify-center border font-[var(--font-mono)] font-semibold uppercase tracking-tight select-none",
-        toneStyles[t],
+        !useExplicit && toneStyles[t],
         className,
       )}
       style={{
         width: size,
         height: size,
         fontSize: Math.round(size * 0.4),
+        ...(useExplicit && { background: bg, color: fg, borderColor: bg }),
       }}
       aria-label={name}
     >
-      {initials(name)}
+      {glyph ?? initials(name)}
     </span>
   );
 }
