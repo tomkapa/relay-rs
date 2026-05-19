@@ -633,4 +633,12 @@ impl DynamicToolSource for McpRegistryInner {
     fn get(&self, name: &str) -> Option<SharedTool> {
         Self::get(self, name)
     }
+    fn server_id_for(&self, name: &str) -> Option<McpServerId> {
+        self.inner
+            .read()
+            .expect("registry lock poisoned")
+            .tool_servers
+            .get(name)
+            .copied()
+    }
 }

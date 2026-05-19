@@ -50,6 +50,7 @@ async fn fixture(db: &TestDb) -> Fixture {
         request_id,
         kind_payload: RequestKindPayload::Normal {},
         acting_user_id: db.default_user_id,
+        org_id: db.default_org_id,
     };
     Fixture {
         tool: CreateAgentTool::new(agents.clone()),
@@ -68,6 +69,7 @@ fn human_ctx(f: &Fixture) -> ToolCallContext {
         request_id: f.ctx.request_id,
         kind_payload: RequestKindPayload::Normal {},
         acting_user_id: f.ctx.acting_user_id,
+        org_id: f.org_id,
     }
 }
 

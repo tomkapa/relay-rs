@@ -5,7 +5,7 @@ use crate::hook::HookChain;
 use crate::memory::SharedMemory;
 use crate::provider::SharedProvider;
 use crate::session::SharedSessionStore;
-use crate::tools::{ToolBox, ToolRegistry};
+use crate::tools::{SharedToolCallStore, ToolBox, ToolRegistry};
 use crate::types::{MaxOutputTokens, MaxTurns, ModelId, ParseError};
 
 use super::core::Agent;
@@ -31,6 +31,7 @@ pub struct AgentBuilder {
     max_turns: MaxTurns,
     provider_timeout: Duration,
     tool_timeout: Duration,
+    tool_call_store: Option<SharedToolCallStore>,
 }
 
 impl AgentBuilder {
@@ -53,6 +54,7 @@ impl AgentBuilder {
             max_turns: MaxTurns::try_from(DEFAULT_MAX_TURNS)?,
             provider_timeout: PROVIDER_CALL_TIMEOUT,
             tool_timeout: TOOL_CALL_TIMEOUT,
+            tool_call_store: None,
         })
     }
 
@@ -105,6 +107,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Attach the `tool_calls` audit recorder.
+    ///
+    /// Optional: agent_core unit tests construct an `Agent` without one and
+    /// the dispatcher skips recording when absent (CLAUDE.md §6 — recording
+    /// is best-effort observability, not a turn invariant). Production wires
+    /// [`crate::tools::PgToolCallStore`] in via the worker pool.
+    #[must_use]
+    pub fn with_tool_call_store(mut self, store: SharedToolCallStore) -> Self {
+        self.tool_call_store = Some(store);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> Agent {
         Agent::new(
@@ -119,6 +133,7 @@ impl AgentBuilder {
             self.max_turns,
             self.provider_timeout,
             self.tool_timeout,
+            self.tool_call_store,
         )
     }
 }

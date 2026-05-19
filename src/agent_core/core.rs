@@ -3,14 +3,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug};
 
-use crate::auth::UserId;
+use crate::auth::Caller;
 use crate::clock::SharedClock;
 use crate::hook::{HookChain, TurnContext};
 use crate::memory::SharedMemory;
 use crate::provider::{ChatMessage, SharedProvider, UserContent};
 use crate::runtime::{PromptRequestId, RequestKindPayload};
 use crate::session::{SessionError, SessionId, SharedSessionStore};
-use crate::tools::ToolBox;
+use crate::tools::{SharedToolCallStore, ToolBox};
 use crate::types::{
     AgentReply, MaxOutputTokens, MaxTurns, MessageSender, ModelId, Participant, Prompt,
 };
@@ -37,8 +37,6 @@ pub struct Agent {
     provider: SharedProvider,
     sessions: SharedSessionStore,
     memory: SharedMemory,
-    // Threaded through the builder; future scheduling work consumes it.
-    #[allow(dead_code)]
     clock: SharedClock,
     tools: ToolBox,
     hooks: HookChain,
@@ -47,6 +45,10 @@ pub struct Agent {
     max_turns: MaxTurns,
     provider_timeout: Duration,
     tool_timeout: Duration,
+    /// Best-effort audit recorder for every dispatched tool call. `None` in
+    /// agent_core unit tests; production wires
+    /// [`crate::tools::PgToolCallStore`] in through the worker pool.
+    tool_call_store: Option<SharedToolCallStore>,
 }
 
 impl Agent {
@@ -63,6 +65,7 @@ impl Agent {
         max_turns: MaxTurns,
         provider_timeout: Duration,
         tool_timeout: Duration,
+        tool_call_store: Option<SharedToolCallStore>,
     ) -> Self {
         Self {
             provider,
@@ -76,6 +79,7 @@ impl Agent {
             max_turns,
             provider_timeout,
             tool_timeout,
+            tool_call_store,
         }
     }
 
@@ -105,6 +109,12 @@ impl Agent {
     }
     pub(super) fn tool_timeout(&self) -> Duration {
         self.tool_timeout
+    }
+    pub(super) fn clock(&self) -> &SharedClock {
+        &self.clock
+    }
+    pub(super) fn tool_call_store(&self) -> Option<&SharedToolCallStore> {
+        self.tool_call_store.as_ref()
     }
 
     /// Drive a batch of user prompts to a final assistant text answer, running
@@ -140,7 +150,7 @@ impl Agent {
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
-        acting_user_id: UserId,
+        caller: Caller,
         kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -151,7 +161,7 @@ impl Agent {
                 viewer,
                 prompts,
                 request_id,
-                acting_user_id,
+                caller,
                 &kind_payload,
                 cancel,
                 observer,
@@ -168,7 +178,7 @@ impl Agent {
         viewer: Participant,
         prompts: Vec<Prompt>,
         request_id: PromptRequestId,
-        acting_user_id: UserId,
+        caller: Caller,
         kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -184,7 +194,7 @@ impl Agent {
             .collect();
         self.sessions
             .append_for_user(
-                acting_user_id,
+                caller.user_id,
                 session,
                 MessageSender::from_participant(counterpart),
                 viewer,
@@ -198,7 +208,7 @@ impl Agent {
             viewer,
             counterpart,
             request_id,
-            acting_user_id,
+            caller,
             kind_payload,
             cancel,
             observer,
@@ -229,7 +239,7 @@ impl Agent {
         session: SessionId,
         viewer: Participant,
         request_id: PromptRequestId,
-        acting_user_id: UserId,
+        caller: Caller,
         kind_payload: RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -241,7 +251,7 @@ impl Agent {
                 viewer,
                 counterpart,
                 request_id,
-                acting_user_id,
+                caller,
                 &kind_payload,
                 cancel,
                 observer,
@@ -258,7 +268,7 @@ impl Agent {
         viewer: Participant,
         counterpart: Participant,
         request_id: PromptRequestId,
-        acting_user_id: UserId,
+        caller: Caller,
         kind_payload: &RequestKindPayload,
         cancel: CancellationToken,
         observer: Option<SharedTurnObserver>,
@@ -297,7 +307,7 @@ impl Agent {
                     viewer_as_sender,
                     root_request_id,
                     request_id,
-                    acting_user_id,
+                    caller,
                     kind_payload,
                     &mut send_message_calls,
                     &cancel,

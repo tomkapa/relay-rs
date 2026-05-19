@@ -40,6 +40,7 @@ struct Fixture {
     session: relay_rs::session::SessionId,
     agent_id: relay_rs::agents::AgentId,
     user_id: relay_rs::auth::UserId,
+    org_id: relay_rs::auth::OrgId,
 }
 
 async fn fixture(db: &TestDb) -> Fixture {
@@ -84,6 +85,7 @@ async fn fixture(db: &TestDb) -> Fixture {
         session,
         agent_id: db.default_agent_id,
         user_id: db.default_user_id,
+        org_id: db.default_org_id,
     }
 }
 
@@ -95,6 +97,7 @@ fn ctx(f: &Fixture, request_id: PromptRequestId) -> ToolCallContext {
         request_id,
         kind_payload: relay_rs::runtime::RequestKindPayload::Normal {},
         acting_user_id: f.user_id,
+        org_id: f.org_id,
     }
 }
 
@@ -417,6 +420,7 @@ fn ctx_with_target(
             contradiction_event_id: target,
         },
         acting_user_id: f.user_id,
+        org_id: f.org_id,
     }
 }
 

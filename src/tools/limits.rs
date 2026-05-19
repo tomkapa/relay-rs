@@ -30,6 +30,22 @@ pub const SEARCH_MAX_COUNT: u8 = 10;
 /// behaved tool from filling the model context with megabytes.
 pub const TOOL_RESULT_MAX_BYTES: usize = 256 * 1024;
 
+/// Maximum bytes accepted in a `tool_calls.tool_name` insert.
+///
+/// Mirrors the migration-25 CHECK constraint so app and database disagree
+/// at the compiler level if either drifts (the recorder rejects oversize
+/// names rather than relying on the DB to do so — defence in depth,
+/// §5/§10).
+pub const MAX_TOOL_NAME_BYTES: usize = 128;
+
+/// Saturation cap for `tool_calls.duration_ms`.
+///
+/// Stored as `i32` in Postgres; we saturate rather than narrowing-cast so
+/// an absurd duration (clock skew, paused tokio runtime) cannot wrap.
+/// `i32::MAX` is ~24 days; real tool calls are capped by
+/// `agent_core::limits::TOOL_TIMEOUT`.
+pub const MAX_TOOL_CALL_DURATION_MS: i32 = i32::MAX;
+
 // §5: per-tool body caps must always fit within the global tool-result cap so the agent
 // boundary doesn't have to truncate something we already truncated upstream.
 const _: () = assert!(FETCH_MAX_BODY_BYTES <= TOOL_RESULT_MAX_BYTES);
