@@ -1,0 +1,188 @@
+import { ChevronDown, ChevronUp } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Monogram } from "../atoms/Monogram";
+import { Checkbox } from "../molecules/Checkbox";
+import { useT } from "../../i18n";
+import { entryForServer } from "../../data/mcpCatalog";
+import { cn } from "../../lib/utils";
+import type { TranslationKey } from "../../i18n/en";
+import type { McpServer } from "../../types/api";
+import {
+  isToolAllowed,
+  shapeOf,
+  toggleServer,
+  toggleTool,
+  type Allowlist,
+  type ServerCheckState,
+} from "./allowlistState";
+
+const SUMMARY_KEY: Record<ServerCheckState, TranslationKey> = {
+  all: "agent.detail.tools.row.allOf",
+  mixed: "agent.detail.tools.row.someOf",
+  unchecked: "agent.detail.tools.row.available",
+};
+
+/** One MCP server row inside the per-agent allowlist editor. */
+export function AllowlistRow({
+  server,
+  list,
+  onChange,
+}: {
+  server: McpServer;
+  list: Allowlist;
+  onChange: (next: Allowlist) => void;
+}) {
+  const { t } = useT();
+  const tools = server.discovered_tools ?? [];
+  const toolNames = useMemo(
+    () => tools.map((tool) => tool.remote_name),
+    [tools],
+  );
+  const catalog = useMemo(() => entryForServer(server), [server]);
+  const shape = shapeOf(list, server.id, toolNames);
+  const isOn = shape !== "unchecked";
+  const [open, setOpen] = useState<boolean>(false);
+  const canExpand = isOn && tools.length > 0;
+
+  const enabled =
+    shape === "all"
+      ? tools.length
+      : shape === "mixed"
+        ? (list[server.id] as string[]).length
+        : 0;
+  const summary = t(SUMMARY_KEY[shape], {
+    total: String(tools.length),
+    enabled: String(enabled),
+  });
+
+  return (
+    <div
+      className={cn(
+        "border-b border-[var(--color-line)] last:border-b-0",
+        isOn ? "bg-[var(--color-moss-tint)]" : "bg-[var(--color-card)]",
+        !server.enabled && "opacity-60",
+      )}
+    >
+      <div className="flex items-center gap-3.5 px-5 py-3.5">
+        <Checkbox
+          checked={isOn}
+          onChange={(next) => {
+            onChange(toggleServer(list, server.id, next));
+            if (!next) setOpen(false);
+          }}
+          aria-label={t("agent.detail.tools.row.toggleAria", {
+            name: server.alias,
+          })}
+        />
+        <Monogram
+          name={catalog?.name ?? server.alias}
+          id={server.id}
+          size={32}
+          bg={catalog?.tileBg}
+          fg={catalog?.tileFg}
+          glyph={catalog?.monogram}
+          iconSlug={catalog?.iconSlug}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate font-[var(--font-display)] text-[14px] font-semibold text-[var(--color-ink)]">
+              {catalog?.name ?? server.alias}
+            </span>
+            {server.connection_status !== "ok" ? (
+              <span className="font-[var(--font-mono)] text-[10px] tracking-[0.1em] text-[var(--color-amber)] uppercase">
+                {server.connection_status === "reconnect_required"
+                  ? t("agent.detail.tools.row.statusReconnect")
+                  : t("agent.detail.tools.row.statusError")}
+              </span>
+            ) : null}
+          </div>
+          <div className="mt-0.5 font-[var(--font-mono)] text-[11px] text-[var(--color-muted)]">
+            {tools.length === 0
+              ? t("agent.detail.tools.row.empty")
+              : summary}
+          </div>
+        </div>
+        {canExpand ? (
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            aria-label={t(
+              open
+                ? "agent.detail.tools.row.collapse"
+                : "agent.detail.tools.row.expand",
+            )}
+            className="rounded p-1 text-[var(--color-muted)] hover:text-[var(--color-ink)]"
+          >
+            {open ? (
+              <ChevronUp className="h-4 w-4" strokeWidth={1.75} />
+            ) : (
+              <ChevronDown className="h-4 w-4" strokeWidth={1.75} />
+            )}
+          </button>
+        ) : (
+          <ChevronDown
+            className="h-4 w-4 text-[var(--color-muted-2)] opacity-40"
+            strokeWidth={1.75}
+            aria-hidden
+          />
+        )}
+      </div>
+      {open ? (
+        <div className="flex flex-col gap-1 px-5 pt-1 pb-4 pl-[68px]">
+          {tools.map((tool) => {
+            const checked = isToolAllowed(list, server.id, tool.remote_name);
+            return (
+              <label
+                key={tool.remote_name}
+                className="flex cursor-pointer items-start gap-3.5 px-3 py-2"
+              >
+                <span className="mt-0.5">
+                  <Checkbox
+                    checked={checked}
+                    onChange={(next) =>
+                      onChange(
+                        toggleTool(
+                          list,
+                          server.id,
+                          tool.remote_name,
+                          toolNames,
+                          next,
+                        ),
+                      )
+                    }
+                    aria-label={tool.remote_name}
+                  />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span
+                    className={cn(
+                      "block font-[var(--font-mono)] text-[12px] font-semibold",
+                      checked
+                        ? "text-[var(--color-ink)]"
+                        : "text-[var(--color-muted)]",
+                    )}
+                  >
+                    {tool.remote_name}
+                  </span>
+                  {tool.description ? (
+                    <span
+                      className={cn(
+                        "mt-0.5 block text-[12px]",
+                        checked
+                          ? "text-[var(--color-muted)]"
+                          : "text-[var(--color-muted-2)]",
+                      )}
+                    >
+                      {tool.description}
+                    </span>
+                  ) : null}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}

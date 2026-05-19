@@ -38,13 +38,35 @@ export type AgentRef = { id: string; name: string };
 export type Agent = {
   id: string;
   name: string;
+  /** Operator-curated, model-facing one-sentence blurb. Always present on
+   *  every read; older list-only consumers may treat it as optional. */
+  description?: string;
+  /** Free-form system prompt. Present on every read; only the agent-detail
+   *  page uses it today. */
+  system_prompt?: string;
   is_default: boolean;
   /** Per-server tool allowlist. Keys are MCP server ids the agent may
    *  reach; the value is `null` (= every tool from that server) or an
    *  array of remote tool names (= only those tools). A server id that
    *  is absent from the object grants the agent no access to that
-   *  server. Mirrors
+   *  server. Always present on every read; an empty object means the
+   *  agent has no MCP access. Mirrors
    *  `src/http/routes/agents.rs::AgentResponse.allowed_mcp_tools`. */
+  allowed_mcp_tools?: Record<string, string[] | null>;
+  created_at?: string;
+  updated_at?: string;
+};
+
+/** PUT /agents/{id}. Every field is a discrete patch: `undefined` leaves
+ *  the column untouched; `null`-meaning omissions follow the backend
+ *  contract in `src/http/routes/agents.rs::UpdateAgentRequest`. The
+ *  allowlist replaces atomically when present — `Some({})` is the
+ *  explicit "lockdown" shape that revokes every server. */
+export type UpdateAgentRequest = {
+  name?: string;
+  system_prompt?: string;
+  description?: string;
+  is_default?: boolean;
   allowed_mcp_tools?: Record<string, string[] | null>;
 };
 
@@ -216,6 +238,26 @@ export type ToolCall = {
  *  `null` when the page is the tail. */
 export type ToolCallList = {
   items: ToolCall[];
+  next_cursor: string | null;
+};
+
+/** One audit row from `GET /agents/{id}/tool-calls`. The per-agent view
+ *  spans connections, so the row carries the originating MCP server id +
+ *  alias (LEFT JOIN — both fields go `null` if the connection has been
+ *  deleted). Other fields mirror `ToolCall`. */
+export type AgentToolCall = {
+  id: string;
+  tool_name: string;
+  mcp_server_id: string | null;
+  mcp_server_alias: string | null;
+  started_at: string;
+  duration_ms: number;
+  is_error: boolean;
+  error_message: string | null;
+};
+
+export type AgentToolCallList = {
+  items: AgentToolCall[];
   next_cursor: string | null;
 };
 

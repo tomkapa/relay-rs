@@ -66,16 +66,55 @@ const seed: Server[] = [
     config: { type: "http", url: "https://mcp.linear.app/sse" },
     description: "Linear",
     last_seen_at: MIN_14_AGO,
-    last_error: "401 unauthorized",
-    discovered_tools: Array.from({ length: 8 }, (_, i) => ({
-      prefixed_name: `mcp_linear_t${i}`,
-      remote_name: `t${i}`,
-      description: null,
-    })),
+    last_error: null,
+    // Realistic per-tool catalog so the Per-Agent Allowlist editor's
+    // expand-row matches the design (issues.*, projects.*, etc.).
+    discovered_tools: [
+      {
+        prefixed_name: "mcp_linear_issues_create",
+        remote_name: "issues.create",
+        description: "Create a new issue in any project",
+      },
+      {
+        prefixed_name: "mcp_linear_issues_update",
+        remote_name: "issues.update",
+        description: "Update title, body, status, assignee",
+      },
+      {
+        prefixed_name: "mcp_linear_issues_search",
+        remote_name: "issues.search",
+        description: "Search issues by query, project, status",
+      },
+      {
+        prefixed_name: "mcp_linear_comments_create",
+        remote_name: "comments.create",
+        description: "Post comments on existing issues",
+      },
+      {
+        prefixed_name: "mcp_linear_projects_create",
+        remote_name: "projects.create",
+        description: "Create new projects (write-heavy)",
+      },
+      {
+        prefixed_name: "mcp_linear_projects_archive",
+        remote_name: "projects.archive",
+        description: "Archive a project",
+      },
+      {
+        prefixed_name: "mcp_linear_cycles_create",
+        remote_name: "cycles.create",
+        description: "Create cycle (sprint)",
+      },
+      {
+        prefixed_name: "mcp_linear_webhooks_create",
+        remote_name: "webhooks.create",
+        description: "Register a webhook (admin)",
+      },
+    ],
     created_by_user_id: USER_ID,
     has_credentials: true,
     credentials_kind: "oauth2",
-    connection_status: "reconnect_required",
+    connection_status: "ok",
     created_at: WEEK_1_AGO,
     updated_at: NOW,
   },
@@ -174,10 +213,50 @@ type ToolCall = {
   error_message: string | null;
 };
 
-const AGENTS: { id: string; name: string }[] = [
-  { id: "aaaaaaaa-0000-0000-0000-000000000001", name: "Atlas" },
-  { id: "aaaaaaaa-0000-0000-0000-000000000002", name: "Beacon" },
+type AgentRow = {
+  id: string;
+  name: string;
+  description: string;
+  system_prompt: string;
+  is_default: boolean;
+  allowed_mcp_tools: Record<string, string[] | null>;
+  created_at: string;
+  updated_at: string;
+};
+
+const AGENTS: AgentRow[] = [
+  {
+    id: "aaaaaaaa-0000-0000-0000-000000000001",
+    name: "Atlas",
+    description: "Default workspace navigator",
+    system_prompt: "You are Atlas, the workspace navigator.",
+    is_default: true,
+    // Seeds match the design: Notion fully on, Linear partial.
+    allowed_mcp_tools: {
+      "11111111-1111-7111-8111-111111111111": null,
+      "22222222-2222-7222-8222-222222222222": [
+        "issues.create",
+        "issues.update",
+        "issues.search",
+        "comments.create",
+      ],
+    },
+    created_at: DAY_3_AGO,
+    updated_at: NOW,
+  },
+  {
+    id: "aaaaaaaa-0000-0000-0000-000000000002",
+    name: "Beacon",
+    description: "Second helper agent",
+    system_prompt: "You are Beacon.",
+    is_default: false,
+    allowed_mcp_tools: {},
+    created_at: DAY_3_AGO,
+    updated_at: NOW,
+  },
 ];
+
+const agentsById = new Map<string, AgentRow>(AGENTS.map((a) => [a.id, a]));
 
 const TOOL_FIXTURES: Record<string, ToolCall[]> = {};
 
@@ -246,6 +325,83 @@ const server = Bun.serve({
     const method = req.method.toUpperCase();
 
     if (path === "/me" && method === "GET") return json(me);
+
+    if (path === "/agents" && method === "GET") {
+      return json([...agentsById.values()]);
+    }
+
+    const agentMatch = path.match(/^\/agents\/([^/]+)(\/.*)?$/);
+    if (agentMatch) {
+      const id = agentMatch[1]!;
+      const sub = agentMatch[2] ?? "";
+      const a = agentsById.get(id);
+
+      if (sub === "" && method === "GET") {
+        return a ? json(a) : empty(404);
+      }
+      if (sub === "" && method === "PUT") {
+        if (!a) return empty(404);
+        const body = (await req.json()) as Partial<AgentRow>;
+        // Guard `allowed_mcp_tools` so a malformed PUT (null, array,
+        // primitive) can't crash the next `Object.keys(...)` call on
+        // GET. The real backend rejects these via the AllowedMcpTools
+        // newtype; the mock just keeps the existing map.
+        const allowlist =
+          body.allowed_mcp_tools &&
+          typeof body.allowed_mcp_tools === "object" &&
+          !Array.isArray(body.allowed_mcp_tools)
+            ? body.allowed_mcp_tools
+            : a.allowed_mcp_tools;
+        const next: AgentRow = {
+          ...a,
+          ...body,
+          allowed_mcp_tools: allowlist,
+          id,
+          updated_at: new Date().toISOString(),
+        };
+        agentsById.set(id, next);
+        return json(next);
+      }
+      if (sub === "/tool-calls" && method === "GET") {
+        if (!a) return empty(404);
+        // Stitch the per-server fixtures for every allowlisted server,
+        // filter to this agent's id, sort by started_at DESC, and paginate.
+        // Mirrors the real backend's per-agent endpoint well enough for
+        // visual verification.
+        const stitched: (ToolCall & {
+          mcp_server_id: string | null;
+          mcp_server_alias: string | null;
+        })[] = [];
+        for (const sid of Object.keys(a.allowed_mcp_tools)) {
+          if (!TOOL_FIXTURES[sid]) TOOL_FIXTURES[sid] = buildFixture(sid);
+          const alias = servers.get(sid)?.alias ?? null;
+          for (const tc of TOOL_FIXTURES[sid]!) {
+            if (tc.agent_id !== id) continue;
+            stitched.push({
+              ...tc,
+              mcp_server_id: sid,
+              mcp_server_alias: alias,
+            });
+          }
+        }
+        stitched.sort((x, y) => (x.started_at < y.started_at ? 1 : -1));
+        const qs = url.searchParams;
+        const limit = Math.min(
+          Math.max(Number(qs.get("limit") ?? 20) || 20, 1),
+          100,
+        );
+        const before = qs.get("before");
+        const filtered = before
+          ? stitched.filter((r) => r.started_at < before)
+          : stitched;
+        const pageItems = filtered.slice(0, limit);
+        const next_cursor =
+          filtered.length > limit
+            ? pageItems[pageItems.length - 1]!.started_at
+            : null;
+        return json({ items: pageItems, next_cursor });
+      }
+    }
 
     if (path === "/mcp-servers" && method === "GET") {
       return json([...servers.values()].sort((a, b) => a.alias.localeCompare(b.alias)));

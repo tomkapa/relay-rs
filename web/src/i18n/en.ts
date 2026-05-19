@@ -227,6 +227,56 @@ const en = {
   "connections.detail.notFound.body":
     "The connection has been removed, or you don't have access to it.",
   "connections.detail.notFound.cta": "Back to connections",
+
+  // ─── Agent detail (per-agent allowlist) ──────────────────────────────
+  "agent.detail.nav.aria": "Agent settings",
+  "agent.detail.nav.eyebrow": "AGENTS",
+  "agent.detail.nav.section": "AGENT SETTINGS",
+  "agent.detail.nav.prompt": "System prompt",
+  "agent.detail.nav.model": "Model & inference",
+  "agent.detail.nav.tools": "Tools & connections",
+  "agent.detail.nav.logs": "Logs & metrics",
+  "agent.detail.breadcrumb.agents": "Agents",
+  "agent.detail.breadcrumb.tools": "Tools & connections",
+  "agent.detail.tools.title": "Tools & connections",
+  "agent.detail.tools.subtitle":
+    "Pick which workspace connections {name} can use, and optionally narrow down to individual tools.",
+  "agent.detail.tools.save": "Save",
+  "agent.detail.tools.sectionEyebrow": "01 · THIS AGENT CAN USE",
+  "agent.detail.tools.sectionCount": "{enabled} of {total} enabled",
+  "agent.detail.tools.empty":
+    "No connections in this workspace yet. Add one from Connections first.",
+  "agent.detail.tools.row.allOf": "{total} tools · all available",
+  "agent.detail.tools.row.someOf": "{enabled} of {total} tools",
+  "agent.detail.tools.row.available": "{total} tools",
+  "agent.detail.tools.row.empty": "No tools discovered",
+  "agent.detail.tools.row.statusReconnect": "RECONNECT",
+  "agent.detail.tools.row.statusError": "ERROR",
+  "agent.detail.tools.row.toggleAria": "Allow {name}",
+  "agent.detail.tools.row.expand": "Show tools",
+  "agent.detail.tools.row.collapse": "Hide tools",
+  "agent.detail.summary.eyebrow": "03 · CAPABILITY SUMMARY",
+  "agent.detail.summary.connections": "Connections enabled",
+  "agent.detail.summary.tools": "Tools allowed",
+  "agent.detail.activity.eyebrow": "02 · WHAT {name} JUST DID",
+  "agent.detail.activity.subtitle": "Last 20 calls across all connections",
+  "agent.detail.activity.auditLink": "Full audit log",
+  "agent.detail.activity.empty": "No tool calls recorded for this agent yet.",
+  "agent.detail.activity.loadError": "Could not load recent activity",
+  "agent.detail.activity.unknownConnection": "Removed connection",
+  "agent.detail.activity.outcomeError": "Error",
+  "agent.detail.activity.col.time": "Time",
+  "agent.detail.activity.col.connection": "Connection",
+  "agent.detail.activity.col.tool": "Tool",
+  "agent.detail.activity.col.outcome": "Outcome",
+  "agent.detail.notFound.title": "Agent not found",
+  "agent.detail.notFound.body":
+    "The agent has been removed, or you don't have access to it.",
+  "agent.detail.notFound.cta": "Back to home",
+  "agent.detail.loadError.title": "Couldn't load agent",
+  "agent.detail.loadError.body":
+    "Something went wrong fetching this agent. Try again in a moment.",
+  "agent.detail.loadError.cta": "Retry",
 } as const;
 
 export type TranslationKey = keyof typeof en;

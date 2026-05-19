@@ -1,11 +1,14 @@
 //! CRUD endpoints for the agents registry.
 //!
-//! `POST   /agents`        — create
-//! `GET    /agents`        — list
-//! `GET    /agents/{id}`   — read one
-//! `PUT    /agents/{id}`   — update
-//! `DELETE /agents/{id}`   — delete (refuses the default; refuses any agent
-//!                          referenced by an existing session)
+//! `POST   /agents`                  — create
+//! `GET    /agents`                  — list
+//! `GET    /agents/{id}`             — read one
+//! `PUT    /agents/{id}`             — update
+//! `DELETE /agents/{id}`             — delete (refuses the default; refuses any agent
+//!                                    referenced by an existing session)
+//! `GET    /agents/{id}/tool-calls`  — cursor-paginated audit list of the agent's
+//!                                    recent tool invocations, joined to
+//!                                    `mcp_servers` for the per-row connection chip.
 //!
 //! Caching: an update to `system_prompt` becomes visible to live workers within
 //! [`crate::agents::AGENT_PROMPT_CACHE_TTL`] (60 s) — there is no synchronous
@@ -14,7 +17,7 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use chrono::{DateTime, Utc};
@@ -26,7 +29,9 @@ use crate::agents::{
     AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt, AgentUpdate,
     AllowedMcpTools, NewAgent,
 };
-use crate::auth::{AuthError, Principal};
+use crate::auth::{AuthError, Principal, VisibilityTable, visible_to};
+use crate::mcp::McpServerId;
+use crate::tools::{DEFAULT_TOOL_CALLS_PAGE, MAX_TOOL_CALLS_PAGE, ToolCallRowId};
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
@@ -40,6 +45,7 @@ pub(super) fn router() -> Router<AppState> {
                 .merge(put(update_agent))
                 .merge(delete(delete_agent)),
         )
+        .route("/agents/{id}/tool-calls", get(list_agent_tool_calls))
 }
 
 /// Wire shape returned on every agents endpoint. Mirrors the row plus
@@ -289,4 +295,101 @@ impl AgentRowForList {
             updated_at: self.updated_at,
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Per-agent tool-call audit list
+// ────────────────────────────────────────────────────────────────────────
+//
+// Mirrors the per-server endpoint in `mcp.rs` for shape/cursor semantics,
+// but pivots on `agent_id` (covered by the `tool_calls_per_agent_mcp_idx`
+// index from migration 25) and LEFT JOINs `mcp_servers` to project the
+// per-row connection id + alias. The join is LEFT because
+// `tool_calls.mcp_server_id` is `ON DELETE SET NULL` — the audit row
+// survives the connection it referenced.
+
+#[derive(Debug, Deserialize)]
+struct AgentToolCallsQuery {
+    /// Defaults to [`DEFAULT_TOOL_CALLS_PAGE`], clamped to
+    /// `1..=MAX_TOOL_CALLS_PAGE` by the handler.
+    limit: Option<u16>,
+    /// Exclusive `started_at` cursor — returned rows have `started_at < before`.
+    /// Pass the previous page's `next_cursor` to walk backwards in time.
+    before: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct AgentToolCallResponse {
+    id: ToolCallRowId,
+    tool_name: String,
+    /// LEFT JOIN: the audit row outlives its connection if the
+    /// `mcp_servers` row is ever deleted (`ON DELETE SET NULL`).
+    mcp_server_id: Option<McpServerId>,
+    /// LEFT JOIN: nullable for the same reason as `mcp_server_id`.
+    mcp_server_alias: Option<String>,
+    started_at: DateTime<Utc>,
+    duration_ms: i32,
+    is_error: bool,
+    /// Non-null only when `is_error = true` (migration-27 CHECK).
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentToolCallListResponse {
+    items: Vec<AgentToolCallResponse>,
+    /// `Some(ts)` when more rows exist beyond this page — pass it back as
+    /// `?before=` to fetch the next slice. `None` when the page is the tail.
+    next_cursor: Option<DateTime<Utc>>,
+}
+
+async fn list_agent_tool_calls(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    Query(params): Query<AgentToolCallsQuery>,
+) -> Result<Json<AgentToolCallListResponse>, HttpError> {
+    let agent_id = AgentId::from(id);
+    // Pre-gate visibility so a foreign / unknown id 404s with the same
+    // shape as `read_agent`, without leaking existence through an empty
+    // list response.
+    if !visible_to(&state.pool, &principal, VisibilityTable::Agents, id).await? {
+        return Err(HttpError::NotFound);
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_TOOL_CALLS_PAGE)
+        .clamp(1, MAX_TOOL_CALLS_PAGE);
+    // Fetch one extra row to detect "has more" without committing it to
+    // this page. `i64` because sqlx binds `LIMIT` through a bigint param.
+    let fetch_limit = i64::from(limit) + 1;
+
+    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
+    let mut items = sqlx::query_as::<_, AgentToolCallResponse>(
+        "SELECT tc.id, tc.tool_name, tc.mcp_server_id, s.alias AS mcp_server_alias, \
+                tc.started_at, tc.duration_ms, tc.is_error, tc.error_message \
+         FROM tool_calls tc \
+         LEFT JOIN mcp_servers s ON s.id = tc.mcp_server_id \
+         WHERE tc.agent_id = $1 \
+           AND ($2::timestamptz IS NULL OR tc.started_at < $2) \
+         ORDER BY tc.started_at DESC \
+         LIMIT $3",
+    )
+    .bind(agent_id)
+    .bind(params.before)
+    .bind(fetch_limit)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(AuthError::from)?;
+    tx.commit().await.map_err(AuthError::from)?;
+
+    let has_more = items.len() > usize::from(limit);
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = has_more
+        .then(|| items.last().map(|r| r.started_at))
+        .flatten();
+
+    Ok(Json(AgentToolCallListResponse { items, next_cursor }))
 }
