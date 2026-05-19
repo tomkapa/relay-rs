@@ -46,6 +46,27 @@ pub const MAX_TOOL_NAME_BYTES: usize = 128;
 /// `agent_core::limits::TOOL_TIMEOUT`.
 pub const MAX_TOOL_CALL_DURATION_MS: i32 = i32::MAX;
 
+/// Maximum bytes accepted in a `tool_calls.error_message` insert.
+///
+/// Tool errors are short reason strings ("upstream 500", "schema mismatch",
+/// "timeout"). 2 KiB tolerates a generous JSON snippet without letting a
+/// pathological provider response bloat the audit table. Mirrors the
+/// migration-27 CHECK so app and database refuse oversize text consistently
+/// (CLAUDE.md §5/§10).
+pub const MAX_TOOL_CALL_ERROR_MESSAGE_BYTES: usize = 2048;
+
+/// Default page size for `GET /mcp-servers/{id}/tool-calls`.
+///
+/// Matches the UI "Last 50 calls" label so the first render fills the card
+/// without a paginate-on-mount round trip.
+pub const DEFAULT_TOOL_CALLS_PAGE: u16 = 50;
+
+/// Hard upper bound on a single tool-calls page.
+///
+/// 100 keeps the cursor query cheap (partial index + LIMIT) while leaving
+/// room for a future "Load more" affordance to grab 2 pages at once.
+pub const MAX_TOOL_CALLS_PAGE: u16 = 100;
+
 // §5: per-tool body caps must always fit within the global tool-result cap so the agent
 // boundary doesn't have to truncate something we already truncated upstream.
 const _: () = assert!(FETCH_MAX_BODY_BYTES <= TOOL_RESULT_MAX_BYTES);

@@ -1,4 +1,9 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { ApiError } from "../lib/errors";
 import type {
@@ -11,6 +16,8 @@ import type {
 
 const LIST_KEY = ["mcp-servers"] as const;
 const ONE_KEY = (id: string) => ["mcp-servers", id] as const;
+const TOOL_CALLS_KEY = (id: string) =>
+  ["mcp-servers", id, "tool-calls"] as const;
 
 export function useMcpServers() {
   return useQuery({
@@ -111,6 +118,37 @@ export function useStartOAuth() {
   return useMutation({
     mutationFn: ({ id, input }: { id: string; input: OAuthStartRequest }) =>
       api.mcpOAuthStart(id, input),
+  });
+}
+
+/**
+ * Cursor-paginated audit log for an MCP server's tool calls. Built on
+ * `useInfiniteQuery` so the card can render a "Load more" affordance
+ * without churning the API later. The first page is what
+ * `RecentActivityCard` renders by default; `refetchInterval` matches the
+ * page-level server refetch so the table stays close to live.
+ */
+export function useMcpServerToolCalls(serverId: string | null) {
+  return useInfiniteQuery({
+    queryKey: serverId
+      ? TOOL_CALLS_KEY(serverId)
+      : (["mcp-servers", "none", "tool-calls"] as const),
+    enabled: Boolean(serverId),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) =>
+      api.mcpServerToolCalls(serverId ?? "", { before: pageParam }),
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    refetchInterval: 15_000,
+    staleTime: 5_000,
+    retry: (count, err) => {
+      if (
+        err instanceof ApiError &&
+        (err.status === 404 || err.status === 403)
+      ) {
+        return false;
+      }
+      return count < 3;
+    },
   });
 }
 

@@ -197,6 +197,28 @@ export type McpServer = {
   updated_at: string;
 };
 
+/** One audit row from `GET /mcp-servers/{id}/tool-calls`. Backed by the
+ *  `tool_calls` table; `agent_name` is joined from `agents.name` and
+ *  `error_message` is populated only when `is_error === true`. */
+export type ToolCall = {
+  id: string;
+  tool_name: string;
+  agent_id: string;
+  agent_name: string | null;
+  started_at: string;
+  duration_ms: number;
+  is_error: boolean;
+  error_message: string | null;
+};
+
+/** Cursor-paginated response. `next_cursor` is the previous page's last
+ *  `started_at`; pass it back as `?before=` to fetch the next slice.
+ *  `null` when the page is the tail. */
+export type ToolCallList = {
+  items: ToolCall[];
+  next_cursor: string | null;
+};
+
 /** Only `static_headers` is accepted on the create/replace path today;
  *  OAuth tokens are written by the callback handler. */
 export type CredentialInput = {

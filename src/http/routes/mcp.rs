@@ -15,14 +15,15 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Redirect;
 use axum::routing::{delete, get, post, put};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{AuthError, Principal};
+use crate::agents::AgentId;
+use crate::auth::{AuthError, Principal, VisibilityTable, visible_to};
 use crate::mcp::oauth::{
     ClientProvenance, NewOAuthClient, OAuthClientId, OAuthError, PendingAuthorization,
     TokenAuthMethod, build_authorize_url, discover_authorization_server, exchange_code,
@@ -33,6 +34,7 @@ use crate::mcp::{
     McpCredentialWrite, McpDescription, McpError, McpServerAlias, McpServerCreate, McpServerId,
     McpServerRecord, McpServerUpdate, McpTransport, OAUTH2_KIND_LABEL, OAuth2Payload,
 };
+use crate::tools::{DEFAULT_TOOL_CALLS_PAGE, MAX_TOOL_CALLS_PAGE, ToolCallRowId};
 use crate::types::SecretString;
 
 use super::super::error::HttpError;
@@ -56,6 +58,10 @@ pub(super) fn router() -> Router<AppState> {
         .route(
             "/mcp-servers/{id}/credentials",
             put(put_mcp_credentials).merge(delete(delete_mcp_credentials)),
+        )
+        .route(
+            "/mcp-servers/{id}/tool-calls",
+            get(list_mcp_server_tool_calls),
         )
         .route("/mcp-servers/{id}/oauth/start", post(start_oauth))
         .route("/mcp-servers/{id}/oauth/disconnect", post(disconnect_oauth))
@@ -338,6 +344,66 @@ async fn read_mcp_server(
         }
     }
     Ok(Json(row.try_into_response()?))
+}
+
+/// Cursor-paginated listing of tool calls recorded against an MCP server.
+///
+/// The `tool_calls_per_connection_idx` partial index covers the access
+/// pattern `(mcp_server_id, started_at DESC)` so the query is index-only.
+/// We pre-gate visibility on `mcp_servers` so a foreign / unknown id 404s
+/// with the same shape as `read_mcp_server`, without leaking existence
+/// through an empty-list response.
+async fn list_mcp_server_tool_calls(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    Query(params): Query<ToolCallsQuery>,
+) -> Result<Json<ToolCallListResponse>, HttpError> {
+    let server_id = McpServerId::from(id);
+    if !visible_to(&state.pool, &principal, VisibilityTable::McpServers, id).await? {
+        return Err(HttpError::NotFound);
+    }
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_TOOL_CALLS_PAGE)
+        .clamp(1, MAX_TOOL_CALLS_PAGE);
+    // Fetch one extra row to detect whether a next page exists. Stored as
+    // i64 because sqlx binds `LIMIT` through bigint params on Postgres.
+    let fetch_limit = i64::from(limit) + 1;
+
+    let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
+    let mut items = sqlx::query_as::<_, ToolCallResponse>(
+        "SELECT tc.id, tc.tool_name, tc.agent_id, a.name AS agent_name, \
+                tc.started_at, tc.duration_ms, tc.is_error, tc.error_message \
+         FROM tool_calls tc \
+         LEFT JOIN agents a ON a.id = tc.agent_id \
+         WHERE tc.mcp_server_id = $1 \
+           AND ($2::timestamptz IS NULL OR tc.started_at < $2) \
+         ORDER BY tc.started_at DESC \
+         LIMIT $3",
+    )
+    .bind(server_id)
+    .bind(params.before)
+    .bind(fetch_limit)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(AuthError::from)?;
+    tx.commit().await.map_err(AuthError::from)?;
+
+    // `fetch_limit = limit + 1`: the extra row is a peek to detect "more
+    // exists" without committing it to this page. Cursor is the *last
+    // returned* row's started_at so the next call's strict `< cursor`
+    // begins exactly where this page ended (no missed row).
+    let has_more = items.len() > usize::from(limit);
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = has_more
+        .then(|| items.last().map(|r| r.started_at))
+        .flatten();
+
+    Ok(Json(ToolCallListResponse { items, next_cursor }))
 }
 
 async fn update_mcp_server(
@@ -713,6 +779,44 @@ impl McpServerRowForList {
             updated_at: self.updated_at,
         })
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Tool-call audit list
+// ────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ToolCallsQuery {
+    /// Defaults to [`DEFAULT_TOOL_CALLS_PAGE`], clamped to
+    /// `1..=MAX_TOOL_CALLS_PAGE` by the handler.
+    limit: Option<u16>,
+    /// Exclusive `started_at` cursor — returned rows have `started_at < before`.
+    /// Pass the previous page's `next_cursor` to walk backwards in time.
+    before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct ToolCallResponse {
+    id: ToolCallRowId,
+    tool_name: String,
+    agent_id: AgentId,
+    /// LEFT JOIN: an audit row outlives its agent if the agent row is ever
+    /// removed. Today the schema doesn't ON DELETE, but the join stays
+    /// nullable so a future cascade doesn't break the list query.
+    agent_name: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    duration_ms: i32,
+    is_error: bool,
+    /// Non-null only when `is_error = true` (migration-27 CHECK).
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolCallListResponse {
+    items: Vec<ToolCallResponse>,
+    /// `Some(ts)` when more rows exist beyond this page — pass it back as
+    /// `?before=` to fetch the next slice. `None` when the page is the tail.
+    next_cursor: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ────────────────────────────────────────────────────────────────────────

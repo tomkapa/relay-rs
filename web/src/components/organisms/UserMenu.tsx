@@ -1,12 +1,12 @@
 import { useCallback, useRef, useState } from "react";
-import { LogOut, MoreHorizontal } from "lucide-react";
+import { LogOut } from "lucide-react";
 import { useAuthStore } from "../../stores/authStore";
 import { useLogout } from "../../hooks/useLogout";
 import { useDismissable } from "../../hooks/useDismissable";
-import { Button } from "../atoms/Button";
 import { useT } from "../../i18n";
 import type { TranslationKey } from "../../i18n/en";
 import { api } from "../../lib/api";
+import { initials } from "../../lib/utils";
 import type { Language } from "../../types/api";
 
 // Exhaustive list of selectable languages. Adding a `Language` variant
@@ -60,28 +60,31 @@ export function UserMenu() {
     }
   };
 
+  const displayName = me.user.display_name ?? me.user.email;
+
   return (
     <div ref={rootRef} className="relative">
-      <Button
-        variant="ghost"
-        size="sm"
-        iconOnly
+      <button
+        type="button"
         aria-label="User menu"
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
+        className="flex h-9 w-9 items-center justify-center border border-white bg-[var(--color-moss)] transition-colors hover:bg-[var(--color-moss-deep)]"
       >
-        <MoreHorizontal className="h-4 w-4" />
-      </Button>
+        <span className="font-mono text-[11px] font-bold tracking-tight text-white">
+          {initials(displayName)}
+        </span>
+      </button>
 
       {open ? (
         <div
           role="menu"
-          className="absolute bottom-full right-0 z-20 mb-1 w-[240px] border border-[var(--color-line)] bg-[var(--color-card)] py-1 shadow-md"
+          className="absolute bottom-0 left-full z-20 ml-2 w-[240px] border border-[var(--color-line)] bg-[var(--color-card)] py-1 shadow-md"
         >
           <div className="border-b border-[var(--color-line)] px-3 py-2">
             <div className="truncate text-[12px] font-semibold text-[var(--color-ink)]">
-              {me.user.display_name ?? me.user.email}
+              {displayName}
             </div>
             <div className="truncate font-[var(--font-mono)] text-[10.5px] text-[var(--color-muted)]">
               {me.user.email}

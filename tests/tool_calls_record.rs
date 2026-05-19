@@ -20,7 +20,10 @@ use relay_rs::auth::{OrgId, UserId};
 use relay_rs::clock::SystemClock;
 use relay_rs::mcp::McpServerId;
 use relay_rs::session::{PgSessionStore, SharedSessionStore};
-use relay_rs::tools::{PgToolCallStore, ToolCallRow, ToolCallRowId, ToolCallStore};
+use relay_rs::tools::{
+    MAX_TOOL_CALL_ERROR_MESSAGE_BYTES, PgToolCallStore, ToolCallRow, ToolCallRowId, ToolCallStore,
+    clip_error_message,
+};
 use relay_rs::types::ToolName;
 
 mod common;
@@ -34,6 +37,7 @@ fn fresh_row(
     mcp_server_id: Option<McpServerId>,
     is_error: bool,
 ) -> ToolCallRow {
+    let error_message = is_error.then(|| "boom".to_owned());
     ToolCallRow {
         id: ToolCallRowId::new(),
         org_id,
@@ -45,6 +49,7 @@ fn fresh_row(
         started_at: Utc::now(),
         duration: Duration::from_millis(42),
         is_error,
+        error_message,
     }
 }
 
@@ -249,4 +254,89 @@ async fn rls_hides_rows_from_non_member_principal() {
         .await
         .expect("read as owner");
     assert_eq!(count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn records_error_row_with_message() {
+    let db = TestDb::fresh().await;
+    let (session, request_id) = setup_session_and_request(&db).await;
+    let mcp = seed_mcp_server(&db).await;
+
+    let store = PgToolCallStore::new(db.pool.clone(), SystemClock::shared());
+    let row = fresh_row(
+        db.default_org_id,
+        session,
+        request_id,
+        db.default_agent_id,
+        Some(mcp),
+        true,
+    );
+    store.record(row).await.expect("record");
+
+    let stored: (bool, Option<String>) =
+        sqlx::query_as("SELECT is_error, error_message FROM tool_calls")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read back");
+    assert!(stored.0);
+    assert_eq!(stored.1.as_deref(), Some("boom"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn db_check_rejects_error_message_on_successful_row() {
+    let db = TestDb::fresh().await;
+    let (session, request_id) = setup_session_and_request(&db).await;
+
+    // Bypass the recorder (which has its own assert!) and hit the DB CHECK
+    // directly so we're sure the migration enforces the invariant.
+    let id = ToolCallRowId::new();
+    let now = Utc::now();
+    let err = sqlx::query(
+        "INSERT INTO tool_calls
+             (id, org_id, session_id, request_id, agent_id,
+              mcp_server_id, tool_name, started_at, duration_ms,
+              is_error, error_message, created_at)
+         VALUES ($1, $2, $3, $4, $5, NULL, 'web_fetch', $6, 1,
+                 FALSE, 'should be rejected', $6)",
+    )
+    .bind(id)
+    .bind(db.default_org_id)
+    .bind(session)
+    .bind(request_id)
+    .bind(db.default_agent_id)
+    .bind(now)
+    .execute(&db.pool)
+    .await
+    .expect_err("CHECK rejects error_message on success row");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("tool_calls_error_message_only_on_error"),
+        "unexpected error: {msg}",
+    );
+}
+
+#[test]
+fn clip_error_message_passes_through_short() {
+    assert_eq!(clip_error_message("nope".to_owned()), "nope");
+}
+
+#[test]
+fn clip_error_message_truncates_at_byte_cap() {
+    let oversize = "x".repeat(MAX_TOOL_CALL_ERROR_MESSAGE_BYTES * 2);
+    let clipped = clip_error_message(oversize);
+    assert!(clipped.len() <= MAX_TOOL_CALL_ERROR_MESSAGE_BYTES);
+    assert_eq!(clipped.len(), MAX_TOOL_CALL_ERROR_MESSAGE_BYTES);
+}
+
+#[test]
+fn clip_error_message_respects_utf8_boundary() {
+    // "é" is 2 bytes. Build a string that lands the naive cut mid-codepoint
+    // so the boundary walk-back is exercised.
+    let prefix_len = MAX_TOOL_CALL_ERROR_MESSAGE_BYTES - 1;
+    let mut s = "x".repeat(prefix_len);
+    s.push('é');
+    s.push_str(&"x".repeat(MAX_TOOL_CALL_ERROR_MESSAGE_BYTES));
+    let clipped = clip_error_message(s);
+    assert!(clipped.is_char_boundary(clipped.len()));
+    assert!(clipped.len() <= MAX_TOOL_CALL_ERROR_MESSAGE_BYTES);
 }

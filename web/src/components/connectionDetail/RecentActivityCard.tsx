@@ -1,69 +1,22 @@
-import { ArrowRight, Check, X } from "lucide-react";
+import { Check, X } from "lucide-react";
 import { SectionHeader } from "../atoms/SectionHeader";
 import { SectionCard } from "../molecules/SectionCard";
+import { Spinner } from "../atoms/Spinner";
+import { useMcpServerToolCalls } from "../../hooks/useMcpServers";
 import { useT } from "../../i18n";
+import { formatMs, useTimeAgo } from "../../lib/time";
+import type { ToolCall } from "../../types/api";
 
-type MockRow = {
-  time: string;
-  tool: string;
-  agent: string;
-  agentColor?: string;
-  latency: string;
-  ok: boolean;
-  outcome: string;
-};
+const COL_WIDTHS =
+  "minmax(76px,90px) minmax(0,1fr) minmax(96px,140px) 72px minmax(120px,220px)";
 
-const MOCK_ROWS: MockRow[] = [
-  {
-    time: "2m ago",
-    tool: "pages.search",
-    agent: "Atlas",
-    latency: "142ms",
-    ok: true,
-    outcome: "200 OK",
-  },
-  {
-    time: "14m ago",
-    tool: "databases.query",
-    agent: "Atlas",
-    latency: "618ms",
-    ok: true,
-    outcome: "200 OK",
-  },
-  {
-    time: "22m ago",
-    tool: "comments.create",
-    agent: "Beacon",
-    latency: "203ms",
-    ok: true,
-    outcome: "200 OK",
-  },
-  {
-    time: "1h ago",
-    tool: "pages.create",
-    agent: "Atlas",
-    latency: "—",
-    ok: false,
-    outcome: "403 forbidden_page",
-  },
-  {
-    time: "3h ago",
-    tool: "pages.search",
-    agent: "Atlas",
-    latency: "96ms",
-    ok: true,
-    outcome: "200 OK",
-  },
-];
-
-const COL_WIDTHS = "minmax(76px,90px) minmax(0,1fr) minmax(96px,140px) 72px minmax(120px,180px)";
-
-export function RecentActivityCard() {
+export function RecentActivityCard({ serverId }: { serverId: string }) {
   const { t } = useT();
+  const query = useMcpServerToolCalls(serverId);
+  const items = query.data?.pages.flatMap((p) => p.items) ?? [];
 
   return (
     <SectionCard
-      className="relative"
       header={
         <SectionHeader
           eyebrow={
@@ -74,85 +27,119 @@ export function RecentActivityCard() {
               </span>
             </>
           }
-          right={
-            <span
-              aria-disabled="true"
-              className="inline-flex items-center gap-1 text-[12px] text-[var(--color-muted)]"
-            >
-              {t("connections.detail.activity.audit")}
-              <ArrowRight className="h-3 w-3" strokeWidth={1.75} aria-hidden />
-            </span>
-          }
         />
       }
     >
-      <div className="relative">
-        <div className="pointer-events-none select-none opacity-55 grayscale">
-          <div
-            className="grid items-center gap-3 border-b border-[var(--color-line)] bg-[var(--color-paper-2)] px-5 py-2.5 font-[var(--font-mono)] text-[9px] tracking-[0.15em] uppercase text-[var(--color-muted)]"
-            style={{ gridTemplateColumns: COL_WIDTHS }}
-          >
-            <span>{t("connections.detail.activity.col.time")}</span>
-            <span>{t("connections.detail.activity.col.tool")}</span>
-            <span>{t("connections.detail.activity.col.agent")}</span>
-            <span>{t("connections.detail.activity.col.latency")}</span>
-            <span className="text-right">
-              {t("connections.detail.activity.col.outcome")}
-            </span>
-          </div>
-          {MOCK_ROWS.map((row, i) => (
-            <div
-              key={`${row.time}-${row.tool}-${i}`}
-              className={`grid items-center gap-3 border-b border-[var(--color-line)] px-5 py-2.5 last:border-b-0 ${
-                row.ok ? "" : "bg-[var(--color-rose-soft)]"
-              }`}
-              style={{ gridTemplateColumns: COL_WIDTHS }}
-            >
-              <span className="font-[var(--font-mono)] text-[12px] text-[var(--color-muted)]">
-                {row.time}
-              </span>
-              <span className="truncate font-[var(--font-mono)] text-[12px] text-[var(--color-ink)]">
-                {row.tool}
-              </span>
-              <span className="truncate text-[12px] text-[var(--color-moss-deep)]">
-                {row.agent}
-              </span>
-              <span className="font-[var(--font-mono)] text-[12px] text-[var(--color-ink)]">
-                {row.latency}
-              </span>
-              <span
-                className={`flex items-center justify-end gap-1.5 font-[var(--font-mono)] text-[12px] ${
-                  row.ok
-                    ? "text-[var(--color-ink)]"
-                    : "font-semibold text-[var(--color-rose)]"
-                }`}
-              >
-                {row.ok ? (
-                  <Check
-                    className="h-3 w-3 text-[var(--color-moss)]"
-                    strokeWidth={2}
-                    aria-hidden
-                  />
-                ) : (
-                  <X
-                    className="h-3 w-3 text-[var(--color-rose)]"
-                    strokeWidth={2}
-                    aria-hidden
-                  />
-                )}
-                {row.outcome}
-              </span>
-            </div>
-          ))}
-        </div>
-        <span className="absolute right-3 top-3 z-10 inline-flex items-center gap-1.5 border border-[var(--color-line)] bg-[var(--color-card)] px-2.5 py-1 font-[var(--font-mono)] text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--color-ink)] shadow-sm">
-          <span
-            aria-hidden
-            className="h-1.5 w-1.5 rounded-full bg-[var(--color-amber)]"
-          />
-          {t("connections.detail.activity.comingSoon")}
+      <ActivityBody query={query} items={items} />
+    </SectionCard>
+  );
+}
+
+type Query = ReturnType<typeof useMcpServerToolCalls>;
+
+function ActivityBody({ query, items }: { query: Query; items: ToolCall[] }) {
+  const { t } = useT();
+
+  if (query.isLoading) {
+    return (
+      <div className="flex items-center justify-center px-5 py-8">
+        <Spinner size={14} />
+      </div>
+    );
+  }
+  if (query.isError) {
+    return (
+      <div className="px-5 py-6 text-center text-[12px] text-[var(--color-rose)]">
+        {t("connections.detail.activity.loadError")}
+      </div>
+    );
+  }
+  if (items.length === 0) {
+    return (
+      <div className="px-5 py-6 text-center text-[12px] text-[var(--color-muted)]">
+        {t("connections.detail.activity.empty")}
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div
+        className="grid items-center gap-3 border-b border-[var(--color-line)] bg-[var(--color-paper-2)] px-5 py-2.5 font-[var(--font-mono)] text-[9px] tracking-[0.15em] uppercase text-[var(--color-muted)]"
+        style={{ gridTemplateColumns: COL_WIDTHS }}
+      >
+        <span>{t("connections.detail.activity.col.time")}</span>
+        <span>{t("connections.detail.activity.col.tool")}</span>
+        <span>{t("connections.detail.activity.col.agent")}</span>
+        <span>{t("connections.detail.activity.col.latency")}</span>
+        <span className="text-right">
+          {t("connections.detail.activity.col.outcome")}
         </span>
       </div>
-    </SectionCard>
+      {items.map((row) => (
+        <ActivityRow key={row.id} row={row} />
+      ))}
+    </>
+  );
+}
+
+function ActivityRow({ row }: { row: ToolCall }) {
+  const { t } = useT();
+  const timeAgo = useTimeAgo();
+  const agentLabel =
+    row.agent_name ?? t("connections.detail.activity.agentUnknown");
+  const outcomeText = row.is_error
+    ? (row.error_message ?? t("connections.detail.activity.outcomeError"))
+    : t("connections.detail.activity.outcomeOk");
+
+  return (
+    <div
+      className={`grid items-center gap-3 border-b border-[var(--color-line)] px-5 py-2.5 last:border-b-0 ${
+        row.is_error ? "bg-[var(--color-rose-soft)]" : ""
+      }`}
+      style={{ gridTemplateColumns: COL_WIDTHS }}
+    >
+      <span className="font-[var(--font-mono)] text-[12px] text-[var(--color-muted)]">
+        {timeAgo(row.started_at)}
+      </span>
+      <span
+        className="truncate font-[var(--font-mono)] text-[12px] text-[var(--color-ink)]"
+        title={row.tool_name}
+      >
+        {row.tool_name}
+      </span>
+      <span
+        className="truncate text-[12px] text-[var(--color-moss-deep)]"
+        title={agentLabel}
+      >
+        {agentLabel}
+      </span>
+      <span className="font-[var(--font-mono)] text-[12px] text-[var(--color-ink)]">
+        {formatMs(row.duration_ms)}
+      </span>
+      <span
+        className={`flex items-center justify-end gap-1.5 truncate font-[var(--font-mono)] text-[12px] ${
+          row.is_error
+            ? "font-semibold text-[var(--color-rose)]"
+            : "text-[var(--color-ink)]"
+        }`}
+        title={outcomeText}
+      >
+        {row.is_error ? (
+          <X
+            className="h-3 w-3 shrink-0 text-[var(--color-rose)]"
+            strokeWidth={2}
+            aria-hidden
+          />
+        ) : (
+          <Check
+            className="h-3 w-3 shrink-0 text-[var(--color-moss)]"
+            strokeWidth={2}
+            aria-hidden
+          />
+        )}
+        <span className="truncate">{outcomeText}</span>
+      </span>
+    </div>
   );
 }

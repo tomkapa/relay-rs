@@ -200,7 +200,11 @@ const en = {
   "connections.detail.activity.col.agent": "Agent",
   "connections.detail.activity.col.latency": "Latency",
   "connections.detail.activity.col.outcome": "Outcome",
-  "connections.detail.activity.comingSoon": "Coming soon",
+  "connections.detail.activity.empty": "No tool calls yet",
+  "connections.detail.activity.outcomeOk": "OK",
+  "connections.detail.activity.outcomeError": "Error",
+  "connections.detail.activity.loadError": "Could not load recent activity",
+  "connections.detail.activity.agentUnknown": "Unknown agent",
   "connections.detail.usedBy.eyebrow": "04 · USED BY",
   "connections.detail.usedBy.count": "{count} agents",
   "connections.detail.usedBy.empty":

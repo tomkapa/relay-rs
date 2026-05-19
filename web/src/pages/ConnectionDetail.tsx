@@ -95,7 +95,7 @@ export function ConnectionDetail() {
               <div className="flex min-w-0 flex-1 flex-col gap-5">
                 <StatusCard server={server} />
                 <ToolsExposedCard tools={server.discovered_tools ?? []} />
-                <RecentActivityCard />
+                <RecentActivityCard serverId={server.id} />
               </div>
               <div className="flex w-full flex-col gap-5 lg:w-[380px] lg:shrink-0">
                 <UsedByCard serverId={server.id} />

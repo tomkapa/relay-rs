@@ -13,6 +13,7 @@ import type {
   TestConnectResponse,
   ThreadMessage,
   ThreadSummary,
+  ToolCallList,
   UpdateMcpServerRequest,
 } from "../types/api";
 import { ApiError, AuthRedirect } from "./errors";
@@ -155,4 +156,16 @@ export const api = {
     request<{ ok: boolean }>(`/mcp-servers/${id}/oauth/disconnect`, {
       method: "POST",
     }),
+  mcpServerToolCalls: (
+    serverId: string,
+    params?: { limit?: number; before?: string },
+  ) => {
+    const search = new URLSearchParams();
+    if (params?.limit !== undefined) search.set("limit", String(params.limit));
+    if (params?.before) search.set("before", params.before);
+    const q = search.toString();
+    return request<ToolCallList>(
+      `/mcp-servers/${serverId}/tool-calls${q ? `?${q}` : ""}`,
+    );
+  },
 };

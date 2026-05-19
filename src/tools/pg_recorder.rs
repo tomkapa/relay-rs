@@ -14,7 +14,9 @@ use sqlx::PgPool;
 use crate::auth::run_privileged;
 use crate::clock::SharedClock;
 
-use super::limits::MAX_TOOL_CALL_DURATION_MS;
+use super::limits::{
+    MAX_TOOL_CALL_DURATION_MS, MAX_TOOL_CALL_ERROR_MESSAGE_BYTES, truncate_to_char_boundary,
+};
 use super::recorder::{ToolCallRow, ToolCallStore, ToolCallStoreError};
 
 /// Postgres-backed [`ToolCallStore`]. Carries the pool + clock by value
@@ -60,10 +62,17 @@ impl ToolCallStore for PgToolCallStore {
         ),
     )]
     async fn record(&self, row: ToolCallRow) -> Result<(), ToolCallStoreError> {
+        // CLAUDE.md §6: assert the invariant the migration-27 CHECK enforces
+        // so a caller bug surfaces before the round trip, not after.
+        assert!(
+            row.is_error || row.error_message.is_none(),
+            "tool_calls invariant: error_message set on a successful row"
+        );
         let duration_ms = saturating_duration_ms(row.duration.as_millis())?;
         tracing::Span::current().record("relay.tool.duration_ms", duration_ms);
 
         let created_at = self.clock.now_utc();
+        let error_message = row.error_message.as_deref();
 
         // Privileged tx: the worker serves many tenants and has no single
         // principal; the trigger `tool_calls_enforce_org` still verifies
@@ -74,8 +83,9 @@ impl ToolCallStore for PgToolCallStore {
                 "INSERT INTO tool_calls
                      (id, org_id, session_id, request_id, agent_id,
                       mcp_server_id, tool_name,
-                      started_at, duration_ms, is_error, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                      started_at, duration_ms, is_error, error_message,
+                      created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(row.id)
             .bind(row.org_id)
@@ -87,6 +97,7 @@ impl ToolCallStore for PgToolCallStore {
             .bind(row.started_at)
             .bind(duration_ms)
             .bind(row.is_error)
+            .bind(error_message)
             .bind(created_at)
             .execute(&mut **tx.tx_mut())
             .await?;
@@ -94,6 +105,24 @@ impl ToolCallStore for PgToolCallStore {
         })
         .await
     }
+}
+
+/// Clip `s` in place to [`MAX_TOOL_CALL_ERROR_MESSAGE_BYTES`] on a UTF-8
+/// boundary, warning on saturation so a recurring offender shows up in
+/// the operator log.
+#[must_use]
+pub fn clip_error_message(mut s: String) -> String {
+    if s.len() <= MAX_TOOL_CALL_ERROR_MESSAGE_BYTES {
+        return s;
+    }
+    let original_bytes = s.len();
+    truncate_to_char_boundary(&mut s, MAX_TOOL_CALL_ERROR_MESSAGE_BYTES);
+    tracing::warn!(
+        original_bytes,
+        cap_bytes = MAX_TOOL_CALL_ERROR_MESSAGE_BYTES,
+        "tool_calls.error_message.truncated",
+    );
+    s
 }
 
 /// Clip a `Duration::as_millis()` (`u128`) down to the schema's `i32`.

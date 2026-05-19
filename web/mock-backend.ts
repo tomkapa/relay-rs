@@ -163,6 +163,62 @@ const json = (body: unknown, status = 200) =>
 
 const empty = (status = 204) => new Response(null, { status });
 
+type ToolCall = {
+  id: string;
+  tool_name: string;
+  agent_id: string;
+  agent_name: string | null;
+  started_at: string;
+  duration_ms: number;
+  is_error: boolean;
+  error_message: string | null;
+};
+
+const AGENTS: { id: string; name: string }[] = [
+  { id: "aaaaaaaa-0000-0000-0000-000000000001", name: "Atlas" },
+  { id: "aaaaaaaa-0000-0000-0000-000000000002", name: "Beacon" },
+];
+
+const TOOL_FIXTURES: Record<string, ToolCall[]> = {};
+
+function buildFixture(serverId: string): ToolCall[] {
+  // Tools per server vary so different connections look distinct in dev.
+  const tools = ["list_pages", "create_page", "search_pages", "comments.add"];
+  const out: ToolCall[] = [];
+  for (let i = 0; i < 18; i++) {
+    const isError = i % 7 === 3;
+    const startedAt = new Date(Date.now() - i * 60_000 - 30_000).toISOString();
+    out.push({
+      id: `${serverId.slice(0, 8)}-tc-${String(i).padStart(4, "0")}`,
+      tool_name: tools[i % tools.length]!,
+      agent_id: AGENTS[i % AGENTS.length]!.id,
+      agent_name: AGENTS[i % AGENTS.length]!.name,
+      started_at: startedAt,
+      duration_ms: 60 + ((i * 73) % 900),
+      is_error: isError,
+      error_message: isError ? "403 forbidden_page" : null,
+    });
+  }
+  return out;
+}
+
+function buildToolCallsPage(
+  serverId: string,
+  qs: URLSearchParams,
+): { items: ToolCall[]; next_cursor: string | null } {
+  if (!TOOL_FIXTURES[serverId]) TOOL_FIXTURES[serverId] = buildFixture(serverId);
+  const all = TOOL_FIXTURES[serverId]!;
+  const limit = Math.min(Math.max(Number(qs.get("limit") ?? 50) || 50, 1), 100);
+  const before = qs.get("before");
+  const filtered = before
+    ? all.filter((r) => r.started_at < before)
+    : all.slice();
+  const page = filtered.slice(0, limit);
+  const next_cursor =
+    filtered.length > limit ? page[page.length - 1]!.started_at : null;
+  return { items: page, next_cursor };
+}
+
 function maybeOAuthStart(id: string): Response {
   // Mock authorize_url just bounces to the fake callback success — gives
   // the FE a usable round-trip without a vendor. We also simulate the
@@ -261,6 +317,10 @@ const server = Bun.serve({
       if (sub === "/oauth/disconnect" && method === "POST") {
         if (s) servers.set(id, { ...s, has_credentials: false, credentials_kind: null });
         return json({ ok: true });
+      }
+      if (sub === "/tool-calls" && method === "GET") {
+        if (!s) return empty(404);
+        return json(buildToolCallsPage(id, url.searchParams));
       }
     }
 

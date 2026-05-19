@@ -637,8 +637,8 @@ impl DynamicToolSource for McpRegistryInner {
         self.inner
             .read()
             .expect("registry lock poisoned")
-            .tool_servers
+            .tool_origins
             .get(name)
-            .copied()
+            .map(|o| o.server)
     }
 }

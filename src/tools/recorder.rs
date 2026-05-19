@@ -55,6 +55,12 @@ pub struct ToolCallRow {
     /// agent's `tool_timeout` runs well below the cap).
     pub duration: Duration,
     pub is_error: bool,
+    /// Short textual reason set only when `is_error == true`. The recorder
+    /// asserts the invariant before insert and the migration-27 CHECK
+    /// (`is_error OR error_message IS NULL`) catches any breach that
+    /// reaches the database. Already clipped to
+    /// [`super::limits::MAX_TOOL_CALL_ERROR_MESSAGE_BYTES`] by the caller.
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Error)]

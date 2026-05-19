@@ -68,8 +68,9 @@ impl DynamicToolSource for ScopedMcpSource {
         if self.allowed.is_empty() {
             return None;
         }
-        let (_tool, server) = self.registry.lookup(name)?;
-        self.allowed.contains(&server).then_some(server)
+        let (_tool, origin) = self.registry.lookup(name)?;
+        self.permits(origin.server, &origin.remote_name)
+            .then_some(origin.server)
     }
 }
 

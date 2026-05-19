@@ -2,6 +2,8 @@ import { Bot, House, Plug } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { cn } from "../../lib/utils";
 import { useT } from "../../i18n";
+import { useAuthStore } from "../../stores/authStore";
+import { UserMenu } from "./UserMenu";
 
 type MenuItem = {
   id: string;
@@ -16,6 +18,7 @@ export function MenuRail() {
   const nav = useNavigate();
   const { pathname } = useLocation();
   const { t } = useT();
+  const me = useAuthStore((s) => s.me);
 
   const items: MenuItem[] = [
     {
@@ -80,6 +83,12 @@ export function MenuRail() {
           </button>
         );
       })}
+
+      {me ? (
+        <div className="mt-auto flex w-full justify-center pt-2">
+          <UserMenu />
+        </div>
+      ) : null}
     </aside>
   );
 }

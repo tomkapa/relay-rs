@@ -198,7 +198,11 @@ const vi: TranslationTable = {
   "connections.detail.activity.col.agent": "Agent",
   "connections.detail.activity.col.latency": "Độ trễ",
   "connections.detail.activity.col.outcome": "Kết quả",
-  "connections.detail.activity.comingSoon": "Sắp ra mắt",
+  "connections.detail.activity.empty": "Chưa có lệnh gọi công cụ nào",
+  "connections.detail.activity.outcomeOk": "OK",
+  "connections.detail.activity.outcomeError": "Lỗi",
+  "connections.detail.activity.loadError": "Không thể tải hoạt động gần đây",
+  "connections.detail.activity.agentUnknown": "Agent không rõ",
   "connections.detail.usedBy.eyebrow": "04 · ĐANG ĐƯỢC DÙNG",
   "connections.detail.usedBy.count": "{count} agent",
   "connections.detail.usedBy.empty":

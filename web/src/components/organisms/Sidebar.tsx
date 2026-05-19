@@ -4,7 +4,6 @@ import { Bot, ChevronDown, Hash, Plus, Search } from "lucide-react";
 import { Button } from "../atoms/Button";
 import { Kbd } from "../atoms/Kbd";
 import { Monogram } from "../atoms/Monogram";
-import { StatusSquare } from "../atoms/StatusSquare";
 import { cn } from "../../lib/utils";
 import { useT } from "../../i18n";
 import type { Agent, ThreadSummary } from "../../types/api";
@@ -17,9 +16,7 @@ export function Sidebar({
   selectedAgentId,
   onSelectChannel,
   onSelectAgent,
-  userName,
   orgSwitcher,
-  userMenu,
 }: {
   workspace?: string;
   threads: ThreadSummary[];
@@ -28,9 +25,7 @@ export function Sidebar({
   selectedAgentId: string | null;
   onSelectChannel: (channel: string) => void;
   onSelectAgent: (agentId: string) => void;
-  userName: string;
   orgSwitcher?: ReactNode;
-  userMenu?: ReactNode;
 }) {
   const { t } = useT();
   const channels = [{ name: "general", icon: Hash, count: threads.length }];
@@ -143,21 +138,6 @@ export function Sidebar({
           )}
         </div>
       </div>
-
-      {/* User bar */}
-      <footer className="flex items-center gap-2.5 border-t border-[var(--color-line)] bg-[var(--color-card)] px-3 py-2.5">
-        <Monogram name={userName} id="user" tone="user" size={32} />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[13px] font-semibold text-[var(--color-ink)]">
-            {userName}
-          </div>
-          <div className="flex items-center gap-1.5 font-[var(--font-mono)] text-[10.5px] text-[var(--color-muted)]">
-            <StatusSquare status="live" size={6} />
-            online · operator
-          </div>
-        </div>
-        {userMenu}
-      </footer>
     </aside>
   );
 }

@@ -19,11 +19,12 @@ mod traits;
 mod url;
 
 pub use limits::{
-    MAX_TOOL_CALL_DURATION_MS, MAX_TOOL_NAME_BYTES, TOOL_RESULT_MAX_BYTES, truncate_from_start,
+    DEFAULT_TOOL_CALLS_PAGE, MAX_TOOL_CALL_DURATION_MS, MAX_TOOL_CALL_ERROR_MESSAGE_BYTES,
+    MAX_TOOL_CALLS_PAGE, MAX_TOOL_NAME_BYTES, TOOL_RESULT_MAX_BYTES, truncate_from_start,
     truncate_to_char_boundary,
 };
 pub use modes::RequestKindModes;
-pub use pg_recorder::PgToolCallStore;
+pub use pg_recorder::{PgToolCallStore, clip_error_message};
 pub use recorder::{
     SharedToolCallStore, ToolCallRow, ToolCallRowId, ToolCallStore, ToolCallStoreError,
 };

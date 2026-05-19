@@ -7,7 +7,6 @@ import { Sidebar } from "../components/organisms/Sidebar";
 import { ThreadPanel } from "../components/organisms/ThreadPanel";
 import { MenuRail } from "../components/organisms/MenuRail";
 import { OrgSwitcher } from "../components/organisms/OrgSwitcher";
-import { UserMenu } from "../components/organisms/UserMenu";
 import { useAgents } from "../hooks/useAgents";
 import { useActiveOrg } from "../hooks/useMe";
 import { useAuthStore } from "../stores/authStore";
@@ -158,9 +157,7 @@ export function ChatView() {
             setSelectedAgentId(id);
             setSelectedRoot(null);
           }}
-          userName={me?.user.display_name ?? me?.user.email ?? DEMO_USER.name}
           orgSwitcher={me ? <OrgSwitcher /> : undefined}
-          userMenu={me ? <UserMenu /> : undefined}
         />
       }
       main={

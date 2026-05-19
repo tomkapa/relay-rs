@@ -19,7 +19,7 @@ use crate::runtime::{PromptRequestId, RequestKind, RequestKindPayload};
 use crate::session::SessionId;
 use crate::tools::{
     SharedTool, TOOL_RESULT_MAX_BYTES, ToolBox, ToolCallContext, ToolCallRow, ToolCallRowId,
-    truncate_to_char_boundary,
+    clip_error_message, truncate_to_char_boundary,
 };
 use crate::types::{MessageSender, Participant, TurnIndex};
 
@@ -314,6 +314,11 @@ impl Agent {
         let Some(agent_id) = tool_ctx.viewer.agent_id() else {
             return;
         };
+        // Carries *what* failed for the audit row, not just *that* it failed.
+        let error_message = outcome
+            .result
+            .is_error
+            .then(|| clip_error_message(outcome.result.output.clone()));
         let row = ToolCallRow {
             id: ToolCallRowId::new(),
             org_id: tool_ctx.org_id,
@@ -325,6 +330,7 @@ impl Agent {
             started_at: outcome.started_at,
             duration: outcome.duration,
             is_error: outcome.result.is_error,
+            error_message,
         };
         if let Err(e) = store.record(row).await {
             tracing::error!(
