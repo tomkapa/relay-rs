@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use crate::mcp::McpServerId;
 use crate::provider::ToolSpec;
 use crate::runtime::RequestKind;
 
@@ -38,6 +39,17 @@ pub trait DynamicToolSource: std::fmt::Debug + Send + Sync {
     /// has per-mode opt-outs.
     fn get_for(&self, _kind: RequestKind, name: &str) -> Option<SharedTool> {
         self.get(name)
+    }
+
+    /// The MCP server backing this tool, if any.
+    ///
+    /// Used by the dispatcher's `tool_calls` recorder to populate the
+    /// nullable `mcp_server_id` column without making the source
+    /// type-specific. Default returns `None` so non-MCP sources (the
+    /// test-only `StaticDynamic`, `EmptySource`, and any future
+    /// non-MCP dynamic source) need not opt in.
+    fn server_id_for(&self, _name: &str) -> Option<McpServerId> {
+        None
     }
 }
 
@@ -113,6 +125,17 @@ impl ToolBox {
             return Some(tool);
         }
         self.dynamic.get_for(kind, name)
+    }
+
+    /// The MCP server backing `name`, if `name` resolves through the
+    /// dynamic (MCP) half of the toolbox. Built-in system tools always
+    /// return `None` — there is no MCP server behind a built-in.
+    #[must_use]
+    pub fn server_id_for(&self, name: &str) -> Option<McpServerId> {
+        if self.builtins.get(name).is_some() {
+            return None;
+        }
+        self.dynamic.server_id_for(name)
     }
 
     #[must_use]

@@ -3,11 +3,14 @@
 //! Lifecycle (`reply` / `resume` / `run_loop`) lives in [`super::core`]; this
 //! module owns the body of one iteration of the turn loop.
 
-use tokio::time::timeout;
+use std::time::Duration as StdDuration;
+
+use chrono::{DateTime, Utc};
+use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::auth::UserId;
+use crate::auth::Caller;
 use crate::hook::{ToolContext, TurnContext};
 use crate::provider::{
     ChatMessage, ChatRequest, ChatResponse, ToolCall, ToolCallId, ToolResult, UserContent,
@@ -15,7 +18,8 @@ use crate::provider::{
 use crate::runtime::{PromptRequestId, RequestKind, RequestKindPayload};
 use crate::session::SessionId;
 use crate::tools::{
-    SharedTool, TOOL_RESULT_MAX_BYTES, ToolBox, ToolCallContext, truncate_to_char_boundary,
+    SharedTool, TOOL_RESULT_MAX_BYTES, ToolBox, ToolCallContext, ToolCallRow, ToolCallRowId,
+    truncate_to_char_boundary,
 };
 use crate::types::{MessageSender, Participant, TurnIndex};
 
@@ -38,7 +42,7 @@ impl Agent {
         viewer_as_sender: MessageSender,
         root_request_id: PromptRequestId,
         request_id: PromptRequestId,
-        acting_user_id: UserId,
+        caller: Caller,
         kind_payload: &RequestKindPayload,
         send_message_calls: &mut usize,
         cancel: &CancellationToken,
@@ -64,7 +68,7 @@ impl Agent {
 
         self.sessions()
             .append_for_user(
-                acting_user_id,
+                caller.user_id,
                 ctx.session_id,
                 viewer_as_sender,
                 counterpart,
@@ -94,7 +98,8 @@ impl Agent {
             root_request_id,
             request_id,
             kind_payload: kind_payload.clone(),
-            acting_user_id,
+            acting_user_id: caller.user_id,
+            org_id: caller.org_id,
         };
         // Counted regardless of tool error — the model already saw the failure
         // via the tool result; the worker's ping-pong guard cares only about
@@ -119,7 +124,7 @@ impl Agent {
         // claiming the human authored the result.
         self.sessions()
             .append_for_user(
-                acting_user_id,
+                caller.user_id,
                 ctx.session_id,
                 MessageSender::System,
                 viewer,
@@ -264,23 +269,70 @@ impl Agent {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let results = futures::future::join_all(batch.map(|i| {
+            // Materialise indices so the merge step can pair each result
+            // with its call (the inner future only carries timing).
+            let indices: Vec<usize> = batch.collect();
+            let results = futures::future::join_all(indices.iter().map(|&i| {
                 self.run_call_with_hooks(ctx, calls[i], classes[i].tool(), kind, tool_ctx, cancel)
             }))
             .await;
             // Emit log + observer in call order — `join_all` preserves
             // input order on the result vec, so iterating it is the
-            // deterministic merge point.
-            for r in results {
-                let result = r?;
-                log::tool_result(ctx.turn_index.get(), &result);
+            // deterministic merge point. The tool-call recorder fires
+            // *after* the observer so a slow insert can't delay the SSE
+            // chunk the user is waiting on (CLAUDE.md §6: observability
+            // is best-effort, never on the user-visible critical path).
+            for (call_idx, r) in indices.into_iter().zip(results) {
+                let outcome = r?;
+                log::tool_result(ctx.turn_index.get(), &outcome.result);
                 if let Some(obs) = observer {
-                    obs.on_tool_result(&result).await;
+                    obs.on_tool_result(&outcome.result).await;
                 }
-                out.push(result);
+                self.record_tool_call(tool_ctx, tools, calls[call_idx], &outcome)
+                    .await;
+                out.push(outcome.result);
             }
         }
         Ok(out)
+    }
+
+    /// Best-effort write to the `tool_calls` audit log. Skipped when no
+    /// store is wired or the viewer is not an agent (system / human
+    /// participants never dispatch tools but the type system can't
+    /// prove it here). DB failures emit `tracing::error!` and continue
+    /// — the user has already seen the result.
+    async fn record_tool_call(
+        &self,
+        tool_ctx: &ToolCallContext,
+        tools: &ToolBox,
+        call: &ToolCall,
+        outcome: &CallOutcome,
+    ) {
+        let Some(store) = self.tool_call_store() else {
+            return;
+        };
+        let Some(agent_id) = tool_ctx.viewer.agent_id() else {
+            return;
+        };
+        let row = ToolCallRow {
+            id: ToolCallRowId::new(),
+            org_id: tool_ctx.org_id,
+            session_id: tool_ctx.session_id,
+            request_id: tool_ctx.request_id,
+            agent_id,
+            mcp_server_id: tools.server_id_for(call.name.as_str()),
+            tool_name: call.name.clone(),
+            started_at: outcome.started_at,
+            duration: outcome.duration,
+            is_error: outcome.result.is_error,
+        };
+        if let Err(e) = store.record(row).await {
+            tracing::error!(
+                error = ?e,
+                relay.tool = %call.name,
+                "tool_calls.record.failed",
+            );
+        }
     }
 
     async fn run_call_with_hooks(
@@ -291,19 +343,29 @@ impl Agent {
         kind: RequestKind,
         tool_ctx: &ToolCallContext,
         cancel: &CancellationToken,
-    ) -> Result<ToolResult, AgentError> {
+    ) -> Result<CallOutcome, AgentError> {
         let hook_ctx = ToolContext {
             session_id: ctx.session_id,
             turn_index: ctx.turn_index,
             call,
         };
         self.hooks().before_tool(hook_ctx).await?.into_result()?;
+        // Wall-clock `started_at` from the agent's clock (CLAUDE.md §11) so
+        // tests can pin timestamps; the monotonic `Instant` runs alongside
+        // so paused / faked wall clocks don't zero out `duration`.
+        let started_at = self.clock().now_utc();
+        let started_mono = Instant::now();
         let result = self.run_one_tool(call, tool, kind, tool_ctx, cancel).await;
+        let duration = started_mono.elapsed();
         self.hooks()
             .after_tool(hook_ctx, &result)
             .await?
             .into_result()?;
-        Ok(result)
+        Ok(CallOutcome {
+            result,
+            started_at,
+            duration,
+        })
     }
 
     /// Resolve and run a single tool. All failure modes (unknown tool, timeout,
@@ -398,6 +460,18 @@ fn error_result(call_id: ToolCallId, message: String) -> ToolResult {
         output,
         is_error: true,
     }
+}
+
+/// One tool dispatch's bundled output: the result the model sees, plus
+/// the timing the `tool_calls` recorder writes.
+///
+/// Threaded out of `run_call_with_hooks` so the dispatcher merge step
+/// has every column it needs without re-deriving timing per call.
+#[derive(Debug)]
+struct CallOutcome {
+    result: ToolResult,
+    started_at: DateTime<Utc>,
+    duration: StdDuration,
 }
 
 /// Helper to construct a `TurnIndex` from a loop counter inside the
