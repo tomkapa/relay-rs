@@ -34,7 +34,13 @@ export function CapabilitySummary({
     }
     return { toolsByServer: map, totalToolsKnown: total };
   }, [servers]);
-  const connectionsEnabled = Object.keys(list).length;
+  // Mirror AllowlistCard: only count keys that point at a currently-loaded
+  // server. Stale entries from connections that have been disabled or
+  // deleted otherwise inflate the numerator past the denominator.
+  const connectionsEnabled = servers.reduce(
+    (n, s) => (s.id in list ? n + 1 : n),
+    0,
+  );
   const toolsAllowed = totalToolsAllowed(list, toolsByServer);
 
   return (

@@ -15,6 +15,7 @@ import { useAgent, useUpdateAgent } from "../hooks/useAgents";
 import { useMcpServers } from "../hooks/useMcpServers";
 import { useT } from "../i18n";
 import { useAuthStore } from "../stores/authStore";
+import { ApiError, formatError } from "../lib/errors";
 import {
   allowlistsEqual,
   type Allowlist,
@@ -68,14 +69,10 @@ export function AgentDetail() {
         </div>
       ) : !agent ? (
         <div className="flex flex-1 items-center justify-center p-8">
-          <EmptyState
-            title={t("agent.detail.notFound.title")}
-            description={t("agent.detail.notFound.body")}
-            action={
-              <Button variant="primary" onClick={() => nav("/")}>
-                {t("agent.detail.notFound.cta")}
-              </Button>
-            }
+          <AgentLoadFallback
+            error={agentQuery.error}
+            onRetry={() => agentQuery.refetch()}
+            onHome={() => nav("/")}
           />
         </div>
       ) : (
@@ -132,5 +129,48 @@ export function AgentDetail() {
         </>
       )}
     </AgentLayout>
+  );
+}
+
+// 404/403 = "not found / hidden" (the same operator surface — we don't
+// distinguish "doesn't exist" from "you can't see it"). Any other error
+// is transient/system and gets a retry affordance instead.
+function AgentLoadFallback({
+  error,
+  onRetry,
+  onHome,
+}: {
+  error: unknown;
+  onRetry: () => void;
+  onHome: () => void;
+}) {
+  const { t } = useT();
+  const isNotFound =
+    error instanceof ApiError && (error.status === 404 || error.status === 403);
+  if (isNotFound) {
+    return (
+      <EmptyState
+        title={t("agent.detail.notFound.title")}
+        description={t("agent.detail.notFound.body")}
+        action={
+          <Button variant="primary" onClick={onHome}>
+            {t("agent.detail.notFound.cta")}
+          </Button>
+        }
+      />
+    );
+  }
+  return (
+    <EmptyState
+      title={t("agent.detail.loadError.title")}
+      description={
+        error ? formatError(error) : t("agent.detail.loadError.body")
+      }
+      action={
+        <Button variant="primary" onClick={onRetry}>
+          {t("agent.detail.loadError.cta")}
+        </Button>
+      }
+    />
   );
 }

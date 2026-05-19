@@ -19,8 +19,14 @@ export function shapeOf(
   const v = list[serverId];
   if (v === undefined) return "unchecked";
   if (v === null) return "all";
-  if (v.length === 0) return "unchecked";
-  if (v.length >= knownTools.length) return "all";
+  // Filter against the live tool catalog before counting — a stale name
+  // (e.g. a tool removed from the connection between sessions) must not
+  // promote the row to "all", which would over-grant access on the next
+  // save by collapsing back to `null`.
+  const known = new Set(knownTools);
+  const selected = v.filter((t) => known.has(t)).length;
+  if (selected === 0) return "unchecked";
+  if (knownTools.length > 0 && selected === knownTools.length) return "all";
   return "mixed";
 }
 
@@ -56,15 +62,19 @@ export function toggleTool(
   knownTools: readonly string[],
   next: boolean,
 ): Allowlist {
+  const known = new Set(knownTools);
+  if (!known.has(toolName)) return list;
   const current = list[serverId];
   // Start from the explicit set: `null` expands to every known tool so
   // unchecking one yields a shrunk array, not "all minus one + null".
+  // An existing `string[]` is filtered against the live catalog so stale
+  // names can't promote the row to "all" via the length-equality check below.
   const base =
     current === undefined
       ? []
       : current === null
         ? [...knownTools]
-        : [...current];
+        : current.filter((t) => known.has(t));
   let updated = next
     ? base.includes(toolName)
       ? base
@@ -75,7 +85,7 @@ export function toggleTool(
     const { [serverId]: _omit, ...rest } = list;
     return rest;
   }
-  if (updated.length >= knownTools.length) {
+  if (knownTools.length > 0 && updated.length === knownTools.length) {
     return { ...list, [serverId]: null };
   }
   // Keep the array stable-sorted by `knownTools` order so saves are
@@ -86,7 +96,9 @@ export function toggleTool(
 }
 
 /** Total of every tool the agent can currently invoke across all
- *  enabled connections. `null` value counts as `knownTools.length`. */
+ *  enabled connections. `null` value counts as `knownTools.length`.
+ *  Explicit tool names are filtered against the live catalog so a stale
+ *  entry doesn't inflate the count. */
 export function totalToolsAllowed(
   list: Allowlist,
   toolsByServer: Record<string, readonly string[]>,
@@ -94,7 +106,12 @@ export function totalToolsAllowed(
   let n = 0;
   for (const [sid, v] of Object.entries(list)) {
     const known = toolsByServer[sid] ?? [];
-    n += v === null ? known.length : v.length;
+    if (v === null) {
+      n += known.length;
+    } else {
+      const knownSet = new Set(known);
+      n += v.filter((t) => knownSet.has(t)).length;
+    }
   }
   return n;
 }

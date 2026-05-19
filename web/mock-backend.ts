@@ -342,9 +342,20 @@ const server = Bun.serve({
       if (sub === "" && method === "PUT") {
         if (!a) return empty(404);
         const body = (await req.json()) as Partial<AgentRow>;
+        // Guard `allowed_mcp_tools` so a malformed PUT (null, array,
+        // primitive) can't crash the next `Object.keys(...)` call on
+        // GET. The real backend rejects these via the AllowedMcpTools
+        // newtype; the mock just keeps the existing map.
+        const allowlist =
+          body.allowed_mcp_tools &&
+          typeof body.allowed_mcp_tools === "object" &&
+          !Array.isArray(body.allowed_mcp_tools)
+            ? body.allowed_mcp_tools
+            : a.allowed_mcp_tools;
         const next: AgentRow = {
           ...a,
           ...body,
+          allowed_mcp_tools: allowlist,
           id,
           updated_at: new Date().toISOString(),
         };

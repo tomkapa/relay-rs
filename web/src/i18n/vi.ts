@@ -230,7 +230,7 @@ const vi: TranslationTable = {
   "agent.detail.nav.aria": "Cài đặt Agent",
   "agent.detail.nav.eyebrow": "AGENT",
   "agent.detail.nav.section": "CÀI ĐẶT AGENT",
-  "agent.detail.nav.prompt": "System prompt",
+  "agent.detail.nav.prompt": "Prompt hệ thống",
   "agent.detail.nav.model": "Mô hình & suy luận",
   "agent.detail.nav.tools": "Công cụ & kết nối",
   "agent.detail.nav.logs": "Nhật ký & chỉ số",
@@ -271,6 +271,10 @@ const vi: TranslationTable = {
   "agent.detail.notFound.body":
     "Agent đã bị xóa, hoặc bạn không có quyền truy cập.",
   "agent.detail.notFound.cta": "Về trang chủ",
+  "agent.detail.loadError.title": "Không tải được agent",
+  "agent.detail.loadError.body":
+    "Có lỗi khi lấy thông tin agent. Vui lòng thử lại sau.",
+  "agent.detail.loadError.cta": "Thử lại",
 };
 
 export default vi;

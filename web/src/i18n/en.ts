@@ -273,6 +273,10 @@ const en = {
   "agent.detail.notFound.body":
     "The agent has been removed, or you don't have access to it.",
   "agent.detail.notFound.cta": "Back to home",
+  "agent.detail.loadError.title": "Couldn't load agent",
+  "agent.detail.loadError.body":
+    "Something went wrong fetching this agent. Try again in a moment.",
+  "agent.detail.loadError.cta": "Retry",
 } as const;
 
 export type TranslationKey = keyof typeof en;

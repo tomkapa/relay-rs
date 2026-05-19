@@ -18,7 +18,14 @@ export function AllowlistCard({
   loading: boolean;
 }) {
   const { t } = useT();
-  const enabledCount = Object.keys(list).length;
+  // Count only keys that map to a server currently loaded in `servers`.
+  // Stale entries (server disabled, deleted, or hidden by a filter) are
+  // still in `list` until the operator hits save, but they don't belong
+  // in the "X of Y enabled" header — otherwise `enabled > total` is possible.
+  const enabledCount = servers.reduce(
+    (n, s) => (s.id in list ? n + 1 : n),
+    0,
+  );
 
   return (
     <SectionCard
