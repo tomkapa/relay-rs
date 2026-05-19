@@ -225,6 +225,52 @@ const vi: TranslationTable = {
   "connections.detail.notFound.body":
     "Kết nối đã bị xóa, hoặc bạn không có quyền truy cập.",
   "connections.detail.notFound.cta": "Quay lại danh sách",
+
+  // ─── Chi tiết Agent (danh sách công cụ cho phép) ─────────────────────
+  "agent.detail.nav.aria": "Cài đặt Agent",
+  "agent.detail.nav.eyebrow": "AGENT",
+  "agent.detail.nav.section": "CÀI ĐẶT AGENT",
+  "agent.detail.nav.prompt": "System prompt",
+  "agent.detail.nav.model": "Mô hình & suy luận",
+  "agent.detail.nav.tools": "Công cụ & kết nối",
+  "agent.detail.nav.logs": "Nhật ký & chỉ số",
+  "agent.detail.breadcrumb.agents": "Agent",
+  "agent.detail.breadcrumb.tools": "Công cụ & kết nối",
+  "agent.detail.tools.title": "Công cụ & kết nối",
+  "agent.detail.tools.subtitle":
+    "Chọn các kết nối trong workspace mà {name} được dùng, và nếu muốn, giới hạn tới từng công cụ cụ thể.",
+  "agent.detail.tools.save": "Lưu",
+  "agent.detail.tools.sectionEyebrow": "01 · AGENT NÀY CÓ THỂ DÙNG",
+  "agent.detail.tools.sectionCount": "{enabled} / {total} đã bật",
+  "agent.detail.tools.empty":
+    "Workspace chưa có kết nối nào. Thêm một kết nối từ trang Kết nối trước.",
+  "agent.detail.tools.row.allOf": "{total} công cụ · đầy đủ",
+  "agent.detail.tools.row.someOf": "{enabled} / {total} công cụ",
+  "agent.detail.tools.row.available": "{total} công cụ",
+  "agent.detail.tools.row.empty": "Chưa phát hiện công cụ",
+  "agent.detail.tools.row.statusReconnect": "KẾT NỐI LẠI",
+  "agent.detail.tools.row.statusError": "LỖI",
+  "agent.detail.tools.row.toggleAria": "Cho phép {name}",
+  "agent.detail.tools.row.expand": "Hiện công cụ",
+  "agent.detail.tools.row.collapse": "Ẩn công cụ",
+  "agent.detail.summary.eyebrow": "03 · TÓM TẮT KHẢ NĂNG",
+  "agent.detail.summary.connections": "Kết nối đã bật",
+  "agent.detail.summary.tools": "Công cụ được phép",
+  "agent.detail.activity.eyebrow": "02 · {name} VỪA LÀM GÌ",
+  "agent.detail.activity.subtitle": "20 lệnh gọi gần nhất trên tất cả kết nối",
+  "agent.detail.activity.auditLink": "Nhật ký đầy đủ",
+  "agent.detail.activity.empty": "Chưa có lệnh gọi công cụ nào được ghi cho agent này.",
+  "agent.detail.activity.loadError": "Không thể tải hoạt động gần đây",
+  "agent.detail.activity.unknownConnection": "Kết nối đã xóa",
+  "agent.detail.activity.outcomeError": "Lỗi",
+  "agent.detail.activity.col.time": "Thời gian",
+  "agent.detail.activity.col.connection": "Kết nối",
+  "agent.detail.activity.col.tool": "Công cụ",
+  "agent.detail.activity.col.outcome": "Kết quả",
+  "agent.detail.notFound.title": "Không tìm thấy agent",
+  "agent.detail.notFound.body":
+    "Agent đã bị xóa, hoặc bạn không có quyền truy cập.",
+  "agent.detail.notFound.cta": "Về trang chủ",
 };
 
 export default vi;

@@ -1,5 +1,6 @@
 import type {
   Agent,
+  AgentToolCallList,
   CreateMcpServerRequest,
   CredentialInput,
   Language,
@@ -14,6 +15,7 @@ import type {
   ThreadMessage,
   ThreadSummary,
   ToolCallList,
+  UpdateAgentRequest,
   UpdateMcpServerRequest,
 } from "../types/api";
 import { ApiError, AuthRedirect } from "./errors";
@@ -94,6 +96,24 @@ export const api = {
     }),
 
   agents: () => request<Agent[]>("/agents"),
+  agent: (id: string) => request<Agent>(`/agents/${id}`),
+  updateAgent: (id: string, patch: UpdateAgentRequest) =>
+    request<Agent>(`/agents/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    }),
+  agentToolCalls: (
+    id: string,
+    params?: { limit?: number; before?: string },
+  ) => {
+    const search = new URLSearchParams();
+    if (params?.limit !== undefined) search.set("limit", String(params.limit));
+    if (params?.before) search.set("before", params.before);
+    const q = search.toString();
+    return request<AgentToolCallList>(
+      `/agents/${id}/tool-calls${q ? `?${q}` : ""}`,
+    );
+  },
 
   threads: () => request<ThreadSummary[]>("/threads"),
 
