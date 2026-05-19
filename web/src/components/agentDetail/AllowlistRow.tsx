@@ -154,29 +154,15 @@ export function AllowlistRow({
                     aria-label={tool.remote_name}
                   />
                 </span>
-                <span className="min-w-0 flex-1">
-                  <span
-                    className={cn(
-                      "block font-[var(--font-mono)] text-[12px] font-semibold",
-                      checked
-                        ? "text-[var(--color-ink)]"
-                        : "text-[var(--color-muted)]",
-                    )}
-                  >
-                    {tool.remote_name}
-                  </span>
-                  {tool.description ? (
-                    <span
-                      className={cn(
-                        "mt-0.5 block text-[12px]",
-                        checked
-                          ? "text-[var(--color-muted)]"
-                          : "text-[var(--color-muted-2)]",
-                      )}
-                    >
-                      {tool.description}
-                    </span>
-                  ) : null}
+                <span
+                  className={cn(
+                    "min-w-0 flex-1 font-[var(--font-mono)] text-[12px] font-semibold",
+                    checked
+                      ? "text-[var(--color-ink)]"
+                      : "text-[var(--color-muted)]",
+                  )}
+                >
+                  {tool.remote_name}
                 </span>
               </label>
             );

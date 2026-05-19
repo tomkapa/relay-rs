@@ -1,10 +1,13 @@
-import type { ReactNode } from "react";
-import { BarChart3, BookText, Cpu, Shield } from "lucide-react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
+import { BarChart3, BookText, Check, ChevronsUpDown, Cpu, Shield } from "lucide-react";
 import { MenuRail } from "../organisms/MenuRail";
 import { GlobalErrorBanner } from "../organisms/GlobalErrorBanner";
 import { Monogram } from "../atoms/Monogram";
 import { useT } from "../../i18n";
 import { cn } from "../../lib/utils";
+import { useAgents } from "../../hooks/useAgents";
+import { useDismissable } from "../../hooks/useDismissable";
 import type { Agent } from "../../types/api";
 
 /** Per-agent settings sub-navigation. Today only `tools` has a real page;
@@ -62,19 +65,7 @@ export function AgentLayout({
           <div className="font-[var(--font-mono)] text-[10px] tracking-[0.15em] text-[var(--color-muted)] uppercase">
             {t("agent.detail.nav.eyebrow")}
           </div>
-          <div className="mt-2 flex items-center gap-2.5">
-            <Monogram
-              name={agent?.name ?? "—"}
-              id={agent?.id}
-              size={32}
-              tone="moss"
-            />
-            <div className="min-w-0 flex-1">
-              <div className="truncate font-[var(--font-display)] text-[18px] leading-tight font-bold text-[var(--color-ink)]">
-                {agent?.name ?? "…"}
-              </div>
-            </div>
-          </div>
+          <AgentSwitcher current={agent} />
         </div>
         <nav className="flex flex-col gap-0.5 p-2">
           <div className="px-3 pt-2 pb-1 font-[var(--font-mono)] text-[10px] tracking-[0.15em] text-[var(--color-muted)] uppercase">
@@ -125,6 +116,88 @@ export function AgentLayout({
         <GlobalErrorBanner />
         {children}
       </main>
+    </div>
+  );
+}
+
+function AgentSwitcher({ current }: { current: Agent | null }) {
+  const { t } = useT();
+  const nav = useNavigate();
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const close = useCallback(() => setOpen(false), []);
+  useDismissable(rootRef, open, close);
+  const list = useAgents();
+  const agents = list.data ?? [];
+
+  const pick = (id: string) => {
+    setOpen(false);
+    if (id !== current?.id) nav(`/agents/${id}`);
+  };
+
+  return (
+    <div ref={rootRef} className="relative mt-2">
+      <button
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={t("agent.detail.switcher.aria")}
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2.5 text-left outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-ink)]"
+      >
+        <Monogram
+          name={current?.name ?? "—"}
+          id={current?.id}
+          size={32}
+          tone="moss"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-[var(--font-display)] text-[18px] leading-tight font-bold text-[var(--color-ink)]">
+            {current?.name ?? "…"}
+          </div>
+        </div>
+        <ChevronsUpDown
+          className="h-4 w-4 shrink-0 text-[var(--color-muted)]"
+          strokeWidth={1.75}
+        />
+      </button>
+
+      {open ? (
+        <ul
+          role="listbox"
+          aria-label={t("agent.detail.switcher.aria")}
+          className="absolute left-0 right-0 top-full z-20 mt-1 max-h-[60vh] overflow-y-auto border border-[var(--color-line)] bg-[var(--color-card)] py-1 shadow-md scroll-thin"
+        >
+          {agents.length === 0 ? (
+            <li className="px-3 py-2 text-[12.5px] text-[var(--color-muted)]">
+              {t("agent.detail.switcher.empty")}
+            </li>
+          ) : (
+            agents.map((a) => {
+              const isActive = a.id === current?.id;
+              return (
+                <li key={a.id}>
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={isActive}
+                    onClick={() => pick(a.id)}
+                    className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-[var(--color-paper-2)]"
+                  >
+                    <Monogram name={a.name} id={a.id} size={24} tone="moss" />
+                    <div className="min-w-0 flex-1 truncate text-[13px] font-semibold text-[var(--color-ink)]">
+                      {a.name}
+                    </div>
+                    {isActive ? (
+                      <Check className="h-3.5 w-3.5 shrink-0 text-[var(--color-moss)]" />
+                    ) : null}
+                  </button>
+                </li>
+              );
+            })
+          )}
+        </ul>
+      ) : null}
     </div>
   );
 }

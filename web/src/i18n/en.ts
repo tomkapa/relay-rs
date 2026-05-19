@@ -236,6 +236,11 @@ const en = {
   "agent.detail.nav.model": "Model & inference",
   "agent.detail.nav.tools": "Tools & connections",
   "agent.detail.nav.logs": "Logs & metrics",
+  "agent.detail.switcher.aria": "Switch agent",
+  "agent.detail.switcher.empty": "No agents",
+  "agent.index.empty.title": "No agents yet",
+  "agent.index.empty.body":
+    "This workspace has no agents. Create one from the Agents settings.",
   "agent.detail.breadcrumb.agents": "Agents",
   "agent.detail.breadcrumb.tools": "Tools & connections",
   "agent.detail.tools.title": "Tools & connections",

@@ -234,6 +234,11 @@ const vi: TranslationTable = {
   "agent.detail.nav.model": "Mô hình & suy luận",
   "agent.detail.nav.tools": "Công cụ & kết nối",
   "agent.detail.nav.logs": "Nhật ký & chỉ số",
+  "agent.detail.switcher.aria": "Chuyển Agent",
+  "agent.detail.switcher.empty": "Chưa có Agent",
+  "agent.index.empty.title": "Chưa có Agent",
+  "agent.index.empty.body":
+    "Workspace này chưa có Agent. Tạo mới từ phần cài đặt Agent.",
   "agent.detail.breadcrumb.agents": "Agent",
   "agent.detail.breadcrumb.tools": "Công cụ & kết nối",
   "agent.detail.tools.title": "Công cụ & kết nối",

@@ -1,5 +1,6 @@
 import { Route, Routes } from "react-router-dom";
 import { AgentDetail } from "./pages/AgentDetail";
+import { AgentsIndex } from "./pages/AgentsIndex";
 import { ChatView } from "./pages/ChatView";
 import { ConnectionDetail } from "./pages/ConnectionDetail";
 import { ConnectionsCatalog } from "./pages/ConnectionsCatalog";
@@ -47,6 +48,14 @@ export function App() {
         element={
           <Protected>
             <ConnectionDetail />
+          </Protected>
+        }
+      />
+      <Route
+        path="/agents"
+        element={
+          <Protected>
+            <AgentsIndex />
           </Protected>
         }
       />
