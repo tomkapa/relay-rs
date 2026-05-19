@@ -4,6 +4,7 @@
 //! smart constructor. The HTTP boundary parses raw JSON into these types once;
 //! nothing downstream constructs them directly.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -11,12 +12,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::auth::OrgId;
-use crate::mcp::McpServerId;
+use crate::mcp::{McpServerId, McpToolRemoteName};
 use crate::types::ParseError;
 
 use super::limits::{
     AGENT_DESCRIPTION_MAX_LEN, AGENT_NAME_MAX_LEN, AGENT_SYSTEM_PROMPT_MAX_LEN,
-    MAX_ALLOWED_MCP_SERVERS_PER_AGENT,
+    MAX_ALLOWED_MCP_SERVERS_PER_AGENT, MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT,
 };
 
 crate::uuid_newtype! {
@@ -237,9 +238,11 @@ pub struct AgentCard {
 
 /// Snapshot of a single row in the `agents` table.
 ///
-/// `allowed_mcp_servers` is the per-agent MCP allowlist: every id in this
-/// vector grants the agent visibility to that server's tools. The semantics
-/// are strict — an empty vector means **zero** MCP tools, not "all of them".
+/// `allowed_mcp_tools` is the per-agent MCP allowlist with per-server tool
+/// granularity: every server id present grants the agent visibility to that
+/// server, with the value (`None` = all tools, `Some(set)` = only these
+/// remote tool names) narrowing what surfaces. Strict semantics: an absent
+/// server id means **zero** tools from that server, not "all of them".
 /// Operators must explicitly opt an agent in to each server.
 #[derive(Debug, Clone)]
 pub struct AgentRecord {
@@ -252,28 +255,48 @@ pub struct AgentRecord {
     pub system_prompt: AgentSystemPrompt,
     pub description: AgentDescription,
     pub is_default: bool,
-    pub allowed_mcp_servers: AllowedMcpServers,
+    pub allowed_mcp_tools: AllowedMcpTools,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// Bounded list of MCP server ids an agent is allowed to see.
-///
-/// The newtype enforces the cardinality cap on every construction path
-/// (HTTP, store reload, factory wiring). Empty is a legitimate value — the
-/// "no MCP tools" lockdown — and is the default for a freshly minted agent.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AllowedMcpServers(Vec<McpServerId>);
+/// Per-server tool-allowlist view used by the runtime filter to decide
+/// whether a single tool surfaces to the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolScope<'a> {
+    /// Server is not in the allowlist — every tool it exposes is hidden.
+    None,
+    /// Server is allowed and every tool it exposes is exposed.
+    All,
+    /// Server is allowed; only the listed remote names are exposed. May be
+    /// empty, which is a valid "server present, lockdown all its tools"
+    /// state — distinct from [`ToolScope::None`] only in that an operator
+    /// has explicitly opted in to the server but listed zero tools.
+    Some(&'a BTreeSet<McpToolRemoteName>),
+}
 
-impl AllowedMcpServers {
+/// Per-agent MCP allowlist with per-server tool granularity.
+///
+/// Storage: `BTreeMap<McpServerId, Option<BTreeSet<McpToolRemoteName>>>`.
+/// `None` value = "all tools from this server"; `Some(set)` = "only these
+/// remote names." An absent server id = no access to that server (strict).
+///
+/// The newtype enforces both caps on every construction path (HTTP, store
+/// reload, factory wiring):
+/// - at most [`MAX_ALLOWED_MCP_SERVERS_PER_AGENT`] keys
+/// - at most [`MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT`] entries per
+///   value list (and each remote name is itself bounded via
+///   `McpToolRemoteName::try_from`).
+///
+/// Empty (`{}`) is a legitimate value — the "no MCP tools" lockdown — and
+/// is the default for a freshly minted agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowedMcpTools(BTreeMap<McpServerId, Option<BTreeSet<McpToolRemoteName>>>);
+
+impl AllowedMcpTools {
     #[must_use]
     pub fn empty() -> Self {
-        Self(Vec::new())
-    }
-
-    #[must_use]
-    pub fn as_slice(&self) -> &[McpServerId] {
-        &self.0
+        Self(BTreeMap::new())
     }
 
     #[must_use]
@@ -281,33 +304,99 @@ impl AllowedMcpServers {
         self.0.is_empty()
     }
 
+    /// Number of distinct servers in the allowlist (i.e. distinct top-level
+    /// keys).
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    #[must_use]
-    pub fn contains(&self, id: McpServerId) -> bool {
-        self.0.contains(&id)
+    /// Iterator over `(server_id, ToolScope)` for the runtime filter.
+    pub fn iter(&self) -> impl Iterator<Item = (McpServerId, ToolScope<'_>)> {
+        self.0.iter().map(|(id, v)| {
+            let scope = v.as_ref().map_or(ToolScope::All, ToolScope::Some);
+            (*id, scope)
+        })
     }
 
+    /// Look up the scope for `server`. Returns [`ToolScope::None`] for a
+    /// server that's absent from the allowlist.
     #[must_use]
-    pub fn into_inner(self) -> Vec<McpServerId> {
-        self.0
+    pub fn tools_for(&self, server: McpServerId) -> ToolScope<'_> {
+        match self.0.get(&server) {
+            None => ToolScope::None,
+            Some(None) => ToolScope::All,
+            Some(Some(set)) => ToolScope::Some(set),
+        }
+    }
+
+    /// True iff this allowlist mentions `server` at all (regardless of
+    /// whether the tool subset is `None` or `Some`).
+    #[must_use]
+    pub fn contains_server(&self, server: McpServerId) -> bool {
+        self.0.contains_key(&server)
     }
 }
 
-impl TryFrom<Vec<McpServerId>> for AllowedMcpServers {
+impl Serialize for AllowedMcpTools {
+    // Delegates to the inner `BTreeMap`'s own `Serialize`. `Option`,
+    // `BTreeSet`, and `McpToolRemoteName` all already implement
+    // `Serialize`, so this emits the wire-shaped JSONB without copying
+    // any `Arc<str>` into a `String`.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AllowedMcpTools {
+    // Parses the wire-shaped `BTreeMap<server, Option<Vec<String>>>` and
+    // funnels through `TryFrom` so the caps + per-name + uniqueness
+    // checks fire on every boundary cross (HTTP, sqlx JSONB, tool
+    // input). Boundary error → serde error → HTTP 400 / store backend
+    // error, same as every other newtype in this crate.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <BTreeMap<McpServerId, Option<Vec<String>>>>::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<BTreeMap<McpServerId, Option<Vec<String>>>> for AllowedMcpTools {
     type Error = ParseError;
 
-    fn try_from(raw: Vec<McpServerId>) -> Result<Self, Self::Error> {
+    fn try_from(raw: BTreeMap<McpServerId, Option<Vec<String>>>) -> Result<Self, Self::Error> {
         if raw.len() > MAX_ALLOWED_MCP_SERVERS_PER_AGENT {
             return Err(ParseError::OutOfRange {
-                field: "allowed_mcp_servers",
-                detail: "too many entries",
+                field: "allowed_mcp_tools",
+                detail: "too many servers",
             });
         }
-        Ok(Self(raw))
+        let mut out: BTreeMap<McpServerId, Option<BTreeSet<McpToolRemoteName>>> = BTreeMap::new();
+        for (id, names) in raw {
+            let scope = match names {
+                None => None,
+                Some(list) => {
+                    if list.len() > MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT {
+                        return Err(ParseError::OutOfRange {
+                            field: "allowed_mcp_tools",
+                            detail: "too many tools for one server",
+                        });
+                    }
+                    let mut set: BTreeSet<McpToolRemoteName> = BTreeSet::new();
+                    for raw_name in list {
+                        let name = McpToolRemoteName::try_from(raw_name)?;
+                        if !set.insert(name) {
+                            return Err(ParseError::Malformed {
+                                field: "allowed_mcp_tools",
+                                detail: "duplicate tool name in server list",
+                            });
+                        }
+                    }
+                    Some(set)
+                }
+            };
+            out.insert(id, scope);
+        }
+        Ok(Self(out))
     }
 }
 
@@ -357,35 +446,100 @@ mod tests {
     }
 
     #[test]
-    fn allowed_mcp_servers_default_is_empty() {
-        let a = AllowedMcpServers::default();
+    fn allowed_mcp_tools_default_is_empty() {
+        let a = AllowedMcpTools::default();
         assert!(a.is_empty());
         assert_eq!(a.len(), 0);
-        assert_eq!(a.as_slice(), &[]);
     }
 
     #[test]
-    fn allowed_mcp_servers_rejects_oversize() {
-        let too_many: Vec<McpServerId> = (0..=MAX_ALLOWED_MCP_SERVERS_PER_AGENT)
-            .map(|_| McpServerId::new())
-            .collect();
-        let err = AllowedMcpServers::try_from(too_many).expect_err("over cap");
+    fn allowed_mcp_tools_rejects_too_many_servers() {
+        let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+        for _ in 0..=MAX_ALLOWED_MCP_SERVERS_PER_AGENT {
+            raw.insert(McpServerId::new(), None);
+        }
+        let err = AllowedMcpTools::try_from(raw).expect_err("over server cap");
         assert!(matches!(
             err,
             ParseError::OutOfRange {
-                field: "allowed_mcp_servers",
+                field: "allowed_mcp_tools",
+                detail: "too many servers",
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_mcp_tools_rejects_too_many_tools_per_server() {
+        let id = McpServerId::new();
+        let mut list: Vec<String> = Vec::new();
+        for i in 0..=MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT {
+            list.push(format!("t{i}"));
+        }
+        let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+        raw.insert(id, Some(list));
+        let err = AllowedMcpTools::try_from(raw).expect_err("over tools cap");
+        assert!(matches!(
+            err,
+            ParseError::OutOfRange {
+                field: "allowed_mcp_tools",
+                detail: "too many tools for one server",
+            }
+        ));
+    }
+
+    #[test]
+    fn allowed_mcp_tools_rejects_empty_tool_name() {
+        let id = McpServerId::new();
+        let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+        raw.insert(id, Some(vec![String::new()]));
+        let err = AllowedMcpTools::try_from(raw).expect_err("empty name");
+        assert!(matches!(err, ParseError::Empty { .. }));
+    }
+
+    #[test]
+    fn allowed_mcp_tools_rejects_duplicate_tool_in_one_server_list() {
+        let id = McpServerId::new();
+        let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+        raw.insert(id, Some(vec!["a".into(), "a".into()]));
+        let err = AllowedMcpTools::try_from(raw).expect_err("dup");
+        assert!(matches!(
+            err,
+            ParseError::Malformed {
+                field: "allowed_mcp_tools",
                 ..
             }
         ));
     }
 
     #[test]
-    fn allowed_mcp_servers_accepts_at_cap() {
-        let at_cap: Vec<McpServerId> = (0..MAX_ALLOWED_MCP_SERVERS_PER_AGENT)
-            .map(|_| McpServerId::new())
-            .collect();
-        let allowed = AllowedMcpServers::try_from(at_cap.clone()).expect("at cap");
+    fn allowed_mcp_tools_distinguishes_all_versus_some_empty() {
+        let id_all = McpServerId::new();
+        let id_some_empty = McpServerId::new();
+        let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+        raw.insert(id_all, None);
+        raw.insert(id_some_empty, Some(Vec::new()));
+        let allowed = AllowedMcpTools::try_from(raw).expect("valid");
+        assert!(matches!(allowed.tools_for(id_all), ToolScope::All));
+        let empty_set = match allowed.tools_for(id_some_empty) {
+            ToolScope::Some(set) => set,
+            other => panic!("expected Some(empty), got {other:?}"),
+        };
+        assert!(empty_set.is_empty());
+        let unknown = McpServerId::new();
+        assert!(matches!(allowed.tools_for(unknown), ToolScope::None));
+    }
+
+    #[test]
+    fn allowed_mcp_tools_accepts_at_caps() {
+        let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+        for i in 0..MAX_ALLOWED_MCP_SERVERS_PER_AGENT {
+            let id = McpServerId::new();
+            let tools: Vec<String> = (0..MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT)
+                .map(|t| format!("s{i}_t{t}"))
+                .collect();
+            raw.insert(id, Some(tools));
+        }
+        let allowed = AllowedMcpTools::try_from(raw).expect("at caps");
         assert_eq!(allowed.len(), MAX_ALLOWED_MCP_SERVERS_PER_AGENT);
-        assert!(allowed.contains(at_cap[0]));
     }
 }

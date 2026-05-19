@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use relay_rs::agents::{
-    AgentDescription, AgentId, AgentName, AgentSystemPrompt, AllowedMcpServers, NewAgent,
+    AgentDescription, AgentId, AgentName, AgentSystemPrompt, AllowedMcpTools, NewAgent,
     SharedAgentStore,
 };
 use relay_rs::auth::{OrgId, UserId};
@@ -164,7 +164,7 @@ impl AuthMemoryHarness {
                 system_prompt: AgentSystemPrompt::try_from("scoped prompt").expect("prompt"),
                 description: AgentDescription::try_from(format!("agent {name}")).expect("desc"),
                 is_default: false,
-                allowed_mcp_servers: AllowedMcpServers::empty(),
+                allowed_mcp_tools: AllowedMcpTools::empty(),
             })
             .await
             .expect("create agent");

@@ -10,7 +10,7 @@ use crate::auth::{OrgId, UserId};
 use super::error::AgentStoreError;
 use super::types::{
     AgentCard, AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt,
-    AllowedMcpServers, DefaultAgentSeed,
+    AllowedMcpTools, DefaultAgentSeed,
 };
 
 /// Input to [`AgentStore::create`]. Server-side fields (`id`, `created_at`,
@@ -32,8 +32,10 @@ pub struct NewAgent {
     /// stays satisfied.
     pub is_default: bool,
     /// Initial MCP allowlist. Empty for the no-MCP-tools default; the operator
-    /// supplies it explicitly when granting access at create time.
-    pub allowed_mcp_servers: AllowedMcpServers,
+    /// supplies it explicitly when granting access at create time. Each
+    /// server entry may carry `None` (= all of its tools) or `Some(set)`
+    /// (= only those remote tool names).
+    pub allowed_mcp_tools: AllowedMcpTools,
 }
 
 /// HTTP-PATCH-style update payload.
@@ -42,7 +44,7 @@ pub struct NewAgent {
 /// "field present (set)". `is_default = Some(true)` triggers an atomic
 /// demote-then-promote; `is_default = Some(false)` is rejected when applied to
 /// the current default row (the system requires a default to exist at all
-/// times). `allowed_mcp_servers = Some(<empty>)` is the lockdown path —
+/// times). `allowed_mcp_tools = Some(<empty>)` is the lockdown path —
 /// distinct from "field omitted" so HTTP PATCH can revoke every server.
 #[derive(Debug, Clone, Default)]
 pub struct AgentUpdate {
@@ -52,7 +54,7 @@ pub struct AgentUpdate {
     /// newtype's `TryFrom` rejects empty/whitespace at the HTTP boundary.
     pub description: Option<AgentDescription>,
     pub is_default: Option<bool>,
-    pub allowed_mcp_servers: Option<AllowedMcpServers>,
+    pub allowed_mcp_tools: Option<AllowedMcpTools>,
 }
 
 /// Storage trait for the agents registry. Implementations must be thread-safe.

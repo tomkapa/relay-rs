@@ -351,7 +351,7 @@ impl AgentFactoryPieces {
     fn build(&self, record: &crate::agents::AgentRecord) -> Agent {
         let dynamic = Arc::new(ScopedMcpSource::new(
             self.mcp_registry.clone(),
-            &record.allowed_mcp_servers,
+            &record.allowed_mcp_tools,
         ));
         let toolbox = ToolBox::new(self.builtin_tools.clone(), dynamic);
         AgentBuilder::new(

@@ -39,7 +39,7 @@ macro_rules! uuid_newtype {
         $vis:vis $name:ident
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         $vis struct $name(::uuid::Uuid);
 
         impl $name {

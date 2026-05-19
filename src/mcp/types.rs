@@ -13,7 +13,7 @@ use crate::types::ParseError;
 
 use super::limits::{
     MCP_ALIAS_MAX_LEN, MCP_DESCRIPTION_MAX_LEN, MCP_HEADER_NAME_MAX_LEN, MCP_HEADER_VALUE_MAX_LEN,
-    MCP_URL_MAX_LEN,
+    MCP_TOOL_REMOTE_NAME_MAX_LEN, MCP_URL_MAX_LEN,
 };
 
 crate::uuid_newtype! {
@@ -419,6 +419,75 @@ pub struct DiscoveredTool {
     pub remote_name: String,
     pub prefixed_name: String,
     pub description: Option<String>,
+}
+
+/// The unprefixed name a remote MCP server publishes for a tool (e.g.
+/// `issues.create`).
+///
+/// Distinct from [`crate::types::ToolName`] — that one is the prefixed,
+/// agent-facing name (`mcp_<alias>_<remote>`). The per-agent allowlist
+/// keys on the remote name so a server rename (the alias changes) does
+/// not silently drop every entry.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct McpToolRemoteName(std::sync::Arc<str>);
+
+impl McpToolRemoteName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for McpToolRemoteName {
+    type Error = ParseError;
+
+    fn try_from(raw: &str) -> Result<Self, Self::Error> {
+        if raw.is_empty() {
+            return Err(ParseError::Empty {
+                field: "mcp_tool_remote_name",
+            });
+        }
+        if raw.len() > MCP_TOOL_REMOTE_NAME_MAX_LEN {
+            return Err(ParseError::TooLong {
+                field: "mcp_tool_remote_name",
+                max: MCP_TOOL_REMOTE_NAME_MAX_LEN,
+                got: raw.len(),
+            });
+        }
+        Ok(Self(std::sync::Arc::from(raw)))
+    }
+}
+
+impl TryFrom<String> for McpToolRemoteName {
+    type Error = ParseError;
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::try_from(raw.as_str())
+    }
+}
+
+impl fmt::Debug for McpToolRemoteName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("McpToolRemoteName").field(&&*self.0).finish()
+    }
+}
+
+impl fmt::Display for McpToolRemoteName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for McpToolRemoteName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for McpToolRemoteName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(test)]

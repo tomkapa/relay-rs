@@ -1,31 +1,39 @@
 //! Per-agent view of the MCP tool catalogue.
 //!
-//! Strict-by-default: an empty allow-set yields zero tools. There is no
-//! "unrestricted" mode — the absence of a server id from the set always
-//! means the agent cannot see that server's tools.
+//! Strict-by-default: a server id absent from the allowlist exposes none of
+//! that server's tools. Within an allowed server, the value carried by the
+//! [`AllowedMcpTools`] map decides whether every tool is exposed
+//! ([`ToolScope::All`]) or only a named subset ([`ToolScope::Some`]).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::agents::AllowedMcpServers;
+use crate::agents::{AllowedMcpTools, ToolScope};
 use crate::provider::ToolSpec;
 use crate::tools::{DynamicToolSource, SharedTool};
 
 use super::registry::McpRegistry;
-use super::types::McpServerId;
+use super::types::{McpServerId, McpToolRemoteName};
 
 #[derive(Debug, Clone)]
 pub struct ScopedMcpSource {
     registry: McpRegistry,
-    allowed: HashSet<McpServerId>,
+    allowed: AllowedMcpTools,
 }
 
 impl ScopedMcpSource {
     #[must_use]
-    pub fn new(registry: McpRegistry, allowed: &AllowedMcpServers) -> Self {
+    pub fn new(registry: McpRegistry, allowed: &AllowedMcpTools) -> Self {
         Self {
             registry,
-            allowed: allowed.as_slice().iter().copied().collect(),
+            allowed: allowed.clone(),
+        }
+    }
+
+    fn permits(&self, server: McpServerId, remote: &McpToolRemoteName) -> bool {
+        match self.allowed.tools_for(server) {
+            ToolScope::None => false,
+            ToolScope::All => true,
+            ToolScope::Some(set) => set.contains(remote),
         }
     }
 }
@@ -38,8 +46,8 @@ impl DynamicToolSource for ScopedMcpSource {
         let snapshot = self.registry.snapshot();
         let mut kept: Vec<ToolSpec> = Vec::with_capacity(snapshot.specs.len());
         for spec in snapshot.specs.iter() {
-            if let Some(server) = snapshot.tool_servers.get(spec.name.as_str())
-                && self.allowed.contains(server)
+            if let Some(origin) = snapshot.tool_origins.get(spec.name.as_str())
+                && self.permits(origin.server, &origin.remote_name)
             {
                 kept.push(spec.clone());
             }
@@ -51,8 +59,9 @@ impl DynamicToolSource for ScopedMcpSource {
         if self.allowed.is_empty() {
             return None;
         }
-        let (tool, server) = self.registry.lookup(name)?;
-        self.allowed.contains(&server).then_some(tool)
+        let (tool, origin) = self.registry.lookup(name)?;
+        self.permits(origin.server, &origin.remote_name)
+            .then_some(tool)
     }
 
     fn server_id_for(&self, name: &str) -> Option<McpServerId> {
@@ -66,6 +75,8 @@ impl DynamicToolSource for ScopedMcpSource {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
@@ -110,36 +121,44 @@ mod tests {
         Arc::new(FakeTool::new(name))
     }
 
-    fn allow(ids: &[McpServerId]) -> AllowedMcpServers {
-        AllowedMcpServers::try_from(ids.to_vec()).expect("under cap")
-    }
-
     fn spec_names(specs: &[crate::provider::ToolSpec]) -> Vec<String> {
         specs.iter().map(|s| s.name.as_str().to_owned()).collect()
+    }
+
+    /// Build an [`AllowedMcpTools`] from a list of `(server, scope)` entries
+    /// where `scope = None` means "all tools" and `scope = Some(&[..])`
+    /// means "only these remote names."
+    fn allow(entries: &[(McpServerId, Option<&[&str]>)]) -> AllowedMcpTools {
+        let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+        for (id, names) in entries {
+            let v = names.map(|list| list.iter().map(|s| (*s).to_owned()).collect());
+            raw.insert(*id, v);
+        }
+        AllowedMcpTools::try_from(raw).expect("valid scope")
     }
 
     #[test]
     fn empty_allowlist_hides_every_tool() {
         let s1 = McpServerId::new();
-        let registry = McpRegistry::for_test(vec![
-            (s1, fake("mcp_one_alpha")),
-            (s1, fake("mcp_one_beta")),
+        let registry = McpRegistry::for_test_with_remote_names(vec![
+            (s1, "alpha".into(), fake("mcp_one_alpha")),
+            (s1, "beta".into(), fake("mcp_one_beta")),
         ]);
-        let scoped = ScopedMcpSource::new(registry, &AllowedMcpServers::empty());
+        let scoped = ScopedMcpSource::new(registry, &AllowedMcpTools::empty());
         assert!(scoped.specs().is_empty());
         assert!(scoped.get("mcp_one_alpha").is_none());
     }
 
     #[test]
-    fn allowed_server_exposes_only_its_tools() {
+    fn allowed_server_with_none_scope_exposes_every_tool() {
         let s1 = McpServerId::new();
         let s2 = McpServerId::new();
-        let registry = McpRegistry::for_test(vec![
-            (s1, fake("mcp_one_alpha")),
-            (s2, fake("mcp_two_beta")),
-            (s2, fake("mcp_two_gamma")),
+        let registry = McpRegistry::for_test_with_remote_names(vec![
+            (s1, "alpha".into(), fake("mcp_one_alpha")),
+            (s2, "beta".into(), fake("mcp_two_beta")),
+            (s2, "gamma".into(), fake("mcp_two_gamma")),
         ]);
-        let scoped = ScopedMcpSource::new(registry, &allow(&[s2]));
+        let scoped = ScopedMcpSource::new(registry, &allow(&[(s2, None)]));
         let names = spec_names(&scoped.specs());
         assert_eq!(names.len(), 2);
         assert!(names.iter().any(|n| n == "mcp_two_beta"));
@@ -149,10 +168,42 @@ mod tests {
     }
 
     #[test]
+    fn partial_scope_keeps_only_named_tools() {
+        let s1 = McpServerId::new();
+        let registry = McpRegistry::for_test_with_remote_names(vec![
+            (s1, "alpha".into(), fake("mcp_one_alpha")),
+            (s1, "beta".into(), fake("mcp_one_beta")),
+            (s1, "gamma".into(), fake("mcp_one_gamma")),
+        ]);
+        let scoped = ScopedMcpSource::new(registry, &allow(&[(s1, Some(&["alpha", "gamma"]))]));
+        let names = spec_names(&scoped.specs());
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().any(|n| n == "mcp_one_alpha"));
+        assert!(names.iter().any(|n| n == "mcp_one_gamma"));
+        assert!(scoped.get("mcp_one_beta").is_none());
+    }
+
+    #[test]
+    fn empty_subset_locks_down_an_allowed_server() {
+        let s1 = McpServerId::new();
+        let registry = McpRegistry::for_test_with_remote_names(vec![
+            (s1, "alpha".into(), fake("mcp_one_alpha")),
+            (s1, "beta".into(), fake("mcp_one_beta")),
+        ]);
+        let scoped = ScopedMcpSource::new(registry, &allow(&[(s1, Some(&[]))]));
+        assert!(scoped.specs().is_empty());
+        assert!(scoped.get("mcp_one_alpha").is_none());
+    }
+
+    #[test]
     fn unknown_tool_yields_none_even_when_allowlist_nonempty() {
         let s1 = McpServerId::new();
-        let registry = McpRegistry::for_test(vec![(s1, fake("mcp_one_alpha"))]);
-        let scoped = ScopedMcpSource::new(registry, &allow(&[s1]));
+        let registry = McpRegistry::for_test_with_remote_names(vec![(
+            s1,
+            "alpha".into(),
+            fake("mcp_one_alpha"),
+        )]);
+        let scoped = ScopedMcpSource::new(registry, &allow(&[(s1, None)]));
         assert!(scoped.get("mcp_one_does_not_exist").is_none());
     }
 
@@ -161,12 +212,12 @@ mod tests {
         let s1 = McpServerId::new();
         let s2 = McpServerId::new();
         let s3 = McpServerId::new();
-        let registry = McpRegistry::for_test(vec![
-            (s1, fake("mcp_one_alpha")),
-            (s2, fake("mcp_two_beta")),
-            (s3, fake("mcp_three_gamma")),
+        let registry = McpRegistry::for_test_with_remote_names(vec![
+            (s1, "alpha".into(), fake("mcp_one_alpha")),
+            (s2, "beta".into(), fake("mcp_two_beta")),
+            (s3, "gamma".into(), fake("mcp_three_gamma")),
         ]);
-        let scoped = ScopedMcpSource::new(registry, &allow(&[s1, s3]));
+        let scoped = ScopedMcpSource::new(registry, &allow(&[(s1, None), (s3, None)]));
         let names = spec_names(&scoped.specs());
         assert_eq!(names.len(), 2);
         assert!(names.iter().any(|n| n == "mcp_one_alpha"));
@@ -177,13 +228,32 @@ mod tests {
     #[test]
     fn dangling_allowlist_id_is_inert() {
         // Operator deleted MCP server s2 but the agent's allowlist still
-        // names it. The filter must not error and must not surface anything
-        // — the registry no longer carries s2's tools.
+        // names it. The filter must not error and must not surface
+        // anything — the registry no longer carries s2's tools.
         let s1 = McpServerId::new();
         let s2 = McpServerId::new();
-        let registry = McpRegistry::for_test(vec![(s1, fake("mcp_one_alpha"))]);
-        let scoped = ScopedMcpSource::new(registry, &allow(&[s1, s2]));
+        let registry = McpRegistry::for_test_with_remote_names(vec![(
+            s1,
+            "alpha".into(),
+            fake("mcp_one_alpha"),
+        )]);
+        let scoped = ScopedMcpSource::new(registry, &allow(&[(s1, None), (s2, None)]));
         let names = spec_names(&scoped.specs());
         assert_eq!(names, vec!["mcp_one_alpha".to_owned()]);
+    }
+
+    #[test]
+    fn partial_scope_referencing_unknown_remote_name_keeps_zero() {
+        // The agent asked for `phantom`, which the live server does not
+        // expose. The known tools are not surfaced because they aren't on
+        // the per-tool list either.
+        let s1 = McpServerId::new();
+        let registry = McpRegistry::for_test_with_remote_names(vec![
+            (s1, "alpha".into(), fake("mcp_one_alpha")),
+            (s1, "beta".into(), fake("mcp_one_beta")),
+        ]);
+        let scoped = ScopedMcpSource::new(registry, &allow(&[(s1, Some(&["phantom"]))]));
+        assert!(scoped.specs().is_empty());
+        assert!(scoped.get("mcp_one_alpha").is_none());
     }
 }

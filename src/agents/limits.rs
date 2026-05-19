@@ -52,10 +52,19 @@ pub const AGENT_PROMPT_CACHE_CAP: usize = 256;
 /// visible to live workers within this window — no LISTEN/NOTIFY required.
 pub const AGENT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Maximum number of MCP server ids that may sit in one agent's `allowed_mcp_servers` array.
+/// Maximum number of MCP server ids that may sit in one agent's
+/// `allowed_mcp_tools` map (i.e. distinct keys at the top level).
 ///
 /// Mirrors `crate::mcp::MAX_MCP_SERVERS`: an agent could legitimately be
 /// granted every server registered system-wide, so a tighter per-agent cap
-/// would just create a confusing asymmetry. The schema
-/// `CHECK (cardinality(...) <= 32)` enforces the same number on the DB side.
+/// would just create a confusing asymmetry. The schema `CHECK` on
+/// `allowed_mcp_tools` enforces the same number on the DB side.
 pub const MAX_ALLOWED_MCP_SERVERS_PER_AGENT: usize = 32;
+
+/// Maximum number of per-server tool names an agent may carry in its
+/// `allowed_mcp_tools` map's value list.
+///
+/// Mirrors [`crate::mcp::MAX_TOOLS_PER_SERVER`] — there's no point allowing
+/// a per-agent subset larger than the server itself can expose. The schema
+/// `CHECK` on `allowed_mcp_tools` enforces the same number on the DB side.
+pub const MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT: usize = 64;

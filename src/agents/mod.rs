@@ -26,7 +26,8 @@ pub use error::AgentStoreError;
 pub use limits::{
     AGENT_DESCRIPTION_MAX_LEN, AGENT_NAME_MAX_LEN, AGENT_PROMPT_CACHE_CAP, AGENT_PROMPT_CACHE_TTL,
     AGENT_SYSTEM_PROMPT_MAX_LEN, DEFAULT_SEARCH_AGENT_RESULTS, MAX_AGENT_NAMES_INLINE,
-    MAX_ALLOWED_MCP_SERVERS_PER_AGENT, MAX_SEARCH_AGENT_RESULTS,
+    MAX_ALLOWED_MCP_SERVERS_PER_AGENT, MAX_ALLOWED_MCP_TOOLS_PER_SERVER_PER_AGENT,
+    MAX_SEARCH_AGENT_RESULTS,
 };
 pub use pg_store::PgAgentStore;
 pub use registry::{AgentFactory, Agents, AgentsError, CachedAgents, SharedAgents};
@@ -34,5 +35,5 @@ pub use render::{AGENTS_TAG_CLOSE, AGENTS_TAG_OPEN, render_agents_block};
 pub use store::{AgentStore, AgentUpdate, NewAgent, SharedAgentStore};
 pub use types::{
     AgentCard, AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt,
-    AllowedMcpServers, DefaultAgentSeed,
+    AllowedMcpTools, DefaultAgentSeed, ToolScope,
 };

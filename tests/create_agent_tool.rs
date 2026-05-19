@@ -8,7 +8,7 @@
 
 #![allow(clippy::expect_used)]
 
-use relay_rs::agents::{AgentName, AllowedMcpServers, SharedAgentStore};
+use relay_rs::agents::{AgentName, AllowedMcpTools, SharedAgentStore, ToolScope};
 use relay_rs::clock::SystemClock;
 use relay_rs::mcp::McpServerId;
 use relay_rs::runtime::{PromptRequestId, RequestKindPayload};
@@ -106,7 +106,7 @@ async fn happy_path_persists_record_with_is_default_false_and_empty_mcp() {
         .expect("read");
     assert_eq!(record.id.as_uuid(), parsed_id);
     assert!(!record.is_default);
-    assert_eq!(record.allowed_mcp_servers, AllowedMcpServers::empty());
+    assert_eq!(record.allowed_mcp_tools, AllowedMcpTools::empty());
     assert!(
         record
             .system_prompt
@@ -127,7 +127,11 @@ async fn allowlist_round_trips_on_persisted_record() {
         "name": "ops",
         "system_prompt": "You are the ops agent. Report to the human.",
         "description": "ops role for testing",
-        "allowed_mcp_servers": [server_a, server_b],
+        // server_a: every tool. server_b: only `issues.create`.
+        "allowed_mcp_tools": {
+            server_a.to_string(): null,
+            server_b.to_string(): ["issues.create"],
+        },
     });
 
     let out = f.tool.execute(input, &f.ctx).await.expect("create ops");
@@ -142,9 +146,17 @@ async fn allowlist_round_trips_on_persisted_record() {
         .await
         .expect("read");
     assert_eq!(record.id.as_uuid(), agent_uuid);
-    assert_eq!(record.allowed_mcp_servers.len(), 2);
-    assert!(record.allowed_mcp_servers.contains(server_a));
-    assert!(record.allowed_mcp_servers.contains(server_b));
+    assert_eq!(record.allowed_mcp_tools.len(), 2);
+    assert!(matches!(
+        record.allowed_mcp_tools.tools_for(server_a),
+        ToolScope::All
+    ));
+    let set_b = match record.allowed_mcp_tools.tools_for(server_b) {
+        ToolScope::Some(set) => set,
+        other => panic!("expected Some, got {other:?}"),
+    };
+    assert_eq!(set_b.len(), 1);
+    assert!(set_b.iter().any(|n| n.as_str() == "issues.create"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

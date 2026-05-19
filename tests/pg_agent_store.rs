@@ -5,9 +5,11 @@
 
 use std::sync::Arc;
 
+use std::collections::BTreeMap;
+
 use relay_rs::agents::{
     AgentDescription, AgentId, AgentName, AgentStore, AgentStoreError, AgentSystemPrompt,
-    AgentUpdate, AllowedMcpServers, DefaultAgentSeed, NewAgent, PgAgentStore,
+    AgentUpdate, AllowedMcpTools, DefaultAgentSeed, NewAgent, PgAgentStore,
 };
 use relay_rs::clock::SystemClock;
 use relay_rs::mcp::McpServerId;
@@ -35,12 +37,18 @@ fn new_agent(db: &TestDb, name: &str, prompt: &str, is_default: bool) -> NewAgen
         system_prompt: AgentSystemPrompt::try_from(prompt).expect("valid prompt"),
         description: AgentDescription::try_from(format!("Role: {name}")).expect("valid desc"),
         is_default,
-        allowed_mcp_servers: AllowedMcpServers::empty(),
+        allowed_mcp_tools: AllowedMcpTools::empty(),
     }
 }
 
-fn allowed(ids: &[McpServerId]) -> AllowedMcpServers {
-    AllowedMcpServers::try_from(ids.to_vec()).expect("under cap")
+/// Grant each server full ("all tools") access — mirrors the old
+/// `AllowedMcpServers::try_from(Vec<McpServerId>)` convenience.
+fn allowed(ids: &[McpServerId]) -> AllowedMcpTools {
+    let mut raw: BTreeMap<McpServerId, Option<Vec<String>>> = BTreeMap::new();
+    for id in ids {
+        raw.insert(*id, None);
+    }
+    AllowedMcpTools::try_from(raw).expect("under cap")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -259,7 +267,7 @@ async fn delete_refuses_default() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn create_default_allowed_mcp_servers_is_empty() {
+async fn create_default_allowed_mcp_tools_is_empty() {
     let db = TestDb::fresh().await;
     let store = store(&db);
 
@@ -268,16 +276,17 @@ async fn create_default_allowed_mcp_servers_is_empty() {
         .create(new_agent(&db, "scoped", "I have no MCP yet", false))
         .await
         .expect("create");
-    assert!(agent.allowed_mcp_servers.is_empty());
+    assert!(agent.allowed_mcp_tools.is_empty());
 
     // The seeded default agent is also empty — the migration's column default
-    // is `'{}'` so existing rows round-trip into an empty allowlist.
+    // is `'{}'::jsonb` so existing rows round-trip into an empty allowlist.
     let default = store.read(db.default_agent_id).await.expect("read default");
-    assert!(default.allowed_mcp_servers.is_empty());
+    assert!(default.allowed_mcp_tools.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn create_with_explicit_allowed_mcp_servers_round_trips() {
+async fn create_with_explicit_allowed_mcp_tools_round_trips() {
+    use relay_rs::agents::ToolScope;
     let db = TestDb::fresh().await;
     let store = store(&db);
 
@@ -289,19 +298,33 @@ async fn create_with_explicit_allowed_mcp_servers_round_trips() {
         system_prompt: AgentSystemPrompt::try_from("scoped agent").expect("prompt"),
         description: AgentDescription::try_from("Scoped agent.").expect("desc"),
         is_default: false,
-        allowed_mcp_servers: allowed(&[s1, s2]),
+        allowed_mcp_tools: allowed(&[s1, s2]),
     };
     let created = store.create(payload).await.expect("create");
-    assert_eq!(created.allowed_mcp_servers.len(), 2);
-    assert!(created.allowed_mcp_servers.contains(s1));
-    assert!(created.allowed_mcp_servers.contains(s2));
+    assert_eq!(created.allowed_mcp_tools.len(), 2);
+    assert!(matches!(
+        created.allowed_mcp_tools.tools_for(s1),
+        ToolScope::All
+    ));
+    assert!(matches!(
+        created.allowed_mcp_tools.tools_for(s2),
+        ToolScope::All
+    ));
 
     let reread = store.read(created.id).await.expect("read");
-    assert_eq!(reread.allowed_mcp_servers.as_slice(), &[s1, s2]);
+    assert!(matches!(
+        reread.allowed_mcp_tools.tools_for(s1),
+        ToolScope::All
+    ));
+    assert!(matches!(
+        reread.allowed_mcp_tools.tools_for(s2),
+        ToolScope::All
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn update_replaces_allowed_mcp_servers() {
+async fn update_replaces_allowed_mcp_tools() {
+    use relay_rs::agents::ToolScope;
     let db = TestDb::fresh().await;
     let store = store(&db);
 
@@ -316,7 +339,7 @@ async fn update_replaces_allowed_mcp_servers() {
             system_prompt: AgentSystemPrompt::try_from("rotating MCP").expect("prompt"),
             description: AgentDescription::try_from("Rotating MCP agent.").expect("desc"),
             is_default: false,
-            allowed_mcp_servers: allowed(&[s1, s2]),
+            allowed_mcp_tools: allowed(&[s1, s2]),
         })
         .await
         .expect("create");
@@ -325,33 +348,37 @@ async fn update_replaces_allowed_mcp_servers() {
         .update(
             agent.id,
             AgentUpdate {
-                allowed_mcp_servers: Some(allowed(&[s3])),
+                allowed_mcp_tools: Some(allowed(&[s3])),
                 ..Default::default()
             },
         )
         .await
         .expect("update");
-    assert_eq!(updated.allowed_mcp_servers.as_slice(), &[s3]);
+    assert_eq!(updated.allowed_mcp_tools.len(), 1);
+    assert!(matches!(
+        updated.allowed_mcp_tools.tools_for(s3),
+        ToolScope::All
+    ));
 
-    // Empty array via Some(empty) is the explicit lockdown path.
+    // Empty map via Some(empty) is the explicit lockdown path.
     let locked = store
         .update(
             agent.id,
             AgentUpdate {
-                allowed_mcp_servers: Some(AllowedMcpServers::empty()),
+                allowed_mcp_tools: Some(AllowedMcpTools::empty()),
                 ..Default::default()
             },
         )
         .await
         .expect("update");
-    assert!(locked.allowed_mcp_servers.is_empty());
+    assert!(locked.allowed_mcp_tools.is_empty());
 
     // Field omitted (None) leaves the column unchanged.
     let restored_first = store
         .update(
             agent.id,
             AgentUpdate {
-                allowed_mcp_servers: Some(allowed(&[s1])),
+                allowed_mcp_tools: Some(allowed(&[s1])),
                 ..Default::default()
             },
         )
@@ -368,8 +395,8 @@ async fn update_replaces_allowed_mcp_servers() {
         .await
         .expect("update");
     assert_eq!(
-        after_noop.allowed_mcp_servers.as_slice(),
-        restored_first.allowed_mcp_servers.as_slice()
+        after_noop.allowed_mcp_tools,
+        restored_first.allowed_mcp_tools
     );
 }
 

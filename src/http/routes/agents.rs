@@ -19,14 +19,14 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::types::Json as SqlxJson;
 use uuid::Uuid;
 
 use crate::agents::{
     AgentDescription, AgentId, AgentName, AgentRecord, AgentSystemPrompt, AgentUpdate,
-    AllowedMcpServers, NewAgent,
+    AllowedMcpTools, NewAgent,
 };
 use crate::auth::{AuthError, Principal};
-use crate::mcp::McpServerId;
 
 use super::super::error::HttpError;
 use super::super::state::AppState;
@@ -53,10 +53,11 @@ struct AgentResponse {
     /// `search_agents`. Always present — the column is `NOT NULL`.
     description: String,
     is_default: bool,
-    /// MCP server ids this agent is allowed to use tools from. Always
-    /// present; an empty array means the agent has no MCP access (the
-    /// default for newly minted agents).
-    allowed_mcp_servers: Vec<McpServerId>,
+    /// Per-agent MCP tool allowlist, keyed by server id. `null` value =
+    /// every tool from that server; otherwise the explicit list of remote
+    /// tool names. Always present; an empty object means the agent has no
+    /// MCP access (the default for newly minted agents).
+    allowed_mcp_tools: AllowedMcpTools,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -69,7 +70,7 @@ impl From<AgentRecord> for AgentResponse {
             system_prompt: r.system_prompt.as_str().to_owned(),
             description: r.description.as_str().to_owned(),
             is_default: r.is_default,
-            allowed_mcp_servers: r.allowed_mcp_servers.into_inner(),
+            allowed_mcp_tools: r.allowed_mcp_tools,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -87,10 +88,12 @@ struct CreateAgentRequest {
     /// row is demoted in the same transaction.
     #[serde(default)]
     is_default: bool,
-    /// MCP servers the new agent may use. Omitted = no MCP access (`[]`):
-    /// there is no "unrestricted" mode. The operator opts in explicitly.
+    /// MCP tools the new agent may use, keyed by server id. `null` =
+    /// every tool from that server; otherwise the explicit list of remote
+    /// tool names. Omitted = no MCP access (`{}`): there is no
+    /// "unrestricted" mode. The operator opts in explicitly.
     #[serde(default)]
-    allowed_mcp_servers: Vec<McpServerId>,
+    allowed_mcp_tools: AllowedMcpTools,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,11 +111,11 @@ struct UpdateAgentRequest {
     /// current default — the system requires exactly one default at all times.
     #[serde(default)]
     is_default: Option<bool>,
-    /// `Some(list)` replaces the allowlist atomically — including
-    /// `Some([])`, the explicit lockdown that revokes every server. `None`
+    /// `Some(map)` replaces the allowlist atomically — including
+    /// `Some({})`, the explicit lockdown that revokes every server. `None`
     /// (field omitted) leaves the existing allowlist untouched.
     #[serde(default)]
-    allowed_mcp_servers: Option<Vec<McpServerId>>,
+    allowed_mcp_tools: Option<AllowedMcpTools>,
 }
 
 async fn create_agent(
@@ -124,8 +127,6 @@ async fn create_agent(
     let system_prompt =
         AgentSystemPrompt::try_from(payload.system_prompt).map_err(HttpError::Parse)?;
     let description = AgentDescription::try_from(payload.description).map_err(HttpError::Parse)?;
-    let allowed_mcp_servers =
-        AllowedMcpServers::try_from(payload.allowed_mcp_servers).map_err(HttpError::Parse)?;
     let record = state
         .agents
         .create(NewAgent {
@@ -134,7 +135,7 @@ async fn create_agent(
             system_prompt,
             description,
             is_default: payload.is_default,
-            allowed_mcp_servers,
+            allowed_mcp_tools: payload.allowed_mcp_tools,
         })
         .await?;
     Ok((StatusCode::CREATED, Json(record.into())))
@@ -151,7 +152,7 @@ async fn list_agents(
     let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let rows = sqlx::query_as::<_, AgentRowForList>(
         "SELECT id, org_id, name, system_prompt, description, is_default, \
-                allowed_mcp_servers, created_at, updated_at \
+                allowed_mcp_tools, created_at, updated_at \
          FROM agents ORDER BY created_at ASC",
     )
     .fetch_all(&mut *tx)
@@ -174,7 +175,7 @@ async fn read_agent(
     let mut tx = crate::auth::begin_as(&state.pool, &principal).await?;
     let row = sqlx::query_as::<_, AgentRowForList>(
         "SELECT id, org_id, name, system_prompt, description, is_default, \
-                allowed_mcp_servers, created_at, updated_at \
+                allowed_mcp_tools, created_at, updated_at \
          FROM agents WHERE id = $1",
     )
     .bind(id)
@@ -208,11 +209,7 @@ async fn update_agent(
         .map(AgentDescription::try_from)
         .transpose()
         .map_err(HttpError::Parse)?;
-    let allowed_mcp_servers = payload
-        .allowed_mcp_servers
-        .map(AllowedMcpServers::try_from)
-        .transpose()
-        .map_err(HttpError::Parse)?;
+    let allowed_mcp_tools = payload.allowed_mcp_tools;
     // Tenant gate: 404 cross-org / unknown ids without leaking existence
     // before dispatching the privileged update.
     if !crate::auth::visible_to(
@@ -234,7 +231,7 @@ async fn update_agent(
                 system_prompt,
                 description,
                 is_default: payload.is_default,
-                allowed_mcp_servers,
+                allowed_mcp_tools,
             },
         )
         .await?;
@@ -273,7 +270,7 @@ struct AgentRowForList {
     system_prompt: String,
     description: String,
     is_default: bool,
-    allowed_mcp_servers: Vec<McpServerId>,
+    allowed_mcp_tools: SqlxJson<AllowedMcpTools>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -287,7 +284,7 @@ impl AgentRowForList {
             system_prompt: self.system_prompt,
             description: self.description,
             is_default: self.is_default,
-            allowed_mcp_servers: self.allowed_mcp_servers,
+            allowed_mcp_tools: self.allowed_mcp_tools.0,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }

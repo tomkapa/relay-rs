@@ -39,9 +39,13 @@ export type Agent = {
   id: string;
   name: string;
   is_default: boolean;
-  /** MCP server ids this agent is allowed to call tools on. Mirrors
-   *  `src/http/routes/agents.rs::AgentResponse.allowed_mcp_servers`. */
-  allowed_mcp_servers?: string[];
+  /** Per-server tool allowlist. Keys are MCP server ids the agent may
+   *  reach; the value is `null` (= every tool from that server) or an
+   *  array of remote tool names (= only those tools). A server id that
+   *  is absent from the object grants the agent no access to that
+   *  server. Mirrors
+   *  `src/http/routes/agents.rs::AgentResponse.allowed_mcp_tools`. */
+  allowed_mcp_tools?: Record<string, string[] | null>;
 };
 
 export type RequestStatus = "pending" | "processing" | "done" | "failed";
